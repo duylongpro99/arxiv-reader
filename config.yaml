@@ -1,0 +1,11 @@
+# config.yaml — committed defaults. Per-machine secrets/paths live in .env.
+# NOTE: yaml.v3 does NOT expand ${VARS}. The LLM API key comes ONLY from .env
+# (LLM_API_KEY) and MUST NOT appear here.
+
+llm:
+  provider: anthropic          # anthropic | openai | gemini  (override: LLM_PROVIDER)
+  model: claude-sonnet-4-6     # provider-valid model string  (override: LLM_MODEL)
+
+paths:
+  obsidian_vault: ~/obsidian/arxiv-papers   # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
+  log_file: ~/.arxiv-agent/processed.log    # ~ expanded to $HOME at load

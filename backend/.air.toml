@@ -1,0 +1,17 @@
+# Invoked as: air -c backend/.air.toml  (from repo ROOT — see Makefile)
+root = "."
+tmp_dir = "backend/tmp"
+
+[build]
+  # -C backend makes ./cmd/server + -o tmp/server resolve inside backend/,
+  # producing backend/tmp/server; air then runs `bin` with cwd = root.
+  cmd = "go build -C backend -o tmp/server ./cmd/server"
+  bin = "backend/tmp/server"
+  include_dir = ["backend"]
+  include_ext = ["go", "yaml"]
+  exclude_dir = ["frontend", "backend/tmp", "node_modules"]
+  delay = 1000
+  stop_on_error = true
+
+[misc]
+  clean_on_exit = true

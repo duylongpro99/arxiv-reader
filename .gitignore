@@ -1,1 +1,11 @@
+# secrets & local env
+.env
+
+# node
+node_modules/
+
+# go build artifacts (air compiles to backend/tmp/)
+/backend/tmp/
+
+# tooling
 .claude
