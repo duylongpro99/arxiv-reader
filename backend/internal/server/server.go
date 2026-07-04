@@ -5,16 +5,33 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+
+	"github.com/maritime-ds/arxiv-reader/internal/config"
+	"github.com/maritime-ds/arxiv-reader/internal/orchestrator"
 )
 
 // addr binds loopback ONLY (F6) — never 0.0.0.0.
 const addr = "127.0.0.1:8080"
 
-// Run registers routes, binds the loopback socket, then serves with CORS.
-// Takes no config yet (YAGNI); Phase 2+ adds a param when a handler needs it.
-func Run() error {
+// Handler builds the fully-wired, CORS-wrapped HTTP handler. Extracted from Run
+// so integration tests can drive the real routes via httptest without binding a
+// socket.
+func Handler(cfg *config.Config) http.Handler {
+	orch := orchestrator.New(cfg)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler) // method-based routing (Go 1.22+)
+	mux.HandleFunc("POST /discover", orch.HandleDiscover)
+	mux.HandleFunc("GET /status/{sessionId}", orch.HandleStatus)
+
+	return corsMiddleware(mux)
+}
+
+// Run binds the loopback socket, then serves the Handler.
+// cfg is threaded in from Phase 2 onward so discovery handlers can read the
+// agent/paths config.
+func Run(cfg *config.Config) error {
+	handler := Handler(cfg)
 
 	// Bind FIRST so "server listening" is only logged once the socket is up
 	// (RT3): if the port is taken, Listen fails here and we never lie in logs.
@@ -23,7 +40,7 @@ func Run() error {
 		return fmt.Errorf("cannot bind %s: %w", addr, err)
 	}
 	slog.Info("server listening", "addr", addr)
-	return http.Serve(ln, corsMiddleware(mux))
+	return http.Serve(ln, handler)
 }
 
 // corsMiddleware restricts cross-origin access to the local Next.js dev origin

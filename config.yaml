@@ -7,5 +7,17 @@ llm:
   model: claude-sonnet-4-6     # provider-valid model string  (override: LLM_MODEL)
 
 paths:
-  obsidian_vault: ~/obsidian/arxiv-papers   # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
-  log_file: ~/.arxiv-agent/processed.log    # ~ expanded to $HOME at load
+  obsidian_vault: ~/obsidian/arxiv-papers    # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
+  log_file: ~/.arxiv-agent/processed.json    # ~ expanded to $HOME at load; JSON content, .json extension
+
+# Phase 2 discovery pipeline. arXiv params live here so tuning stays out of code
+# and tests can point arxiv_base_url at a local httptest server.
+agent:
+  arxiv_category: cs.AI
+  arxiv_base_url: https://export.arxiv.org/api/query
+  fetch_limit: 20                    # papers pulled from arXiv (buffer for dedup)
+  display_limit: 5                   # candidates surfaced to the user
+  user_agent: "arxiv-explainer-agent/1.0"
+  request_timeout_seconds: 10
+  min_request_interval_seconds: 3    # arXiv politeness: min gap between requests
+  max_retries: 3                     # 429/5xx backoff: 3s -> 6s -> 12s

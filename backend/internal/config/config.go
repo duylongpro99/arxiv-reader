@@ -10,10 +10,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the fully-resolved runtime configuration for Phase 1.
+// Config is the fully-resolved runtime configuration.
 type Config struct {
 	LLM   LLMConfig   `yaml:"llm"`
 	Paths PathsConfig `yaml:"paths"`
+	Agent AgentConfig `yaml:"agent"`
 }
 
 type LLMConfig struct {
@@ -25,6 +26,20 @@ type LLMConfig struct {
 type PathsConfig struct {
 	ObsidianVault string `yaml:"obsidian_vault"`
 	LogFile       string `yaml:"log_file"`
+}
+
+// AgentConfig holds the discovery-pipeline knobs introduced in Phase 2.
+// arXiv params live here (not hardcoded) so tuning stays out of code and tests
+// can point ArxivBaseURL at an httptest.Server instead of the live API.
+type AgentConfig struct {
+	ArxivCategory         string `yaml:"arxiv_category"`
+	ArxivBaseURL          string `yaml:"arxiv_base_url"`
+	FetchLimit            int    `yaml:"fetch_limit"`   // papers pulled from arXiv (buffer)
+	DisplayLimit          int    `yaml:"display_limit"` // candidates surfaced to the user
+	UserAgent             string `yaml:"user_agent"`
+	RequestTimeoutSec     int    `yaml:"request_timeout_seconds"`
+	MinRequestIntervalSec int    `yaml:"min_request_interval_seconds"`
+	MaxRetries            int    `yaml:"max_retries"`
 }
 
 // validProviders is the whitelist enforced by validate().
@@ -104,6 +119,40 @@ func (c *Config) validate() error {
 	}
 	if !filepath.IsAbs(c.Paths.LogFile) {
 		return fmt.Errorf("paths.log_file must be an absolute path, got %q.\n  → Set paths.log_file in config.yaml", c.Paths.LogFile)
+	}
+	return c.Agent.validate()
+}
+
+// validate enforces the Phase 2 agent section. A missing agent block leaves the
+// int fields at their zero value, so the >0 checks double as presence checks —
+// preventing a silent fetch_limit:0 from surfacing zero candidates downstream.
+func (a *AgentConfig) validate() error {
+	if a.ArxivCategory == "" {
+		return fmt.Errorf("agent.arxiv_category is required but not set.\n  → Set agent.arxiv_category (e.g. cs.AI) in config.yaml")
+	}
+	if a.ArxivBaseURL == "" {
+		return fmt.Errorf("agent.arxiv_base_url is required but not set.\n  → Set agent.arxiv_base_url in config.yaml")
+	}
+	if a.UserAgent == "" {
+		return fmt.Errorf("agent.user_agent is required but not set.\n  → Set agent.user_agent in config.yaml")
+	}
+	if a.FetchLimit <= 0 {
+		return fmt.Errorf("agent.fetch_limit must be > 0, got %d.\n  → Set agent.fetch_limit in config.yaml", a.FetchLimit)
+	}
+	if a.DisplayLimit <= 0 {
+		return fmt.Errorf("agent.display_limit must be > 0, got %d.\n  → Set agent.display_limit in config.yaml", a.DisplayLimit)
+	}
+	if a.DisplayLimit > a.FetchLimit {
+		return fmt.Errorf("agent.display_limit (%d) must not exceed agent.fetch_limit (%d).\n  → Lower display_limit or raise fetch_limit in config.yaml", a.DisplayLimit, a.FetchLimit)
+	}
+	if a.RequestTimeoutSec <= 0 {
+		return fmt.Errorf("agent.request_timeout_seconds must be > 0, got %d.\n  → Set agent.request_timeout_seconds in config.yaml", a.RequestTimeoutSec)
+	}
+	if a.MinRequestIntervalSec < 0 {
+		return fmt.Errorf("agent.min_request_interval_seconds must be >= 0, got %d.\n  → Set agent.min_request_interval_seconds in config.yaml", a.MinRequestIntervalSec)
+	}
+	if a.MaxRetries < 0 {
+		return fmt.Errorf("agent.max_retries must be >= 0, got %d.\n  → Set agent.max_retries in config.yaml", a.MaxRetries)
 	}
 	return nil
 }

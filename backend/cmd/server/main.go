@@ -22,7 +22,7 @@ func main() {
 	// Log provider+model only. NEVER log cfg.LLM.APIKey.
 	slog.Info("config loaded", "provider", cfg.LLM.Provider, "model", cfg.LLM.Model)
 
-	if err := server.Run(); err != nil {
+	if err := server.Run(cfg); err != nil {
 		slog.Error("server error", "error", err.Error())
 		os.Exit(1)
 	}

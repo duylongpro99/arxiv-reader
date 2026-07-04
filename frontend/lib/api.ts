@@ -1,0 +1,31 @@
+// Client-side API helpers. These call the Next.js proxy routes (same origin),
+// never the Go backend directly — the backend address stays server-side.
+
+import type { PipelineStatus, TriggerResponse } from "./types";
+
+// triggerDiscovery starts a discovery run and returns the new session id.
+export async function triggerDiscovery(): Promise<TriggerResponse> {
+  const res = await fetch("/api/trigger", { method: "POST" });
+  if (!res.ok) {
+    throw new Error(`Failed to start discovery (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// fetchStatus polls the pipeline status for a session. A 404 (e.g. the backend
+// restarted and lost the in-memory session) is surfaced as a failed status so
+// the UI degrades gracefully instead of throwing on an unknown session.
+export async function fetchStatus(sessionId: string): Promise<PipelineStatus> {
+  const res = await fetch(`/api/status?sessionId=${encodeURIComponent(sessionId)}`);
+  if (res.status === 404) {
+    return {
+      stage: "failed",
+      error: "This discovery session expired. Please try again.",
+      recoverable: true,
+    };
+  }
+  if (!res.ok) {
+    throw new Error(`Failed to fetch status (HTTP ${res.status})`);
+  }
+  return res.json();
+}
