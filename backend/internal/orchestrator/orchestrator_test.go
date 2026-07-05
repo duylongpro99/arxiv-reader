@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/maritime-ds/arxiv-reader/internal/agents"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
@@ -69,15 +71,53 @@ func (f *fakeContent) FetchMarkdown(context.Context, string) (string, error) {
 	return f.md, f.err
 }
 
-// fakeLLM satisfies llm.LLMClient; Phase 3 never invokes it, so it is inert.
-type fakeLLM struct{}
-
-func (fakeLLM) Complete(context.Context, llm.CompletionRequest) (llm.CompletionResponse, error) {
-	return llm.CompletionResponse{}, nil
+// fakeExplainer returns a canned ExplainerOutput or a forced error.
+type fakeExplainer struct {
+	out models.ExplainerOutput
+	err error
 }
 
-func newProcessOrch(c PaperContent) *Orchestrator {
-	return &Orchestrator{cfg: testCfg(5), disco: &fakeFetcher{}, logCheck: passthrough(), content: c, llm: fakeLLM{}}
+func (f *fakeExplainer) Generate(context.Context, agents.ExplainerInput) (models.ExplainerOutput, error) {
+	if f.err != nil {
+		return models.ExplainerOutput{}, f.err
+	}
+	return f.out, nil
+}
+
+// fakeVault records the write and returns a canned path or a forced error.
+type fakeVault struct {
+	path    string
+	err     error
+	written int32
+}
+
+func (f *fakeVault) WriteToVault(context.Context, models.ExplainerOutput, models.Paper) (string, error) {
+	atomic.AddInt32(&f.written, 1)
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.path, nil
+}
+
+// canned is a fully-wired explainer for happy-path process tests.
+func canned() *fakeExplainer {
+	return &fakeExplainer{out: models.ExplainerOutput{
+		PaperID: "a", Content: "# Note\n## Problem Statement\nbody",
+		InputTokens: 1200, OutputTokens: 800,
+	}}
+}
+
+// newProcessOrch builds an orchestrator with fake content + explainer + vault.
+// Optional overrides let a test inject a failing explainer/vault.
+func newProcessOrch(c PaperContent, opts ...func(*Orchestrator)) *Orchestrator {
+	o := &Orchestrator{
+		cfg: testCfg(5), disco: &fakeFetcher{}, logCheck: passthrough(),
+		content: c, explainer: canned(), vault: &fakeVault{path: "/vault/AI Papers/note.md"},
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
 }
 
 // selectionSession stores a session already at the selection stage with the
@@ -110,7 +150,7 @@ func waitFor(t *testing.T, pred func() bool) {
 	t.Fatal("timed out waiting for pipeline outcome")
 }
 
-func TestProcessHappyPathStoresMarkdown(t *testing.T) {
+func TestProcessHappyPathReachesComplete(t *testing.T) {
 	o := newProcessOrch(&fakeContent{md: "# Extracted paper"})
 	s := selectionSession(o, makePapers(3))
 
@@ -118,12 +158,121 @@ func TestProcessHappyPathStoresMarkdown(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	waitFor(t, func() bool { return s.Markdown() != "" })
-	if s.Snapshot().Stage != models.StageExtracting {
-		t.Fatalf("stage: want extracting, got %s", s.Snapshot().Stage)
-	}
+	// Pipeline now runs past the Phase 3 seam through generating→writing→complete.
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
+
 	if s.Markdown() != "# Extracted paper" {
 		t.Fatalf("markdown not stored, got %q", s.Markdown())
+	}
+	if ex := s.Explainer(); ex == nil || ex.Content == "" {
+		t.Fatal("explainer not stored on complete")
+	}
+	if s.VaultFile() != "/vault/AI Papers/note.md" {
+		t.Fatalf("vault file not stored, got %q", s.VaultFile())
+	}
+	if s.TokensUsed() != 2000 {
+		t.Fatalf("tokens not accumulated, got %d", s.TokensUsed())
+	}
+}
+
+func TestProcessGenerationErrorFailsRecoverable(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+		o.explainer = &fakeExplainer{err: llm.ErrLLMBadRequest}
+	})
+	fv := &fakeVault{path: "x"}
+	o.vault = fv
+	s := selectionSession(o, makePapers(3))
+
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageFailed })
+
+	snap := s.Snapshot()
+	if !snap.Recoverable || snap.Error == "" {
+		t.Fatalf("generation failure should be recoverable with a message: %#v", snap)
+	}
+	// Vault must never be written when generation fails.
+	if atomic.LoadInt32(&fv.written) != 0 {
+		t.Fatal("vault must not be written on generation failure")
+	}
+	if s.VaultFile() != "" {
+		t.Fatalf("no vault file expected, got %q", s.VaultFile())
+	}
+}
+
+func TestProcessEmptyGenerationFailsRecoverable(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+		o.explainer = &fakeExplainer{out: models.ExplainerOutput{PaperID: "a", Content: "   \n"}}
+	})
+	fv := &fakeVault{path: "x"}
+	o.vault = fv
+	s := selectionSession(o, makePapers(3))
+
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageFailed })
+
+	if !s.Snapshot().Recoverable {
+		t.Fatal("empty generation should be recoverable")
+	}
+	if atomic.LoadInt32(&fv.written) != 0 {
+		t.Fatal("vault must not be written for empty content")
+	}
+}
+
+func TestProcessVaultPermissionErrorNonRecoverable(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+		o.vault = &fakeVault{err: os.ErrPermission}
+	})
+	s := selectionSession(o, makePapers(3))
+
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageFailed })
+
+	if s.Snapshot().Recoverable {
+		t.Fatal("permission failure must be non-recoverable")
+	}
+}
+
+// --- /result endpoint ---
+
+func result(o *Orchestrator, id string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/result/"+id, nil)
+	req.SetPathValue("sessionId", id)
+	o.HandleResult(rec, req)
+	return rec
+}
+
+func TestResultBeforeCompleteIs404(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "md"})
+	s := selectionSession(o, makePapers(3)) // still at selection
+	if rec := result(o, s.SessionID); rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404 before complete, got %d", rec.Code)
+	}
+}
+
+func TestResultUnknownSessionIs404(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "md"})
+	if rec := result(o, "nope"); rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404 for unknown session, got %d", rec.Code)
+	}
+}
+
+func TestResultAfterCompleteReturnsContent(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "# Extracted paper"})
+	s := selectionSession(o, makePapers(3))
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
+
+	rec := result(o, s.SessionID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	var resp ResultResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if resp.Content == "" || resp.VaultFile != "/vault/AI Papers/note.md" || resp.TokensUsed != 2000 {
+		t.Fatalf("unexpected result payload: %#v", resp)
 	}
 }
 

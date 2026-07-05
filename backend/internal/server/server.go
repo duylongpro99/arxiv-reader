@@ -28,6 +28,7 @@ func Handler(cfg *config.Config) (http.Handler, error) {
 	mux.HandleFunc("POST /discover", orch.HandleDiscover)
 	mux.HandleFunc("POST /process", orch.HandleProcess)
 	mux.HandleFunc("GET /status/{sessionId}", orch.HandleStatus)
+	mux.HandleFunc("GET /result/{sessionId}", orch.HandleResult)
 
 	return corsMiddleware(mux), nil
 }

@@ -224,10 +224,13 @@ type ExplainerInput struct {
 }
 
 type ExplainerOutput struct {
-    Content   string            // full Markdown
-    Sections  map[string]string // keyed by section name
-    Iteration int
-    CreatedAt time.Time
+    PaperID      string            // paper's arXiv ID
+    Content      string            // full Markdown body
+    Sections     map[string]string // keyed by section name
+    Iteration    int
+    InputTokens  int               // tokens consumed by LLM
+    OutputTokens int               // tokens produced by LLM
+    CreatedAt    time.Time
 }
 
 func Generate(ctx context.Context, input ExplainerInput) (ExplainerOutput, error)
@@ -271,21 +274,37 @@ func Review(ctx context.Context, explainer ExplainerOutput, iteration int) (Revi
 
 ### 8. VaultWriterTool (ADK Tool)
 
-**Purpose:** Persist the approved explainer to the Obsidian vault.
+**Purpose:** Persist the explainer to the Obsidian vault atomically.
 
 **Responsibilities:**
-- Format final Markdown with consistent frontmatter
-- Generate filename: `YYYY-MM-DD_arxivID_slug-title.md`
-- Write file atomically to configured Obsidian vault subfolder
-- Trigger `LogCheckTool.MarkAsProcessed()` after successful write
+- Format final Markdown with consistent YAML frontmatter
+- Generate filename: `YYYY-MM-DD_arxivID_slug-title.md` with date parsed from Paper.Published string
+- Write file atomically to configured Obsidian vault subfolder (`.tmp` → `rename`)
+- Trigger `LogCheckTool.MarkAsProcessed()` after successful write (failure is warning, not fatal)
 
 **Interface:**
 ```go
-func WriteToVault(ctx context.Context, explainer ExplainerOutput, meta Paper) (string, error)
-// returns the file path written
+type VaultWriterTool struct {
+    cfg      *config.Config
+    logCheck *LogCheckTool
+}
+
+func NewVaultWriterTool(cfg *config.Config, logCheck *LogCheckTool) *VaultWriterTool
+
+func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex ExplainerOutput, p Paper) (string, error)
+// returns the final absolute path written; NO verdict parameter (Phase 5 adds review state)
 ```
 
-**Dependencies:** Local filesystem (vault path from config), LogCheckTool
+**Frontmatter fields:**
+- `arxiv_id`: from Paper.ID
+- `title`, `authors` (YAML list), `abstract`: from Paper metadata
+- `published`: date part of Paper.Published string (parsed RFC3339 or first 10 chars)
+- `category`: from `config.Agent.ArxivCategory` (NOT from Paper, which has no Category field)
+- `generated_at`: RFC3339 UTC timestamp
+- `review_iterations: 1`, `review_passed: true`: hardcoded now, forward-compatible for Phase 5
+- `tags`: `[ai, paper, explainer]`
+
+**Dependencies:** Local filesystem (vault path from config), LogCheckTool, config
 
 ---
 
@@ -387,20 +406,22 @@ type Paper struct {
 ### ExplainerOutput
 ```go
 type ExplainerOutput struct {
-    PaperID   string
-    Content   string            // final assembled Markdown
-    Sections  map[string]string // keyed by section name:
-                                // "problem_statement"
-                                // "core_idea"
-                                // "methodology"
-                                // "key_findings"
-                                // "limitations"
-                                // "why_it_matters"
-                                // "analogies"
-                                // "glossary"
-                                // "follow_up_papers"
-    Iteration int
-    CreatedAt time.Time
+    PaperID      string            // paper's arXiv ID
+    Content      string            // final assembled Markdown body
+    Sections     map[string]string // keyed by section name:
+                                   // "problem_statement"
+                                   // "core_idea"
+                                   // "methodology"
+                                   // "key_findings"
+                                   // "limitations"
+                                   // "why_it_matters"
+                                   // "analogies"
+                                   // "glossary"
+                                   // "follow_up_papers"
+    Iteration    int               // 1 in Phase 4 (revision loop is Phase 5)
+    InputTokens  int               // tokens consumed by LLM
+    OutputTokens int               // tokens produced by LLM
+    CreatedAt    time.Time
 }
 ```
 

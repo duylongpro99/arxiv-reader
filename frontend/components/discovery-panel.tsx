@@ -2,10 +2,11 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { fetchStatus, selectPaper, triggerDiscovery } from "@/lib/api";
+import { fetchResult, fetchStatus, selectPaper, triggerDiscovery } from "@/lib/api";
 import { CandidateList } from "./candidate-list";
 import { ErrorBanner } from "./error-banner";
 import { ProgressIndicator } from "./progress-indicator";
+import { ResultPanel } from "./result-panel";
 import { TriggerButton } from "./trigger-button";
 
 // DiscoveryPanel owns the discovery + selection flow: trigger -> poll -> pick ->
@@ -49,12 +50,26 @@ export function DiscoveryPanel() {
     queryKey: ["status", sessionId],
     queryFn: () => fetchStatus(sessionId as string),
     enabled: !!sessionId,
-    // Denylist: poll every 2s until a terminal stage. "extracting" is NOT
-    // terminal, so polling continues through it (PRD F5).
+    // Denylist: poll every 2s until a terminal stage. "extracting"/"generating"/
+    // "writing" are NOT terminal, so polling continues through them; "complete"
+    // is terminal alongside "selection"/"failed".
     refetchInterval: (query) => {
       const stage = query.state.data?.stage;
-      return stage === "selection" || stage === "failed" ? false : 2000;
+      return stage === "selection" || stage === "failed" || stage === "complete"
+        ? false
+        : 2000;
     },
+  });
+
+  // Once the pipeline is complete, fetch the finished note once (no polling).
+  const {
+    data: result,
+    isError: resultFailed,
+    refetch: refetchResult,
+  } = useQuery({
+    queryKey: ["result", sessionId],
+    queryFn: () => fetchResult(sessionId as string),
+    enabled: status?.stage === "complete",
   });
 
   // Re-pick detection: after we have selected, a return to "selection" WITH a
@@ -68,7 +83,10 @@ export function DiscoveryPanel() {
 
   // Running once we have a session but haven't reached a terminal stage yet.
   const polling =
-    !!sessionId && status?.stage !== "selection" && status?.stage !== "failed";
+    !!sessionId &&
+    status?.stage !== "selection" &&
+    status?.stage !== "failed" &&
+    status?.stage !== "complete";
   const isLoading = trigger.isPending || polling;
 
   const start = () => trigger.mutate();
@@ -104,6 +122,17 @@ export function DiscoveryPanel() {
           notice={status.notice}
           selectedId={selectedId}
           onSelect={(id) => select.mutate(id)}
+        />
+      )}
+
+      {status?.stage === "complete" && result && <ResultPanel result={result} />}
+
+      {/* Pipeline finished but the note fetch failed (e.g. backend restarted). */}
+      {status?.stage === "complete" && resultFailed && (
+        <ErrorBanner
+          message="The explainer was generated but could not be loaded. It is saved in your vault; you can retry loading the preview."
+          recoverable
+          onRetry={() => refetchResult()}
         />
       )}
     </div>

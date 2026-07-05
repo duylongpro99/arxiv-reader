@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/maritime-ds/arxiv-reader/internal/agents"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 )
@@ -91,8 +93,55 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 		return
 	}
 
-	s.SetMarkdown(md) // Phase 4 seam: ExplainerAgent picks up from here.
+	s.SetMarkdown(md)
 	slog.Info("markdown stored", "session_id", s.SessionID, "paper_id", paperID, "markdown_bytes", len(md))
+
+	// --- Phase 4: generate the explainer, write it to the vault, complete. ---
+
+	// SelectedPaper carries the full metadata (title/authors/published) the
+	// ExplainerAgent and VaultWriter need. HandleProcess always sets it before
+	// spawning this goroutine; guard nil defensively rather than risk a panic.
+	paper := s.SelectedPaper()
+	if paper == nil {
+		s.Fail("Internal error: no paper selected. Please try again.", true)
+		slog.Error("pipeline missing selected paper", "session_id", s.SessionID, "paper_id", paperID)
+		return
+	}
+
+	s.SetStage(models.StageGenerating)
+	ex, err := o.explainer.Generate(ctx, agents.ExplainerInput{MarkdownText: md, PaperMeta: *paper})
+	if err != nil {
+		// Generation errors are retryable — no vault file written, log untouched.
+		s.Fail(describeGenErr(err), true)
+		slog.Error("explainer generation failed", "session_id", s.SessionID, "paper_id", paperID, "error", err.Error())
+		return
+	}
+	// A degenerate empty response (no error) would otherwise be written as a
+	// frontmatter-only note and mark the paper processed. Treat it as a
+	// recoverable generation failure so the paper re-surfaces for a retry.
+	if strings.TrimSpace(ex.Content) == "" {
+		s.Fail("The AI returned an empty explainer. Please try again.", true)
+		slog.Error("explainer generation empty", "session_id", s.SessionID, "paper_id", paperID)
+		return
+	}
+	s.SetExplainer(&ex)
+	s.AddTokens(ex.InputTokens + ex.OutputTokens)
+
+	s.SetStage(models.StageWriting)
+	path, err := o.vault.WriteToVault(ctx, ex, *paper)
+	if err != nil {
+		// Permission/disk failures won't fix themselves on retry; others might.
+		s.Fail(vaultErrMsg(err), vaultRecoverable(err))
+		slog.Error("vault write failed", "session_id", s.SessionID, "paper_id", paperID, "error", err.Error())
+		return
+	}
+	s.SetVaultFile(path)
+	s.SetStage(models.StageComplete)
+
+	slog.Info("pipeline complete",
+		"session_id", s.SessionID, "paper_id", paperID,
+		"total_duration_ms", time.Since(s.StartedAt()).Milliseconds(),
+	)
 }
 
 // newSession creates a session with a unique, dependency-free random ID.
@@ -111,29 +160,6 @@ func newSessionID() string {
 		return fmt.Sprintf("sess-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
-}
-
-// describeError maps a pipeline error to a human-readable message and whether a
-// retry might help. Shared by both background goroutines, so the default message
-// is stage-neutral. Corrupt-log is the only non-recoverable failure — it needs a
-// manual fix.
-func describeError(err error) (message string, recoverable bool) {
-	switch {
-	case errors.Is(err, tools.ErrArxivRateLimit):
-		return "arXiv is rate limiting requests. Please try again in a minute.", true
-	case errors.Is(err, tools.ErrArxivUnavailable):
-		return "arXiv is currently unavailable. Please try again.", true
-	case errors.Is(err, tools.ErrArxivParse):
-		return "arXiv returned an unexpected response. Please try again.", true
-	case errors.Is(err, tools.ErrLogCorrupted):
-		return "The processed-log file is corrupted and needs manual inspection.", false
-	case errors.Is(err, tools.ErrPaperHTMLTimeout):
-		return "Fetching the paper's HTML timed out. Please try again.", true
-	case errors.Is(err, tools.ErrPaperHTMLFailed):
-		return "Could not fetch or convert the paper's HTML. Please try again.", true
-	default:
-		return "The request failed unexpectedly. Please try again.", true
-	}
 }
 
 func (o *Orchestrator) logFailure(session *models.PipelineSession, err error) {

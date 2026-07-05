@@ -14,6 +14,9 @@ const (
 	StageDiscovery  PipelineStage = "discovery"  // fetching + filtering in progress
 	StageSelection  PipelineStage = "selection"  // candidates ready, awaiting user pick
 	StageExtracting PipelineStage = "extracting" // fetching + converting paper HTML → Markdown
+	StageGenerating PipelineStage = "generating" // Phase 4: LLM writing the explainer note
+	StageWriting    PipelineStage = "writing"    // Phase 4: atomic write to the Obsidian vault
+	StageComplete   PipelineStage = "complete"   // Phase 4: note saved; /result is ready
 	StageFailed     PipelineStage = "failed"     // pipeline aborted; see Error/Recoverable
 )
 
@@ -38,6 +41,12 @@ type PipelineSession struct {
 	// the frontend; selectedPaper's metadata already rides along in candidates.
 	selectedPaper *Paper
 	markdownText  string
+	// Phase 4 explainer/vault state. Also server-only and excluded from
+	// Snapshot(): explainer.Content is large and reaches the frontend only via
+	// the dedicated /result endpoint, never the /status poll.
+	explainer  *ExplainerOutput
+	vaultFile  string
+	tokensUsed int
 }
 
 // SessionSnapshot is an immutable, mutex-free copy of a session's observable
@@ -115,6 +124,60 @@ func (s *PipelineSession) SetSelectedPaper(p *Paper) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.selectedPaper = p
+}
+
+// SelectedPaper returns the paper the user picked (server-only; not in Snapshot).
+// Phase 4 reads the full metadata (title/authors/published/id) here to feed the
+// ExplainerAgent and VaultWriter. Returns nil if no paper has been selected.
+func (s *PipelineSession) SelectedPaper() *Paper {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.selectedPaper
+}
+
+// SetExplainer stores the generated explainer note (server-only; not in Snapshot).
+func (s *PipelineSession) SetExplainer(e *ExplainerOutput) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.explainer = e
+}
+
+// Explainer returns the generated explainer note, or nil before generation.
+// The /result handler reads it here (server-only; kept out of /status).
+func (s *PipelineSession) Explainer() *ExplainerOutput {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.explainer
+}
+
+// SetVaultFile records the absolute path of the written vault note (server-only).
+func (s *PipelineSession) SetVaultFile(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vaultFile = path
+}
+
+// VaultFile returns the written note's path, or "" before the vault write.
+func (s *PipelineSession) VaultFile() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.vaultFile
+}
+
+// AddTokens accumulates LLM token usage across calls. Phase 4 adds once; the
+// Phase 5 revision loop will add per iteration — an additive API future-proofs
+// that at no cost now.
+func (s *PipelineSession) AddTokens(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokensUsed += n
+}
+
+// TokensUsed returns the accumulated token total (server-only; not in Snapshot).
+func (s *PipelineSession) TokensUsed() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tokensUsed
 }
 
 // SetMarkdown stores the extracted paper Markdown (server-only; excluded from

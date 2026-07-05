@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/maritime-ds/arxiv-reader/internal/agents"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
@@ -33,54 +34,50 @@ type PaperContent interface {
 	FetchMarkdown(ctx context.Context, arxivID string) (string, error)
 }
 
+// Explainer and VaultWriter are the Phase 4 consumer contracts, defined here so
+// the orchestrator stays testable with fakes and decoupled from the concrete
+// agent/tool implementations.
+type Explainer interface {
+	Generate(ctx context.Context, in agents.ExplainerInput) (models.ExplainerOutput, error)
+}
+
+type VaultWriter interface {
+	WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper) (string, error)
+}
+
 // Orchestrator holds the session store and the tools it sequences.
 type Orchestrator struct {
-	sessions sync.Map // sessionID -> *models.PipelineSession
-	cfg      *config.Config
-	disco    PaperFetcher
-	logCheck Unprocessor
-	content  PaperContent  // Phase 3: HTML → Markdown extraction
-	llm      llm.LLMClient // constructed now, invoked in Phase 4
+	sessions  sync.Map // sessionID -> *models.PipelineSession
+	cfg       *config.Config
+	disco     PaperFetcher
+	logCheck  Unprocessor
+	content   PaperContent // Phase 3: HTML → Markdown extraction
+	explainer Explainer    // Phase 4: LLM re-teaching generation
+	vault     VaultWriter  // Phase 4: atomic Obsidian vault write
 }
 
 // New wires the orchestrator with the real tools built from config. It can fail:
 // NewLLMClient rejects an unknown provider, and a misconfigured provider should
 // stop the server at startup (matching the config fail-fast philosophy).
+//
+// The concrete *LogCheckTool is built once and shared: the orchestrator holds it
+// as the read-only Unprocessor, while the VaultWriter needs its MarkAsProcessed
+// (write) method — which is not on that interface. The single LLM client is
+// shared with the ExplainerAgent (stateless / concurrency-safe).
 func New(cfg *config.Config) (*Orchestrator, error) {
 	client, err := llm.NewLLMClient(&cfg.LLM)
 	if err != nil {
 		return nil, err
 	}
+	logCheck := tools.NewLogCheckTool(&cfg.Paths)
 	return &Orchestrator{
-		cfg:      cfg,
-		disco:    tools.NewDiscoveryTool(&cfg.Agent),
-		logCheck: tools.NewLogCheckTool(&cfg.Paths),
-		content:  tools.NewPaperContentTool(&cfg.Agent),
-		llm:      client,
+		cfg:       cfg,
+		disco:     tools.NewDiscoveryTool(&cfg.Agent),
+		logCheck:  logCheck,
+		content:   tools.NewPaperContentTool(&cfg.Agent),
+		explainer: agents.New(client, cfg),
+		vault:     tools.NewVaultWriterTool(cfg, logCheck),
 	}, nil
-}
-
-// --- response DTOs (the frontend-facing contract) ---
-
-type DiscoverResponse struct {
-	SessionID string `json:"session_id"`
-}
-
-type StatusResponse struct {
-	Stage       models.PipelineStage `json:"stage"`
-	Candidates  []models.Paper       `json:"candidates,omitempty"`
-	Notice      string               `json:"notice,omitempty"`
-	Error       string               `json:"error,omitempty"`
-	Recoverable bool                 `json:"recoverable,omitempty"`
-}
-
-type ProcessRequest struct {
-	SessionID string `json:"session_id"`
-	PaperID   string `json:"paper_id"`
-}
-
-type ProcessResponse struct {
-	SessionID string `json:"session_id"`
 }
 
 // HandleDiscover creates a session, kicks off discovery in the background, and
@@ -173,8 +170,31 @@ func (o *Orchestrator) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+// HandleResult returns the finished explainer for a session, or 404 until the
+// pipeline is complete. It reads the server-only fields (explainer/vaultFile/
+// tokens) via their dedicated accessors — these are deliberately NOT part of
+// Snapshot()/‌/status, so the large Content never rides the status poll.
+func (o *Orchestrator) HandleResult(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sessionId")
+	v, ok := o.sessions.Load(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	s := v.(*models.PipelineSession)
+	if s.Snapshot().Stage != models.StageComplete {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "result not ready"})
+		return
+	}
+	ex := s.Explainer()
+	if ex == nil { // defensive: complete implies explainer set, but never nil-panic
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "result not ready"})
+		return
+	}
+	writeJSON(w, http.StatusOK, ResultResponse{
+		Content:    ex.Content,
+		VaultFile:  s.VaultFile(),
+		TokensUsed: s.TokensUsed(),
+	})
 }
+

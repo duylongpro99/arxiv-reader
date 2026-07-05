@@ -1,7 +1,12 @@
 // Client-side API helpers. These call the Next.js proxy routes (same origin),
 // never the Go backend directly — the backend address stays server-side.
 
-import type { PipelineStatus, SelectResponse, TriggerResponse } from "./types";
+import type {
+  PipelineStatus,
+  ResultResponse,
+  SelectResponse,
+  TriggerResponse,
+} from "./types";
 
 // triggerDiscovery starts a discovery run and returns the new session id.
 export async function triggerDiscovery(): Promise<TriggerResponse> {
@@ -43,6 +48,19 @@ export async function fetchStatus(sessionId: string): Promise<PipelineStatus> {
   }
   if (!res.ok) {
     throw new Error(`Failed to fetch status (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// fetchResult retrieves the finished explainer once the pipeline is complete.
+// Only called when the status stage is "complete" (the backend 404s otherwise);
+// a non-OK response throws, like selectPaper.
+export async function fetchResult(sessionId: string): Promise<ResultResponse> {
+  const res = await fetch(
+    `/api/result?sessionId=${encodeURIComponent(sessionId)}`,
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to fetch result (HTTP ${res.status})`);
   }
   return res.json();
 }

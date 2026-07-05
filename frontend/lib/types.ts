@@ -40,3 +40,11 @@ export interface TriggerResponse {
 export interface SelectResponse {
   session_id: string;
 }
+
+// The finished explainer, served by /result once the pipeline is complete.
+// Field names match the Go ResultResponse DTO (camelCase json tags).
+export interface ResultResponse {
+  content: string; // note body Markdown (no frontmatter)
+  vaultFile: string; // absolute path of the written note
+  tokensUsed: number;
+}

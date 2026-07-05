@@ -23,6 +23,47 @@ func TestAccessorsMutateUnderLock(t *testing.T) {
 	}
 }
 
+// Phase 4 accessors round-trip under the lock, and none of the new server-only
+// fields leak into Snapshot() (which would inflate every /status poll).
+func TestPhase4AccessorsRoundTrip(t *testing.T) {
+	s := NewSession("s1", time.Now())
+
+	p := &Paper{ID: "2401.12345", Title: "Attention Is All You Need"}
+	s.SetSelectedPaper(p)
+	if got := s.SelectedPaper(); got == nil || got.ID != "2401.12345" {
+		t.Fatalf("SelectedPaper round-trip failed: %+v", got)
+	}
+
+	ex := &ExplainerOutput{PaperID: "2401.12345", Content: "# Title\n## Problem Statement\nbody"}
+	s.SetExplainer(ex)
+	if got := s.Explainer(); got == nil || got.PaperID != "2401.12345" {
+		t.Fatalf("Explainer round-trip failed: %+v", got)
+	}
+
+	s.SetVaultFile("/vault/AI Papers/2024-01-15_2401.12345_title.md")
+	if got := s.VaultFile(); got != "/vault/AI Papers/2024-01-15_2401.12345_title.md" {
+		t.Fatalf("VaultFile round-trip failed: %q", got)
+	}
+
+	// AddTokens accumulates across calls.
+	s.AddTokens(1200)
+	s.AddTokens(800)
+	if got := s.TokensUsed(); got != 2000 {
+		t.Fatalf("TokensUsed = %d, want 2000 (additive)", got)
+	}
+
+	// Server-only guarantee: the Phase 4 fields must not surface in Snapshot.
+	snap := s.Snapshot()
+	if snap.Stage == StageComplete {
+		t.Fatal("Snapshot stage should reflect only what SetStage set, not the explainer")
+	}
+	// SessionSnapshot has no explainer/vaultFile/tokens fields by type; the
+	// observable string fields must carry none of that content.
+	if snap.Notice != "" || snap.Error != "" {
+		t.Fatalf("unexpected snapshot content: notice=%q error=%q", snap.Notice, snap.Error)
+	}
+}
+
 // SessionSnapshot must never surface the large, server-only markdown. Guarding
 // against a future field being added to the snapshot by habit (would leak KBs
 // of text to every /status poll).
