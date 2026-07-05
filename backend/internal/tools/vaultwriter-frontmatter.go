@@ -21,9 +21,11 @@ var (
 
 // buildFrontmatter renders the YAML frontmatter block that precedes the note
 // body. Keys are fixed and values are YAML-escaped (titles routinely contain
-// ":"). review_iterations/review_passed are written now for forward-compat with
-// the Phase 5 review loop (spares that phase from re-scheming existing notes).
-func (t *VaultWriterTool) buildFrontmatter(p models.Paper, ex models.ExplainerOutput) string {
+// ":"). The review_* fields reflect the Phase 5 verdict: a nil verdict means the
+// reviewer was disabled (max_review_iterations: 0) → review_iterations: 0,
+// review_passed: true, and review_score is omitted (no review ran). A set verdict
+// records its real iteration count, pass flag, and score.
+func (t *VaultWriterTool) buildFrontmatter(p models.Paper, ex models.ExplainerOutput, verdict *models.ReviewVerdict) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString(fmt.Sprintf("arxiv_id: %s\n", escapeYAML(p.ID)))
@@ -35,8 +37,16 @@ func (t *VaultWriterTool) buildFrontmatter(p models.Paper, ex models.ExplainerOu
 	b.WriteString(fmt.Sprintf("published: %s\n", escapeYAML(dateOnly(p.Published))))
 	b.WriteString(fmt.Sprintf("category: %s\n", escapeYAML(t.cfg.Agent.ArxivCategory)))
 	b.WriteString(fmt.Sprintf("generated_at: %s\n", escapeYAML(ex.CreatedAt.UTC().Format(time.RFC3339))))
-	b.WriteString("review_iterations: 1\n")
-	b.WriteString("review_passed: true\n")
+	if verdict == nil {
+		// Reviewer disabled: nothing was reviewed, so record an honest "0 rounds,
+		// passed by default" and omit the score (there is no meaningful value).
+		b.WriteString("review_iterations: 0\n")
+		b.WriteString("review_passed: true\n")
+	} else {
+		b.WriteString(fmt.Sprintf("review_iterations: %d\n", verdict.Iteration))
+		b.WriteString(fmt.Sprintf("review_passed: %t\n", verdict.Pass))
+		b.WriteString(fmt.Sprintf("review_score: %.2f\n", verdict.Score))
+	}
 	b.WriteString("tags: [ai, paper, explainer]\n")
 	b.WriteString("---\n\n")
 	return b.String()

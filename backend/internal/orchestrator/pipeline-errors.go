@@ -54,6 +54,25 @@ func describeGenErr(err error) string {
 	}
 }
 
+// describeReviewErr maps a reviewer LLM error to a user-facing message. Like
+// generation, all reviewer failures are recoverable: no vault file is written and
+// the log is untouched, so a retry is always safe. (A malformed-JSON parse error
+// is handled separately in the loop — it stops the loop rather than failing.)
+func describeReviewErr(err error) string {
+	switch {
+	case errors.Is(err, llm.ErrLLMRateLimit):
+		return "The AI provider is rate limiting requests. Please try again in a minute."
+	case errors.Is(err, llm.ErrLLMBadRequest):
+		return "The AI review request was rejected. Please try again."
+	case errors.Is(err, llm.ErrLLMTimeout):
+		return "Reviewing the explainer timed out. Please try again."
+	case errors.Is(err, llm.ErrLLMUnavailable):
+		return "The AI provider is currently unavailable. Please try again."
+	default:
+		return "Reviewing the explainer failed unexpectedly. Please try again."
+	}
+}
+
 // vaultErrMsg is the user-facing message for a vault-write failure.
 func vaultErrMsg(err error) string {
 	if !vaultRecoverable(err) {

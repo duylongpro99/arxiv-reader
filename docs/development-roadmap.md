@@ -5,7 +5,7 @@
 
 ## Overview
 
-The project is organized into six sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-05**, Phase 4 is complete. The system can discover papers, extract content, generate rich explainers, and write them to Obsidian.
+The project is organized into six sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-05**, Phase 5 is complete. The system can discover papers, extract content, generate rich explainers, review them for quality, revise iteratively, and write them to Obsidian.
 
 | Phase | Focus | Status | Completion |
 |---|---|---|---|
@@ -13,8 +13,8 @@ The project is organized into six sequential phases, each delivering a complete,
 | **2** | Discovery & Deduplication | ✅ Complete | Phase 2 PR merged |
 | **3** | HTML Extraction & LLM Client | ✅ Complete | Phase 3 PR merged |
 | **4** | Explainer & Vault Write | ✅ Complete | 2026-07-05 |
-| **5** | Reviewer & Revision Loop | ⏳ Planned | Q3 2026 |
-| **6** | Polish & Hardening | ⏳ Planned | Q4 2026 |
+| **5** | Reviewer & Revision Loop | ✅ Complete | 2026-07-05 |
+| **6** | Polish & Hardening | ⏳ Planned | Q3–Q4 2026 |
 
 ---
 
@@ -129,24 +129,58 @@ The project is organized into six sequential phases, each delivering a complete,
 ---
 
 ## Phase 5 — Reviewer & Revision Loop
-**Status:** ⏳ Planned
+**Status:** ✅ Complete (2026-07-05)
 
-**Expected Deliverables:**
-- ReviewerAgent: Evaluate explainer against quality rubric
-- Revision loop: Generate → Review → Revise until Pass or max iterations
-- ReviewVerdict: Pass/Fail with per-section feedback
-- Iteration tracking: Explainer.Iteration incremented per revision
-- Frontmatter enhancement: review_iterations and review_passed from verdict
-- Progress indicator: "reviewing" and "revising" stages
+**Deliverables:**
+- **ReviewerAgent**: Independent critic evaluating explainer against 6-criteria quality rubric
+  - Evaluates explainer text alone (source paper not sent — cost optimization)
+  - Returns structured ReviewVerdict with Pass (gates the loop), Score (advisory), and per-section Feedback
+  - Reuses same LLM client as ExplainerAgent but with distinct system prompt + low temperature (0.1)
+  - Error handling: malformed JSON stops loop gracefully with pass=false (no blind regen)
+  
+- **Bounded critic-generator loop**: Generate → Review → (Revise if fail & iterations remain) → Repeat
+  - Loop terminates when reviewer approves OR max iterations reached
+  - Always writes exactly one note (the last explainer generated)
+  - Respects max_review_iterations config knob (0 disables reviewer entirely, reproduces Phase 4)
+  - Configurable cost: default max=2 ≈ 200k tokens/paper
+  
+- **ReviewVerdict data model**: Pass/Fail decision with per-section feedback map
+  - Iteration tracking: which review round (1st, 2nd, etc.)
+  - Token accounting: separate count for each review call
+  
+- **Frontmatter enhancement**: Vault notes now reflect real verdict
+  - review_iterations: actual count from verdict (0 if reviewer disabled)
+  - review_passed: boolean approval status
+  - review_score: quality score (omitted if reviewer disabled)
+  
+- **Progress UI updates**: Status DTO and frontend surface Phase 5 states
+  - New stages: "reviewing" and "revising"
+  - Iteration counter visible during polling
+  - Progress message: "Reviewing (pass 1)…" and "Revising (pass 2)…"
+  
+- **Configuration**: New agent.max_review_iterations setting
+  - Default: 2 (bounded loop with cost ≈ 200k tokens/paper)
+  - Set to 0 to disable reviewer (Phase 4 behaviour at zero reviewer cost)
 
-**Key Changes:**
-- VaultWriterTool.WriteToVault now accepts verdict parameter
-- Orchestrator.runPipeline inserts review loop between generation and vault write
-- LLM client supports structured output for verdict JSON
+**Key Files:**
+- `/backend/internal/agents/reviewer.go`: ReviewerAgent implementation
+- `/backend/internal/models/review.go`: ReviewVerdict struct
+- `/backend/internal/agents/revision-note.go`: Format feedback into revision prompts
+- `/backend/internal/orchestrator/orchestrator-pipeline.go`: Bounded loop implementation
+- `/backend/internal/tools/vaultwriter-frontmatter.go`: Frontmatter rendering with verdict fields
+- `/config.yaml`: agent.max_review_iterations setting (default 2)
+
+**Architecture:**
+- **Design Decision 1 (Policy):** Pass is single source of truth; Score never gates the loop
+- **Design Decision 2 (Fault Handling):** Malformed reviewer JSON stops loop and saves with pass=false (no blind regen)
+- **Text-only reviewer:** Paper Markdown intentionally NOT sent to reviewer (cost optimization per T3)
+- **Shared LLM:** Reviewer and explainer use same LLM client with different system prompts + temperature
+- **Error resilience:** Reviewer LLM/network error fails session recoverably; parse errors save with pass=false
 
 **Dependencies:**
-- Phase 4 must be complete (explainer generation working)
-- All 9 sections stable from Phase 4 (reviewer expects consistent structure)
+- Phase 4 complete (ExplainerAgent and VaultWriterTool working)
+- All 9 explainer sections stable (reviewer targets consistent structure)
+- Config system supporting max_review_iterations knob
 
 ---
 
@@ -178,6 +212,8 @@ The project is organized into six sequential phases, each delivering a complete,
 | Phase 3 HTML extraction & LLM | 2026-06-28 | ✅ Yes |
 | Phase 4 explainer & vault write | 2026-07-05 | ✅ Yes |
 | User can trigger → select → receive note | 2026-07-05 | ✅ Yes |
+| Phase 5 reviewer & revision loop | 2026-07-05 | ✅ Yes |
+| Full pipeline with quality review | 2026-07-05 | ✅ Yes |
 
 ---
 
@@ -211,11 +247,13 @@ The project is organized into six sequential phases, each delivering a complete,
 
 ## Known Limitations & Future Work
 
-### Phase 4 Limitations
-- **Single-pass generation:** No revision loop; Phase 5 adds that
+### Phase 5 Limitations (resolved from Phase 4)
+- ~~**Single-pass generation:** No revision loop; Phase 5 adds that~~ → Phase 5 adds critic-generator loop
 - **Text-only:** Diagrams described by captions only; Phase ? may add optional image channel
 - **No auto-linking:** Follow-up papers listed; user opens arXiv manually; Phase ? may add links
 - **Obsidian only:** No other vault formats; future phases may add more targets
+- **Single paper per run:** No batch processing; Phase ? may add multiple papers
+- **Reviewer cost:** Default 2 iterations ≈ 200k tokens/paper; Phase 6 may add cost monitoring
 
 ### Recommended Additions (Post-Phase 6)
 - Multi-category support (not just `cs.AI`)

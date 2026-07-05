@@ -41,7 +41,7 @@ func TestWriteToVaultHappyPath(t *testing.T) {
 		Authors: []string{"A. Vaswani", `N. "Noam" Shazeer`}, Published: "2017-06-12T00:00:00Z",
 	}
 
-	path, err := w.WriteToVault(context.Background(), sampleExplainer(), paper)
+	path, err := w.WriteToVault(context.Background(), sampleExplainer(), paper, nil)
 	if err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
@@ -69,8 +69,12 @@ func TestWriteToVaultHappyPath(t *testing.T) {
 	if fm["category"] != "cs.AI" {
 		t.Fatalf("category should come from config: %v", fm["category"])
 	}
-	if fm["review_iterations"] != 1 || fm["review_passed"] != true {
-		t.Fatalf("forward-compat review fields wrong: %v / %v", fm["review_iterations"], fm["review_passed"])
+	// nil verdict = reviewer disabled: 0 iterations, passed by default, no score key.
+	if fm["review_iterations"] != 0 || fm["review_passed"] != true {
+		t.Fatalf("nil-verdict review fields wrong: %v / %v", fm["review_iterations"], fm["review_passed"])
+	}
+	if _, ok := fm["review_score"]; ok {
+		t.Fatalf("review_score must be omitted for a nil verdict, got %v", fm["review_score"])
 	}
 	if fm["published"] != "2024-01-15" && fm["published"] != "2017-06-12" {
 		// published is the RFC3339 date part -> 2017-06-12
@@ -101,7 +105,7 @@ func TestWriteToVaultRenameFailureCleansTmp(t *testing.T) {
 		t.Fatalf("setup dir: %v", err)
 	}
 
-	_, err := w.WriteToVault(context.Background(), sampleExplainer(), paper)
+	_, err := w.WriteToVault(context.Background(), sampleExplainer(), paper, nil)
 	if err == nil {
 		t.Fatal("expected rename failure")
 	}
@@ -128,11 +132,11 @@ func TestValidateWithinBaseRejectsTraversal(t *testing.T) {
 
 func TestSlugifyEdgeCases(t *testing.T) {
 	cases := map[string]string{
-		"Attention Is All You Need":          "attention-is-all-you-need",
-		"  Mixed   CASE & Symbols!! ":         "mixed-case-symbols",
-		"":                                    "untitled",
-		"—— ///":                              "untitled",
-		strings.Repeat("word ", 30):           "", // long — only assert length below
+		"Attention Is All You Need":   "attention-is-all-you-need",
+		"  Mixed   CASE & Symbols!! ": "mixed-case-symbols",
+		"":                            "untitled",
+		"—— ///":                      "untitled",
+		strings.Repeat("word ", 30):   "", // long — only assert length below
 	}
 	for in, want := range cases {
 		got := slugify(in)
@@ -162,7 +166,7 @@ func TestDateOnlyFallbacks(t *testing.T) {
 
 func TestSanitizeArxivID(t *testing.T) {
 	cases := map[string]string{
-		"2401.12345v2": "2401.12345v2",
+		"2401.12345v2":  "2401.12345v2",
 		"cs.AI/0123456": "cs.ai0123456",
 		// Path separators are stripped (dots are filename-safe and kept), so no
 		// "/" survives → the result can never traverse.

@@ -86,13 +86,15 @@ func (f *fakeExplainer) Generate(context.Context, agents.ExplainerInput) (models
 
 // fakeVault records the write and returns a canned path or a forced error.
 type fakeVault struct {
-	path    string
-	err     error
-	written int32
+	path        string
+	err         error
+	written     int32
+	lastVerdict *models.ReviewVerdict // captured for review-loop assertions
 }
 
-func (f *fakeVault) WriteToVault(context.Context, models.ExplainerOutput, models.Paper) (string, error) {
+func (f *fakeVault) WriteToVault(_ context.Context, _ models.ExplainerOutput, _ models.Paper, verdict *models.ReviewVerdict) (string, error) {
 	atomic.AddInt32(&f.written, 1)
+	f.lastVerdict = verdict
 	if f.err != nil {
 		return "", f.err
 	}

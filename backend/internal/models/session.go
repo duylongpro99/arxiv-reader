@@ -15,6 +15,8 @@ const (
 	StageSelection  PipelineStage = "selection"  // candidates ready, awaiting user pick
 	StageExtracting PipelineStage = "extracting" // fetching + converting paper HTML → Markdown
 	StageGenerating PipelineStage = "generating" // Phase 4: LLM writing the explainer note
+	StageReviewing  PipelineStage = "reviewing"  // Phase 5: ReviewerAgent scoring the explainer
+	StageRevising   PipelineStage = "revising"   // Phase 5: ExplainerAgent revising after a failed review
 	StageWriting    PipelineStage = "writing"    // Phase 4: atomic write to the Obsidian vault
 	StageComplete   PipelineStage = "complete"   // Phase 4: note saved; /result is ready
 	StageFailed     PipelineStage = "failed"     // pipeline aborted; see Error/Recoverable
@@ -47,6 +49,12 @@ type PipelineSession struct {
 	explainer  *ExplainerOutput
 	vaultFile  string
 	tokensUsed int
+	// Phase 5 review-loop state. verdict is the latest reviewer judgement (nil
+	// before any review, and permanently nil when the reviewer is disabled via
+	// max_review_iterations: 0). iteration is the current generate/review pass
+	// (1-based). Both are surfaced to the frontend through Snapshot().
+	verdict   *ReviewVerdict
+	iteration int
 }
 
 // SessionSnapshot is an immutable, mutex-free copy of a session's observable
@@ -59,6 +67,11 @@ type SessionSnapshot struct {
 	Error       string
 	Recoverable bool
 	StartedAt   time.Time
+	// Phase 5 review progress, derived from verdict/iteration. ReviewScore and
+	// ReviewPassed are zero-valued (0/false) when no verdict is set yet.
+	Iteration    int
+	ReviewScore  float32
+	ReviewPassed bool
 }
 
 // NewSession creates a session in the discovery stage. id must be unique.
@@ -80,14 +93,24 @@ func (s *PipelineSession) Snapshot() SessionSnapshot {
 		cands = make([]Paper, len(s.candidates))
 		copy(cands, s.candidates)
 	}
+	// Derive review fields from verdict; zero-valued when no review has run.
+	var score float32
+	var passed bool
+	if s.verdict != nil {
+		score = s.verdict.Score
+		passed = s.verdict.Pass
+	}
 	return SessionSnapshot{
-		SessionID:   s.SessionID,
-		Stage:       s.stage,
-		Candidates:  cands,
-		Notice:      s.notice,
-		Error:       s.errMsg,
-		Recoverable: s.recoverable,
-		StartedAt:   s.startedAt,
+		SessionID:    s.SessionID,
+		Stage:        s.stage,
+		Candidates:   cands,
+		Notice:       s.notice,
+		Error:        s.errMsg,
+		Recoverable:  s.recoverable,
+		StartedAt:    s.startedAt,
+		Iteration:    s.iteration,
+		ReviewScore:  score,
+		ReviewPassed: passed,
 	}
 }
 
@@ -178,6 +201,37 @@ func (s *PipelineSession) TokensUsed() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.tokensUsed
+}
+
+// SetVerdict stores the latest reviewer judgement (Phase 5). Also drives the
+// review fields in Snapshot(); server keeps the full struct for the vault write.
+func (s *PipelineSession) SetVerdict(v *ReviewVerdict) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.verdict = v
+}
+
+// Verdict returns the latest reviewer judgement, or nil if none (reviewer
+// disabled, or before the first review). The vault write reads it here.
+func (s *PipelineSession) Verdict() *ReviewVerdict {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.verdict
+}
+
+// SetIteration records the current generate/review pass (1-based). Surfaced to
+// the frontend via Snapshot() so the UI can label "Reviewing (pass N)".
+func (s *PipelineSession) SetIteration(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.iteration = n
+}
+
+// Iteration returns the current generate/review pass, or 0 before the loop runs.
+func (s *PipelineSession) Iteration() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.iteration
 }
 
 // SetMarkdown stores the extracted paper Markdown (server-only; excluded from

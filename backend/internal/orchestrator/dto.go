@@ -20,6 +20,12 @@ type StatusResponse struct {
 	Notice      string               `json:"notice,omitempty"`
 	Error       string               `json:"error,omitempty"`
 	Recoverable bool                 `json:"recoverable,omitempty"`
+	// Phase 5 review progress. omitempty keeps pre-review stages clean (no
+	// iteration:0 noise); the definitive pass/fail is read from /result + the
+	// vault note, not this poll.
+	Iteration    int     `json:"iteration,omitempty"`
+	ReviewScore  float32 `json:"reviewScore,omitempty"`
+	ReviewPassed bool    `json:"reviewPassed,omitempty"`
 }
 
 type ProcessRequest struct {

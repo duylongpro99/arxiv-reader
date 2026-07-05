@@ -42,7 +42,13 @@ type Explainer interface {
 }
 
 type VaultWriter interface {
-	WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper) (string, error)
+	WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper, verdict *models.ReviewVerdict) (string, error)
+}
+
+// Reviewer is the Phase 5 consumer contract for the critic in the revision loop.
+// Defined here (consumer-side) so the orchestrator stays testable with a fake.
+type Reviewer interface {
+	Review(ctx context.Context, ex models.ExplainerOutput, paper models.Paper, iteration int) (models.ReviewVerdict, error)
 }
 
 // Orchestrator holds the session store and the tools it sequences.
@@ -53,6 +59,7 @@ type Orchestrator struct {
 	logCheck  Unprocessor
 	content   PaperContent // Phase 3: HTML → Markdown extraction
 	explainer Explainer    // Phase 4: LLM re-teaching generation
+	reviewer  Reviewer     // Phase 5: independent critic (revision loop)
 	vault     VaultWriter  // Phase 4: atomic Obsidian vault write
 }
 
@@ -76,6 +83,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		logCheck:  logCheck,
 		content:   tools.NewPaperContentTool(&cfg.Agent),
 		explainer: agents.New(client, cfg),
+		reviewer:  agents.NewReviewer(client, cfg), // shares the explainer's LLM client
 		vault:     tools.NewVaultWriterTool(cfg, logCheck),
 	}, nil
 }
@@ -162,11 +170,14 @@ func (o *Orchestrator) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := v.(*models.PipelineSession).Snapshot()
 	writeJSON(w, http.StatusOK, StatusResponse{
-		Stage:       snap.Stage,
-		Candidates:  snap.Candidates,
-		Notice:      snap.Notice,
-		Error:       snap.Error,
-		Recoverable: snap.Recoverable,
+		Stage:        snap.Stage,
+		Candidates:   snap.Candidates,
+		Notice:       snap.Notice,
+		Error:        snap.Error,
+		Recoverable:  snap.Recoverable,
+		Iteration:    snap.Iteration,
+		ReviewScore:  snap.ReviewScore,
+		ReviewPassed: snap.ReviewPassed,
 	})
 }
 
@@ -197,4 +208,3 @@ func (o *Orchestrator) HandleResult(w http.ResponseWriter, r *http.Request) {
 		TokensUsed: s.TokensUsed(),
 	})
 }
-

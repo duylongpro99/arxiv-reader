@@ -30,6 +30,11 @@ export interface PipelineStatus {
   notice?: string;
   error?: string;
   recoverable?: boolean;
+  // Phase 5 review-loop progress. Omitted by the backend before review starts
+  // (see the Go StatusResponse `omitempty` tags).
+  iteration?: number;
+  reviewScore?: number;
+  reviewPassed?: boolean;
 }
 
 export interface TriggerResponse {

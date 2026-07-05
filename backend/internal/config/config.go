@@ -51,6 +51,9 @@ type AgentConfig struct {
 	// and a byte cap feeding io.LimitReader as the OOM guard on fetched bodies.
 	ArxivHTMLBaseURL string `yaml:"arxiv_html_base_url"` // default https://arxiv.org/html
 	MaxContentBytes  int64  `yaml:"max_content_bytes"`   // io.LimitReader cap; > 0
+	// Phase 5 reviewer loop: max critic→revision rounds per paper. 0 disables the
+	// reviewer entirely (reproduces Phase-4 behaviour at zero reviewer cost).
+	MaxReviewIterations int `yaml:"max_review_iterations"` // >= 0; default 2
 }
 
 // validProviders is the whitelist enforced by validate().
@@ -179,6 +182,10 @@ func (a *AgentConfig) validate() error {
 	}
 	if a.MaxContentBytes <= 0 {
 		return fmt.Errorf("agent.max_content_bytes must be > 0, got %d.\n  → Set agent.max_content_bytes in config.yaml", a.MaxContentBytes)
+	}
+	// 0 is valid: it disables the reviewer. Only a negative value is rejected.
+	if a.MaxReviewIterations < 0 {
+		return fmt.Errorf("agent.max_review_iterations must be >= 0, got %d.\n  → Set agent.max_review_iterations in config.yaml (0 disables the reviewer)", a.MaxReviewIterations)
 	}
 	return nil
 }

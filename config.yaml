@@ -27,3 +27,4 @@ agent:
   max_retries: 3                     # 429/5xx backoff: 3s -> 6s -> 12s
   arxiv_html_base_url: https://arxiv.org/html   # LaTeXML HTML rendering base (Phase 3)
   max_content_bytes: 52428800        # 50MB cap on fetched HTML (io.LimitReader OOM guard)
+  max_review_iterations: 2           # Phase 5 critic→revision rounds/paper (0 disables reviewer; ~200k tok/paper at 2)

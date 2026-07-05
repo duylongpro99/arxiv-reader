@@ -108,27 +108,86 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 		return
 	}
 
-	s.SetStage(models.StageGenerating)
-	ex, err := o.explainer.Generate(ctx, agents.ExplainerInput{MarkdownText: md, PaperMeta: *paper})
-	if err != nil {
-		// Generation errors are retryable — no vault file written, log untouched.
-		s.Fail(describeGenErr(err), true)
-		slog.Error("explainer generation failed", "session_id", s.SessionID, "paper_id", paperID, "error", err.Error())
-		return
+	// --- Phase 5: bounded critic-generator loop. ---
+	//
+	// The loop always terminates (via one of the explicit breaks), always writes
+	// exactly one note (the last explainer), and honours max=0 (reviewer disabled,
+	// Phase-4 path). A revision note produced by a failing review is threaded back
+	// into the next generation via the existing ExplainerInput.RevisionNote seam.
+	maxIter := o.cfg.Agent.MaxReviewIterations
+	var lastEx models.ExplainerOutput
+	revisionNote := ""
+
+	for iteration := 1; ; iteration++ {
+		s.SetIteration(iteration)
+		// First pass is a fresh generation; later passes revise using the note.
+		if iteration == 1 {
+			s.SetStage(models.StageGenerating)
+		} else {
+			s.SetStage(models.StageRevising)
+		}
+
+		ex, err := o.explainer.Generate(ctx, agents.ExplainerInput{
+			MarkdownText: md, PaperMeta: *paper, RevisionNote: revisionNote,
+		})
+		if err != nil {
+			// Generation errors are retryable — no vault file written, log untouched.
+			s.Fail(describeGenErr(err), true)
+			slog.Error("explainer generation failed", "session_id", s.SessionID, "paper_id", paperID, "iteration", iteration, "error", err.Error())
+			return
+		}
+		// A degenerate empty response (no error) would otherwise be written as a
+		// frontmatter-only note and mark the paper processed. Treat it as a
+		// recoverable generation failure so the paper re-surfaces for a retry.
+		if strings.TrimSpace(ex.Content) == "" {
+			s.Fail("The AI returned an empty explainer. Please try again.", true)
+			slog.Error("explainer generation empty", "session_id", s.SessionID, "paper_id", paperID, "iteration", iteration)
+			return
+		}
+		ex.Iteration = iteration // explainer hardcodes 1; stamp the real loop value
+		lastEx = ex
+		s.SetExplainer(&ex)
+		s.AddTokens(ex.InputTokens + ex.OutputTokens)
+
+		if maxIter == 0 {
+			break // reviewer disabled → Phase-4 path; verdict stays nil
+		}
+
+		s.SetStage(models.StageReviewing)
+		verdict, err := o.reviewer.Review(ctx, ex, *paper, iteration)
+		if errors.Is(err, agents.ErrReviewParse) {
+			// Decision 2: malformed reviewer JSON stops the loop and saves the
+			// current explainer flagged as not-passed — no blind, no-guidance regen.
+			// The verdict carries {Pass:false, Score:0} plus the tokens the (successful)
+			// review call consumed, so token accounting stays accurate.
+			s.SetVerdict(&verdict)
+			s.AddTokens(verdict.TokensUsed)
+			slog.Warn("reviewer json parse failed; stopping loop", "session_id", s.SessionID, "iteration", iteration)
+			break
+		}
+		if err != nil {
+			// Real LLM/network error — recoverable, fail the session (no write).
+			s.Fail(describeReviewErr(err), true)
+			slog.Error("reviewer failed", "session_id", s.SessionID, "paper_id", paperID, "iteration", iteration, "error", err.Error())
+			return
+		}
+		s.SetVerdict(&verdict)
+		s.AddTokens(verdict.TokensUsed)
+
+		if verdict.Pass {
+			slog.Info("reviewer approved explainer", "session_id", s.SessionID, "iteration", iteration, "score", verdict.Score)
+			break
+		}
+		if iteration >= maxIter {
+			slog.Warn("max review iterations reached without approval", "session_id", s.SessionID, "final_score", verdict.Score)
+			break
+		}
+		// Not passed and iterations remain: build the note for the next revision.
+		revisionNote = agents.FormatRevisionNote(verdict)
 	}
-	// A degenerate empty response (no error) would otherwise be written as a
-	// frontmatter-only note and mark the paper processed. Treat it as a
-	// recoverable generation failure so the paper re-surfaces for a retry.
-	if strings.TrimSpace(ex.Content) == "" {
-		s.Fail("The AI returned an empty explainer. Please try again.", true)
-		slog.Error("explainer generation empty", "session_id", s.SessionID, "paper_id", paperID)
-		return
-	}
-	s.SetExplainer(&ex)
-	s.AddTokens(ex.InputTokens + ex.OutputTokens)
 
 	s.SetStage(models.StageWriting)
-	path, err := o.vault.WriteToVault(ctx, ex, *paper)
+	path, err := o.vault.WriteToVault(ctx, lastEx, *paper, s.Verdict())
 	if err != nil {
 		// Permission/disk failures won't fix themselves on retry; others might.
 		s.Fail(vaultErrMsg(err), vaultRecoverable(err))

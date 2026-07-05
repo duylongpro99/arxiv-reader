@@ -105,7 +105,7 @@ export function DiscoveryPanel() {
       )}
 
       {sessionId && status && status.stage !== "failed" && (
-        <ProgressIndicator stage={status.stage} />
+        <ProgressIndicator status={status} />
       )}
 
       {status?.stage === "failed" && (

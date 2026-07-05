@@ -29,13 +29,15 @@ func NewVaultWriterTool(cfg *config.Config, logCheck *LogCheckTool) *VaultWriter
 
 // WriteToVault assembles frontmatter + content, writes it atomically to
 // {vault}/AI Papers/{filename}, then records the paper as processed. It returns
-// the final absolute path. NO verdict param — Phase 5 adds review state.
+// the final absolute path. verdict is the Phase 5 review outcome: nil means the
+// reviewer was disabled (frontmatter records review_iterations: 0, review_passed:
+// true); a set verdict drives the real review_* fields.
 //
 // Atomicity: write to a sibling ".tmp" then os.Rename (atomic on the same
 // filesystem). A rename failure removes the temp file so no orphan ".tmp" is
 // left. A post-write log-update failure is a WARNING, not an error: the note is
 // already saved; the only consequence is the paper re-surfaces next run.
-func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper) (string, error) {
+func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper, verdict *models.ReviewVerdict) (string, error) {
 	start := time.Now()
 	vaultDir := filepath.Join(t.cfg.Paths.ObsidianVault, "AI Papers")
 	filename := t.generateFilename(p)
@@ -52,7 +54,7 @@ func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerO
 
 	slog.Info("vault write started", "paper_id", p.ID, "filename", filename)
 
-	content := t.buildFrontmatter(p, ex) + ex.Content
+	content := t.buildFrontmatter(p, ex, verdict) + ex.Content
 	// Atomic + unique-temp write: no partial file ever appears at finalPath, and
 	// concurrent writers to the same note never collide on one temp (see
 	// writeFileAtomic). A failure leaves no orphan temp behind.

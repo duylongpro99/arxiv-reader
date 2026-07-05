@@ -245,28 +245,41 @@ func Generate(ctx context.Context, input ExplainerInput) (ExplainerOutput, error
 **Purpose:** Independent critic — evaluates explainer quality and drives the revision loop.
 
 **Responsibilities:**
-- Evaluate explainer against a fixed quality rubric:
+- Evaluate **explainer text only** (paper Markdown NOT sent — cost optimization per design T3)
+- Score against a fixed 6-criteria rubric:
   - Is the core author intent clearly captured?
   - Are analogies accurate and layered (intuition → engineering)?
   - Is math handled appropriately?
   - Are diagrams and figures described and explained correctly?
   - Is the glossary prioritized correctly?
   - Is the tone right for technical practitioners?
-- Return structured verdict: `Pass` or `Fail` with actionable per-section feedback
-- Signal loop termination when quality threshold is met or max iterations reached
+- Return structured verdict: `Pass` is the single source of truth (verbatim from model); `Score` is advisory only
+- Generate section-level feedback for failed reviews (fed back to ExplainerAgent for revision)
+- Reuse the same `llm.LLMClient` as the ExplainerAgent (distinct system prompt + low temperature provide meaningfully different evaluation behaviour)
+
+**Design Decision 1 (Policy):** `Pass` gates the loop, never `Score`. Score is advisory for observability, never blocks progress.
+
+**Design Decision 2 (Fault Handling):** Malformed reviewer JSON (not valid JSON after fence stripping) stops the loop immediately and saves the current explainer flagged as `review_passed: false` — no blind regeneration without guidance.
 
 **Interface:**
 ```go
 type ReviewVerdict struct {
-    Pass      bool
-    Score     float32            // 0.0 - 1.0
-    Feedback  map[string]string  // section → revision note
-    Iteration int
-    CreatedAt time.Time
+    PaperID    string
+    Pass       bool              // single source of truth; verbatim from model
+    Score      float32           // 0.0 - 1.0, advisory only (never gates)
+    Feedback   map[string]string // section slug → actionable revision note
+    Iteration  int               // which review round this was (1st, 2nd, etc.)
+    TokensUsed int               // tokens for this review call
+    CreatedAt  time.Time
 }
 
-func Review(ctx context.Context, explainer ExplainerOutput, iteration int) (ReviewVerdict, error)
+func (a *ReviewerAgent) Review(ctx context.Context, ex ExplainerOutput, paper Paper, iteration int) (ReviewVerdict, error)
 ```
+
+**Error Handling:**
+- JSON parse failure → returns `ErrReviewParse` sentinel (distinguishable from real LLM errors)
+- LLM/network error → returns error unchanged (fails session recoverably, no write)
+- Orchestrator respects both distinctions: parse error halts loop with `pass: false`, other errors fail the run
 
 **Dependencies:** LLM Client (configurable), Config (max iterations)
 
@@ -274,10 +287,10 @@ func Review(ctx context.Context, explainer ExplainerOutput, iteration int) (Revi
 
 ### 8. VaultWriterTool (ADK Tool)
 
-**Purpose:** Persist the explainer to the Obsidian vault atomically.
+**Purpose:** Persist the explainer to the Obsidian vault atomically with review metadata.
 
 **Responsibilities:**
-- Format final Markdown with consistent YAML frontmatter
+- Format final Markdown with consistent YAML frontmatter (including Phase 5 review verdict)
 - Generate filename: `YYYY-MM-DD_arxivID_slug-title.md` with date parsed from Paper.Published string
 - Write file atomically to configured Obsidian vault subfolder (`.tmp` → `rename`)
 - Trigger `LogCheckTool.MarkAsProcessed()` after successful write (failure is warning, not fatal)
@@ -291,17 +304,20 @@ type VaultWriterTool struct {
 
 func NewVaultWriterTool(cfg *config.Config, logCheck *LogCheckTool) *VaultWriterTool
 
-func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex ExplainerOutput, p Paper) (string, error)
-// returns the final absolute path written; NO verdict parameter (Phase 5 adds review state)
+func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex ExplainerOutput, p Paper, verdict *ReviewVerdict) (string, error)
+// returns the final absolute path written
+// verdict is nil if reviewer disabled (maxReviewIterations=0), otherwise contains Phase 5 review result
 ```
 
 **Frontmatter fields:**
 - `arxiv_id`: from Paper.ID
-- `title`, `authors` (YAML list), `abstract`: from Paper metadata
+- `title`, `authors` (YAML list): from Paper metadata
 - `published`: date part of Paper.Published string (parsed RFC3339 or first 10 chars)
 - `category`: from `config.Agent.ArxivCategory` (NOT from Paper, which has no Category field)
 - `generated_at`: RFC3339 UTC timestamp
-- `review_iterations: 1`, `review_passed: true`: hardcoded now, forward-compatible for Phase 5
+- **Phase 5 review fields** (per verdict):
+  - If `verdict == nil` (reviewer disabled): `review_iterations: 0`, `review_passed: true`, no `review_score`
+  - If `verdict != nil`: `review_iterations: {verdict.Iteration}`, `review_passed: {verdict.Pass}`, `review_score: {verdict.Score}`
 - `tags`: `[ai, paper, explainer]`
 
 **Dependencies:** Local filesystem (vault path from config), LogCheckTool, config
@@ -366,11 +382,15 @@ llm:
   base_url: ""                      # optional: override API endpoint
 
 agent:
-  max_review_iterations: 2          # reviewer loop cap (0 = disable review)
-  paper_fetch_limit: 5              # top N papers per discovery run
-  request_timeout_sec: 30           # timeout for HTTP requests (arXiv API, HTML fetch)
-  max_retries: 3                    # max retries for transient failures
+  max_review_iterations: 2          # Phase 5: critic→revision rounds per paper (0 = disable reviewer, reproduce Phase 4)
+  arxiv_category: "cs.AI"           # papers to fetch from arXiv
+  arxiv_base_url: "https://export.arxiv.org/api/query"  # arXiv API endpoint
   arxiv_html_base_url: "https://arxiv.org/html"  # arXiv HTML rendering endpoint
+  fetch_limit: 20                   # papers fetched per discovery trigger
+  display_limit: 5                  # papers shown to user for selection
+  request_timeout_sec: 30           # timeout for HTTP requests (arXiv API, HTML fetch)
+  max_retries: 3                    # max retries for transient failures (429, 503)
+  max_content_bytes: 52428800       # 50MB size cap for fetched paper HTML
 
 arxiv:
   category: "cs.AI"
@@ -442,6 +462,7 @@ type ReviewVerdict struct {
 type PipelineSession struct {
     SessionID   string
     Stage       PipelineStage
+    Iteration   int               // Phase 5: current reviewer/revision loop iteration (incremented each round)
     Candidates  []Paper           // frontend-visible: candidates for selection
     Notice      string            // optional user-facing message
     Error       string            // error message if stage = "failed"
@@ -450,8 +471,8 @@ type PipelineSession struct {
     // Server-only (excluded from Snapshot, never sent to frontend)
     SelectedPaper *Paper          // paper user selected
     MarkdownText  string          // extracted HTML→Markdown from PaperContentTool
-    Explainer     *ExplainerOutput    // Phase 4
-    LastVerdict   *ReviewVerdict      // Phase 5
+    Explainer     *ExplainerOutput    // Phase 4+5: current explainer (updated each iteration)
+    Verdict       *ReviewVerdict      // Phase 5: review result from last iteration (nil if reviewer disabled or not yet reviewed)
     
     StartedAt     time.Time
     CompletedAt   *time.Time
@@ -462,10 +483,10 @@ const (
     StageDiscovery  PipelineStage = "discovery"      // fetching + filtering papers
     StageSelection  PipelineStage = "selection"      // candidates ready, awaiting pick
     StageExtracting PipelineStage = "extracting"     // fetching + converting HTML → Markdown
-    StageGenerating PipelineStage = "generating"     // Phase 4: explainer generation
-    StageReviewing  PipelineStage = "reviewing"      // Phase 5: quality review
-    StageRevising   PipelineStage = "revising"       // Phase 5: revision loop
-    StageWriting    PipelineStage = "writing"        // Phase 4: vault write
+    StageGenerating PipelineStage = "generating"     // Phase 4+5: initial explainer generation
+    StageReviewing  PipelineStage = "reviewing"      // Phase 5: quality review (critic evaluation)
+    StageRevising   PipelineStage = "revising"       // Phase 5: revision loop (iterate on feedback)
+    StageWriting    PipelineStage = "writing"        // Phase 4+5: vault write (after all reviews pass)
     StageComplete   PipelineStage = "complete"       // success
     StageFailed     PipelineStage = "failed"         // pipeline aborted
 )
@@ -494,6 +515,9 @@ authors: ["Author One", "Author Two"]
 published: "2026-06-07"
 category: "cs.AI"
 generated_at: "2026-06-07T10:30:00Z"
+review_iterations: 2
+review_passed: true
+review_score: 0.89
 tags: [ai, paper, explainer]
 ---
 
@@ -592,29 +616,61 @@ PaperContentTool detached goroutine
     │                          (candidates preserved, return to selection)
     │
     ▼
-ExplainerAgent (iteration 1)
-    → CompletionRequest { system_prompt, user_prompt, document_text: markdown, revision_note: "" }
-    → LLMClient.Complete()
-    → ExplainerOutput { content, sections, iteration: 1 }
+┌─────────────────────────────────────────────────────────────┐
+│  Phase 5: Bounded Critic-Generator Loop (config-driven)     │
+│                                                              │
+│  maxIter := config.Agent.MaxReviewIterations (0 = skip)    │
+│                                                              │
+│  for iteration := 1; ; iteration++ {                        │
+│    ┌──────────────────────────────────────────────────────┐ │
+│    │ GENERATE (Iteration N)                               │ │
+│    │  → if N == 1: fresh generation                       │ │
+│    │  → if N > 1: revision with feedback from prev round  │ │
+│    │  → ExplainerAgent.Generate(markdown, revisionNote)   │ │
+│    │  → ExplainerOutput { content, sections, iteration:N} │ │
+│    │  → stage := "generating"/"revising"                  │ │
+│    │  → SetExplainer(&ex); AddTokens()                    │ │
+│    └──────────────────────────────────────────────────────┘ │
+│    │                                                         │
+│    │  if maxIter == 0 → break (reviewer disabled)           │
+│    │                                                         │
+│    ▼                                                         │
+│    ┌──────────────────────────────────────────────────────┐ │
+│    │ REVIEW (Pass N)                                      │ │
+│    │  → stage := "reviewing"                              │ │
+│    │  → ReviewerAgent.Review(explainer, paper, iter=N)    │ │
+│    │  → ReviewVerdict { pass, score, feedback, iter:N }   │ │
+│    │  → SetVerdict(&verdict); AddTokens()                 │ │
+│    │  → AddTokens(verdict.TokensUsed)                     │ │
+│    └──────────────────────────────────────────────────────┘ │
+│    │                                                         │
+│    │  if verdict.Pass == true → break (approved)            │
+│    │  if iteration >= maxIter → break (max reached)         │
+│    │  else: continue to REVISE                              │
+│    │                                                         │
+│    ▼                                                         │
+│    ┌──────────────────────────────────────────────────────┐ │
+│    │ BUILD REVISION FEEDBACK                              │ │
+│    │  → formatRevisionNote(verdict.Feedback)              │ │
+│    │  → revisionNote := structured feedback string         │ │
+│    │  → loop back to GENERATE with revisionNote           │ │
+│    └──────────────────────────────────────────────────────┘ │
+│  }                                                            │
+│                                                              │
+│  ► Loop terminates: either verdict.Pass OR max iterations   │
+│  ► Always writes exactly one note (lastEx)                  │
+│  ► Always honors maxIter == 0 (Phase 4 path, no reviewer)   │
+└─────────────────────────────────────────────────────────────┘
     │
     ▼
-ReviewerAgent
-    → CompletionRequest { system_prompt, rubric, explainer sections (text) }
-    → LLMClient.Complete()
-    → ReviewVerdict { pass, score, feedback, iteration }
-    │
-    ▼
-┌─── Orchestrator evaluates verdict ───────────────────────────────┐
-│                                                                   │
-│  if verdict.Pass == true OR iterations >= config.MaxIterations:  │
-│      → proceed to Flow 3                                         │
-│                                                                   │
-│  else:                                                            │
-│      → pass verdict.Feedback back to ExplainerAgent              │
-│      → ExplainerAgent rebuilds with revision_note from feedback  │
-│      → loop                                                       │
-└───────────────────────────────────────────────────────────────────┘
+Proceed to Flow 3: Vault Write & Completion
 ```
+
+**Error Handling in Review Loop:**
+- **Reviewer JSON parse error** → Stop loop, save explainer with `review_passed: false` (Decision 2: no blind regen)
+- **Reviewer LLM/network error** → Fail session recoverably (no write, paper can re-surface)
+- **Generator error** → Fail session recoverably
+- **Empty generator response** → Fail session recoverably (prevents all-whitespace notes)
 
 ### Flow 3 — Vault Write & Completion
 

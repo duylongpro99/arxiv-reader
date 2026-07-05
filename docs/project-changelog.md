@@ -5,6 +5,159 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
+## [Phase 5] — 2026-07-05
+
+### Added
+
+#### Core Features
+- **ReviewerAgent**: Independent critic evaluating explainer quality
+  - 6-criteria rubric: author intent clarity, analogies, math handling, figures, glossary, tone
+  - Text-only review (source paper not sent — cost optimization)
+  - Low temperature evaluation (0.1) for consistent, repeatable judgements
+  - Returns ReviewVerdict with Pass (single source of truth), Score (advisory), Feedback (per-section)
+  - JSON parsing with markdown fence stripping
+
+- **Bounded Critic-Generator Loop**: Phase 5 orchestration in runPipeline
+  - Generate → Review → (Revise if fail & iterations remain) → Repeat until Pass or max reached
+  - Always terminates and writes exactly one note (the last explainer)
+  - Respects max_review_iterations config (0 disables reviewer entirely)
+  - Revision note formatting: structures feedback from failed reviews for next generation
+  - Error handling: parse errors stop loop gracefully; LLM errors fail session recoverably
+
+- **ReviewVerdict Data Model**: Structured review result
+  - Pass: boolean verdict (gates the loop, never Score)
+  - Score: 0.0–1.0 quality rating (advisory for observability)
+  - Feedback: map[section_slug]revision_note for failed reviews
+  - Iteration & TokensUsed: cost tracking per review call
+
+- **Frontmatter Enhancement**: Vault notes reflect real review state
+  - review_iterations: actual count from ReviewVerdict
+  - review_passed: boolean approval status
+  - review_score: included only when reviewer ran (omitted if max_review_iterations=0)
+
+- **Session Enhancements**: Phase 5 pipeline state
+  - New Iteration field: tracks current reviewer/revision loop round
+  - SetIteration/SetVerdict accessor methods
+  - Updated Explainer after each revision
+
+- **Configuration**: New agent.max_review_iterations setting
+  - Default: 2 (bounded loop, ~200k tokens/paper)
+  - 0 = disable reviewer (Phase 4 behavior at zero cost)
+  - >= 0 validation: negative values rejected at config load
+
+- **Progress UI**: Frontend surfaces review loop states
+  - New stages: StageReviewing ("reviewing") and StageRevising ("revising")
+  - Iteration counter visible during status polling
+  - Progress message shows "Reviewing (pass N)…" and "Revising (pass N)…"
+  - Session accessors: Iteration, ReviewScore, ReviewPassed (Snapshot dto)
+
+#### Documentation
+- Updated `docs/architecture.md` §2.7 ReviewerAgent with detailed design decisions
+- Updated `docs/architecture.md` Flow 2 with complete bounded loop diagram
+- Updated `docs/architecture.md` frontmatter examples showing review_* fields
+- Updated `docs/development-roadmap.md` Phase 5 to Complete with full deliverables
+- Updated `docs/project-changelog.md` (this file) with Phase 5 entry
+- Updated `README.md` with section on reviewer loop behavior, cost, and config knob
+
+### Changed
+
+- **Orchestrator.runPipeline**: Complete Phase 5 critic-generator loop
+  - Flow: Generate (iteration 1) → Review → Check verdict → Revise (feedback) → Loop → Vault write
+  - Stage transitions: generating → reviewing → revising (loop) → writing → complete
+  - Token accumulation: both explainer and reviewer tokens tracked
+  - Verdict handling: pass=true breaks loop; parse errors save with pass=false
+
+- **VaultWriterTool.WriteToVault**: Now accepts verdict parameter
+  - Signature: WriteToVault(ctx, explainer, paper, verdict *ReviewVerdict) (string, error)
+  - Frontmatter rendering respects nil verdict: review_iterations=0, review_passed=true, no score
+
+- **ExplainerOutput.Iteration**: Now accurate loop iteration
+  - Phase 4: hardcoded to 1
+  - Phase 5: stamped with real loop iteration (1, 2, 3, ...)
+
+- **PipelineSession**: New fields and accessors for Phase 5
+  - Added Iteration field (tracking reviewer/revision loop round)
+  - Added Verdict field (*ReviewVerdict, nil if not yet reviewed or reviewer disabled)
+  - Renamed LastVerdict → Verdict (clearer semantics)
+  - New accessor: SetVerdict, Verdict, Iteration
+
+### Fixed
+
+- Explainer iteration tracking: now reflects actual loop round (Phase 4 hardcoded 1)
+- Frontmatter consistency: review_* fields always present, never nil
+- Config validation: max_review_iterations >= 0 enforced at load time
+
+### Architecture
+
+**Design Decisions (Phase 5):**
+- **Decision 1 (Policy):** Pass gates the loop; Score never blocks (advisory only)
+- **Decision 2 (Fault Handling):** Malformed JSON stops loop and saves with pass=false (no blind regen)
+- **Design T3 (Cost):** Reviewer never receives source paper (text-only review at lower cost)
+- **Shared LLM:** Same client as explainer with different system prompt + temperature (0.1)
+
+**Error Handling:**
+- JSON parse error (ErrReviewParse sentinel) → loop halts, saves with pass=false
+- LLM/network error → session fails recoverably
+- Empty generator response → session fails recoverably
+- Reviewer LLM/network error → session fails recoverably (no write, paper re-surfacable)
+
+**Loop Termination Guarantees:**
+- Always terminates via one of: verdict.Pass, max iterations, or parse error
+- Always writes exactly one note (the final explainer)
+- Respects maxReviewIterations=0 (reviewer disabled)
+
+### Tradeoffs & Acceptance
+
+| Tradeoff | Rationale | Residual Risk |
+|---|---|---|
+| Same LLM for reviewer & explainer | Simpler config, single model. Distinct prompts + low temp provide different behavior. | Reviewer may inherit explainer's biases; optional separate reviewer LLM could improve independence. |
+| Text-only reviewer | Reduces token cost by ~50% vs. sending source paper. Reviewer evaluates clarity of explainer alone. | Reviewer cannot catch errors in figure descriptions if source not provided; acceptable by design. |
+| Configurable max=2 default | Balances cost (~200k tok) vs. quality iterations. Cost-conscious deployments can set to 0. | Higher iterations increase cost; users must balance quality vs. budget. |
+
+### Dependencies Added
+
+**Backend:**
+- No new Go dependencies (ReviewerAgent reuses existing llm.LLMClient)
+
+**Frontend:**
+- No new dependencies (existing Status DTO and polling already support iteration fields)
+
+### Test Coverage
+
+- ReviewerAgent: JSON parsing with/without markdown fences
+- ReviewerAgent: per-section feedback filtering (nulls and empty strings dropped)
+- Orchestrator loop: termination on Pass, max iterations, parse error
+- VaultWriterTool: frontmatter with nil verdict (review_iterations=0, no score)
+- Session: Iteration and Verdict accessor thread safety
+
+### Known Issues & Limitations
+
+- **Score not persisted to vault:** Score in frontmatter only (advisory); not queryable later
+- **Single loop per run:** Cannot restart a failed review loop; must re-trigger
+- **No reviewer quality metrics:** No feedback on reviewer confidence/disagreement rates
+- **Config immutable per run:** max_review_iterations cannot be changed mid-pipeline
+
+### Breaking Changes
+
+- VaultWriterTool.WriteToVault signature changed: now requires verdict parameter (was optional in Phase 4)
+- PipelineSession: LastVerdict renamed to Verdict; old code will not compile
+- Orchestrator.runPipeline: internal flow changed; any orchestrator subclasses must adapt
+
+### Migration Guide (if upgrading from Phase 4)
+
+1. Update VaultWriterTool calls to pass verdict (or nil if reviewer disabled): `WriteToVault(ex, paper, s.Verdict())`
+2. Update config.yaml: add `agent.max_review_iterations: 2` (or 0 to disable reviewer)
+3. Update session access: `s.LastVerdict` → `s.Verdict()`, new `s.Iteration()` field
+4. Ensure LLMClient is configured; same client serves both explainer and reviewer
+5. Frontend status polling unchanged; new `iteration` and `reviewPassed` fields in DTO are optional
+
+### Commit References
+
+- 📦 Phase 5 implementation: commit hash TBD (when merged)
+- 📚 Docs reconciliation: commit hash TBD (when merged)
+
+---
+
 ## [Phase 4] — 2026-07-05
 
 ### Added
@@ -170,23 +323,17 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
-## Unreleased (Phase 5+)
+## Unreleased (Phase 6+)
 
 ### Planned
 
-#### Phase 5 — Reviewer & Revision Loop
-- ReviewerAgent with quality rubric evaluation
-- Revision loop: Generate → Review → Feedback → Revise → Vault write
-- ReviewVerdict with Pass/Fail and per-section feedback
-- Iteration tracking in Explainer and frontmatter
-- New stages: reviewing, revising
-
 #### Phase 6 — Polish & Hardening
 - Comprehensive error handling and user-facing messages
-- Structured logging with session_id, paper_id, duration_ms
-- Test suite: unit + integration tests
-- Documentation: README, config guide, operator manual
-- Performance tuning: token budgets, timeouts, cleanup
+- Structured logging with session_id, paper_id, duration_ms, reviewer_iterations
+- Test suite: unit + integration tests (ReviewerAgent, revision feedback formatting)
+- Documentation: API reference, troubleshooting guide, operator manual
+- Performance tuning: token budgets, request timeouts, cleanup handlers
+- Frontend: error UI improvements, retry buttons, session recovery
 
 #### Future Considerations
 - Multi-category arXiv support (not just cs.AI)

@@ -54,6 +54,9 @@ func TestAgentConfigValidate(t *testing.T) {
 		{"empty html base url", func(a *AgentConfig) { a.ArxivHTMLBaseURL = "" }, "arxiv_html_base_url"},
 		{"zero max content bytes", func(a *AgentConfig) { a.MaxContentBytes = 0 }, "max_content_bytes"},
 		{"negative max content bytes", func(a *AgentConfig) { a.MaxContentBytes = -1 }, "max_content_bytes"},
+		{"negative max review iterations", func(a *AgentConfig) { a.MaxReviewIterations = -1 }, "max_review_iterations"},
+		{"zero max review iterations ok", func(a *AgentConfig) { a.MaxReviewIterations = 0 }, ""},
+		{"positive max review iterations ok", func(a *AgentConfig) { a.MaxReviewIterations = 2 }, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
