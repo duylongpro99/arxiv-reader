@@ -8,6 +8,7 @@ import type { PipelineStage } from "@/lib/types";
 const STAGE_LABEL: Partial<Record<PipelineStage, string>> = {
   discovery: "Connecting to arXiv…",
   selection: "Ready — select a paper",
+  extracting: "Extracting paper text…",
 };
 
 export function ProgressIndicator({ stage }: { stage: PipelineStage }) {

@@ -5,17 +5,13 @@ package orchestrator
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/config"
+	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 )
@@ -31,21 +27,37 @@ type Unprocessor interface {
 	FilterUnprocessed(papers []models.Paper) ([]models.Paper, error)
 }
 
+// PaperContent is the narrow contract for turning a chosen paper into Markdown.
+// Consumer-side interface so the orchestrator stays testable with a fake tool.
+type PaperContent interface {
+	FetchMarkdown(ctx context.Context, arxivID string) (string, error)
+}
+
 // Orchestrator holds the session store and the tools it sequences.
 type Orchestrator struct {
 	sessions sync.Map // sessionID -> *models.PipelineSession
 	cfg      *config.Config
 	disco    PaperFetcher
 	logCheck Unprocessor
+	content  PaperContent  // Phase 3: HTML → Markdown extraction
+	llm      llm.LLMClient // constructed now, invoked in Phase 4
 }
 
-// New wires the orchestrator with the real tools built from config.
-func New(cfg *config.Config) *Orchestrator {
+// New wires the orchestrator with the real tools built from config. It can fail:
+// NewLLMClient rejects an unknown provider, and a misconfigured provider should
+// stop the server at startup (matching the config fail-fast philosophy).
+func New(cfg *config.Config) (*Orchestrator, error) {
+	client, err := llm.NewLLMClient(&cfg.LLM)
+	if err != nil {
+		return nil, err
+	}
 	return &Orchestrator{
 		cfg:      cfg,
 		disco:    tools.NewDiscoveryTool(&cfg.Agent),
 		logCheck: tools.NewLogCheckTool(&cfg.Paths),
-	}
+		content:  tools.NewPaperContentTool(&cfg.Agent),
+		llm:      client,
+	}, nil
 }
 
 // --- response DTOs (the frontend-facing contract) ---
@@ -60,6 +72,15 @@ type StatusResponse struct {
 	Notice      string               `json:"notice,omitempty"`
 	Error       string               `json:"error,omitempty"`
 	Recoverable bool                 `json:"recoverable,omitempty"`
+}
+
+type ProcessRequest struct {
+	SessionID string `json:"session_id"`
+	PaperID   string `json:"paper_id"`
+}
+
+type ProcessResponse struct {
+	SessionID string `json:"session_id"`
 }
 
 // HandleDiscover creates a session, kicks off discovery in the background, and
@@ -80,52 +101,55 @@ func (o *Orchestrator) HandleDiscover(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, DiscoverResponse{SessionID: session.SessionID})
 }
 
-// runDiscovery executes the pipeline and records the result on the session.
-func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.PipelineSession) {
-	// This goroutine is fully detached from the request lifecycle, so an
-	// unrecovered panic here would take down the entire process (and every
-	// other session). Contain it: fail this one session, keep the server up.
-	defer func() {
-		if r := recover(); r != nil {
-			session.Fail("Discovery crashed unexpectedly. Please try again.", true)
-			slog.Error("discovery panic", "session_id", session.SessionID, "panic", fmt.Sprintf("%v", r))
+// HandleProcess records the user's paper choice and kicks off extraction. It
+// validates the session is awaiting selection and the paper_id is one the server
+// itself surfaced (never an arbitrary client-supplied fetch target), then flips
+// to extracting and detaches the pipeline goroutine — returning {session_id}
+// immediately so the client keeps polling.
+func (o *Orchestrator) HandleProcess(w http.ResponseWriter, r *http.Request) {
+	var req ProcessRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	v, ok := o.sessions.Load(req.SessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	s := v.(*models.PipelineSession)
+	snap := s.Snapshot()
+	if snap.Stage != models.StageSelection {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session is not awaiting selection"})
+		return
+	}
+
+	// Match paper_id against the session's own candidates (Snapshot is lock-free).
+	// Bind the match into a local copy so the detached goroutine reads a stable
+	// *Paper rather than aliasing the loop variable / backing slice.
+	var selected *models.Paper
+	for i := range snap.Candidates {
+		if snap.Candidates[i].ID == req.PaperID {
+			p := snap.Candidates[i]
+			selected = &p
+			break
 		}
-	}()
-
-	papers, err := o.disco.FetchPapers(ctx)
-	if err != nil {
-		msg, recoverable := describeError(err)
-		session.Fail(msg, recoverable)
-		o.logFailure(session, err)
+	}
+	if selected == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "paper_id is not among the candidates"})
 		return
 	}
 
-	unprocessed, err := o.logCheck.FilterUnprocessed(papers)
-	if err != nil {
-		msg, recoverable := describeError(err)
-		session.Fail(msg, recoverable)
-		o.logFailure(session, err)
-		return
-	}
+	s.SetSelectedPaper(selected)
+	s.SetStage(models.StageExtracting)
+	slog.Info("process requested", "session_id", s.SessionID, "paper_id", selected.ID)
+	writeJSON(w, http.StatusOK, ProcessResponse{SessionID: s.SessionID})
 
-	// Cap to the display limit; note when we have fewer than requested.
-	limit := o.cfg.Agent.DisplayLimit
-	candidates := unprocessed
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
-	notice := ""
-	if len(candidates) < limit {
-		notice = fmt.Sprintf("Only %d new paper(s) found", len(candidates))
-	}
-
-	session.Complete(candidates, notice)
-	slog.Info("discovery complete",
-		"session_id", session.SessionID,
-		"stage", string(models.StageSelection),
-		"returning", len(candidates),
-		"duration_ms", time.Since(session.StartedAt()).Milliseconds(),
-	)
+	// Detach from the request context (cancelled once this handler returns) so
+	// extraction survives; pass the ID explicitly to avoid a cross-goroutine
+	// read of the private selectedPaper field.
+	go o.runPipeline(context.WithoutCancel(r.Context()), s, selected.ID)
 }
 
 // HandleStatus returns the current session snapshot, or 404 for an unknown ID.
@@ -147,51 +171,6 @@ func (o *Orchestrator) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		Error:       snap.Error,
 		Recoverable: snap.Recoverable,
 	})
-}
-
-// newSession creates a session with a unique, dependency-free random ID.
-func (o *Orchestrator) newSession() *models.PipelineSession {
-	return models.NewSession(newSessionID(), time.Now())
-}
-
-// newSessionID returns a 32-hex-char (16 random bytes) session ID. crypto/rand
-// avoids adding a UUID dependency while giving ample collision resistance for a
-// local, single-user tool.
-func newSessionID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failure is effectively impossible; fall back to a
-		// time-based ID so the pipeline can still proceed.
-		return fmt.Sprintf("sess-%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
-}
-
-// describeError maps a pipeline error to a human-readable message and whether a
-// retry might help. Corrupt-log is the only non-recoverable failure — it needs
-// a manual fix.
-func describeError(err error) (message string, recoverable bool) {
-	switch {
-	case errors.Is(err, tools.ErrArxivRateLimit):
-		return "arXiv is rate limiting requests. Please try again in a minute.", true
-	case errors.Is(err, tools.ErrArxivUnavailable):
-		return "arXiv is currently unavailable. Please try again.", true
-	case errors.Is(err, tools.ErrArxivParse):
-		return "arXiv returned an unexpected response. Please try again.", true
-	case errors.Is(err, tools.ErrLogCorrupted):
-		return "The processed-log file is corrupted and needs manual inspection.", false
-	default:
-		return "Discovery failed unexpectedly. Please try again.", true
-	}
-}
-
-func (o *Orchestrator) logFailure(session *models.PipelineSession, err error) {
-	slog.Error("discovery failed",
-		"session_id", session.SessionID,
-		"stage", string(models.StageFailed),
-		"error", err.Error(),
-		"duration_ms", time.Since(session.StartedAt()).Milliseconds(),
-	)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

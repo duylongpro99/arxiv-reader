@@ -19,9 +19,19 @@ function formatDate(iso: string): string {
   });
 }
 
-// PaperCard displays one candidate. The "Select" button is intentionally
-// disabled in Phase 2 — selection handling arrives in Phase 3.
-export function PaperCard({ paper }: { paper: Paper }) {
+// PaperCard displays one candidate with an active Select button. Once any paper
+// is chosen, sibling cards are disabled; the chosen card shows a "Selected" state.
+export function PaperCard({
+  paper,
+  onSelect,
+  disabled = false,
+  selected = false,
+}: {
+  paper: Paper;
+  onSelect?: (paperId: string) => void;
+  disabled?: boolean;
+  selected?: boolean;
+}) {
   return (
     <article className="rounded-xl border border-gray-200 p-5 dark:border-gray-700">
       <div className="mb-2 flex items-start justify-between gap-4">
@@ -39,11 +49,17 @@ export function PaperCard({ paper }: { paper: Paper }) {
       <div className="flex items-center justify-between">
         <time className="text-xs text-gray-400">{formatDate(paper.published)}</time>
         <button
-          disabled
-          title="Selection arrives in Phase 3"
-          className="cursor-not-allowed rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-400 dark:border-gray-600"
+          onClick={() => onSelect?.(paper.id)}
+          disabled={disabled || selected}
+          className={
+            selected
+              ? "rounded-md border border-blue-600 bg-blue-600 px-3 py-1.5 text-sm text-white"
+              : disabled
+                ? "cursor-not-allowed rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-400 dark:border-gray-600"
+                : "rounded-md border border-blue-600 px-3 py-1.5 text-sm text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950"
+          }
         >
-          Select
+          {selected ? "Selected" : "Select"}
         </button>
       </div>
     </article>

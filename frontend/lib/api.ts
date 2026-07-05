@@ -1,13 +1,30 @@
 // Client-side API helpers. These call the Next.js proxy routes (same origin),
 // never the Go backend directly — the backend address stays server-side.
 
-import type { PipelineStatus, TriggerResponse } from "./types";
+import type { PipelineStatus, SelectResponse, TriggerResponse } from "./types";
 
 // triggerDiscovery starts a discovery run and returns the new session id.
 export async function triggerDiscovery(): Promise<TriggerResponse> {
   const res = await fetch("/api/trigger", { method: "POST" });
   if (!res.ok) {
     throw new Error(`Failed to start discovery (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// selectPaper submits the chosen paper for extraction. The backend keeps the
+// same session id and moves it to the "extracting" stage; the panel keeps polling.
+export async function selectPaper(
+  sessionId: string,
+  paperId: string,
+): Promise<SelectResponse> {
+  const res = await fetch("/api/select", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, paper_id: paperId }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to select paper (HTTP ${res.status})`);
   }
   return res.json();
 }

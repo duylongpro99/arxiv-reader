@@ -37,14 +37,30 @@ func buildFeed(n int) string {
 	return b.String()
 }
 
-// setup wires a real server.Handler against a fake arXiv and a temp log file.
+// latexmlSample is a minimal LaTeXML-style body used by the paper-HTML server.
+const latexmlSample = `<!DOCTYPE html><html><body>
+<h1>Extracted Paper Title</h1><p>The core contribution.</p></body></html>`
+
+// setup wires a real server.Handler against a fake arXiv (Atom API) and a temp
+// log file. The paper-HTML server always serves 200 sample HTML.
 func setup(t *testing.T, feed string, logContent string) (*httptest.Server, string) {
+	return setupWith(t, feed, logContent, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(latexmlSample))
+	})
+}
+
+// setupWith is setup with a caller-controlled paper-HTML handler (e.g. to force
+// a 404 for the re-pick path).
+func setupWith(t *testing.T, feed, logContent string, htmlHandler http.HandlerFunc) (*httptest.Server, string) {
 	t.Helper()
 
 	arxiv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(feed))
 	}))
 	t.Cleanup(arxiv.Close)
+
+	htmlSrv := httptest.NewServer(htmlHandler)
+	t.Cleanup(htmlSrv.Close)
 
 	logPath := filepath.Join(t.TempDir(), "processed.json")
 	if logContent != "" {
@@ -54,10 +70,18 @@ func setup(t *testing.T, feed string, logContent string) (*httptest.Server, stri
 	}
 
 	cfg := &config.Config{
+		// A valid LLM block is required so orchestrator.New (which constructs the
+		// client) succeeds; the client is never invoked in these Phase 3 tests.
+		LLM: config.LLMConfig{
+			Provider: "anthropic", Model: "test-model", APIKey: "test-key",
+			MaxTokens: 100, Temperature: 0.3, RequestTimeoutSec: 10,
+		},
 		Paths: config.PathsConfig{LogFile: logPath},
 		Agent: config.AgentConfig{
 			ArxivCategory:         "cs.AI",
 			ArxivBaseURL:          arxiv.URL,
+			ArxivHTMLBaseURL:      htmlSrv.URL,
+			MaxContentBytes:       52428800,
 			FetchLimit:            20,
 			DisplayLimit:          5,
 			UserAgent:             "arxiv-explainer-agent/integration",
@@ -67,7 +91,11 @@ func setup(t *testing.T, feed string, logContent string) (*httptest.Server, stri
 		},
 	}
 
-	app := httptest.NewServer(server.Handler(cfg))
+	handler, err := server.Handler(cfg)
+	if err != nil {
+		t.Fatalf("build handler: %v", err)
+	}
+	app := httptest.NewServer(handler)
 	t.Cleanup(app.Close)
 	return app, logPath
 }
@@ -155,6 +183,115 @@ func TestDiscoveryDedup(t *testing.T) {
 	// fewer than display_limit -> notice present
 	if status.Notice == "" {
 		t.Error("expected a fewer-than-limit notice")
+	}
+}
+
+// discoverToSelection runs discovery and returns the session ID once it reaches
+// the selection stage with candidates.
+func discoverToSelection(t *testing.T, app *httptest.Server) (string, orchestrator.StatusResponse) {
+	t.Helper()
+	postRes, err := http.Post(app.URL+"/discover", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /discover: %v", err)
+	}
+	defer postRes.Body.Close()
+	var trigger struct {
+		SessionID string `json:"session_id"`
+	}
+	decode(t, postRes.Body, &trigger)
+
+	var status orchestrator.StatusResponse
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		res, err := http.Get(app.URL + "/status/" + trigger.SessionID)
+		if err != nil {
+			t.Fatalf("GET /status: %v", err)
+		}
+		decode(t, res.Body, &status)
+		res.Body.Close()
+		if status.Stage == models.StageSelection {
+			return trigger.SessionID, status
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for selection")
+	return "", status
+}
+
+// pollUntil polls /status until pred is satisfied or the deadline passes.
+func pollUntil(t *testing.T, app *httptest.Server, sessionID string, pred func(orchestrator.StatusResponse) bool) orchestrator.StatusResponse {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var status orchestrator.StatusResponse
+	for time.Now().Before(deadline) {
+		res, err := http.Get(app.URL + "/status/" + sessionID)
+		if err != nil {
+			t.Fatalf("GET /status: %v", err)
+		}
+		decode(t, res.Body, &status)
+		res.Body.Close()
+		if pred(status) {
+			return status
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out; last stage=%s", status.Stage)
+	return status
+}
+
+func selectPaper(t *testing.T, app *httptest.Server, sessionID, paperID string) {
+	t.Helper()
+	body := `{"session_id":"` + sessionID + `","paper_id":"` + paperID + `"}`
+	res, err := http.Post(app.URL+"/process", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /process: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("process status: %d", res.StatusCode)
+	}
+}
+
+// TestProcessEndToEndExtracting: select a paper whose HTML is served 200 → the
+// session transitions to (and stays at) extracting after the Markdown is stored.
+func TestProcessEndToEndExtracting(t *testing.T) {
+	app, _ := setup(t, buildFeed(5), "")
+	sessionID, status := discoverToSelection(t, app)
+
+	selectPaper(t, app, sessionID, status.Candidates[0].ID)
+	got := pollUntil(t, app, sessionID, func(s orchestrator.StatusResponse) bool {
+		return s.Stage == models.StageExtracting
+	})
+	if got.Stage != models.StageExtracting {
+		t.Fatalf("stage: want extracting, got %s (error=%q)", got.Stage, got.Error)
+	}
+	// Give the pipeline a beat; a stored-Markdown success keeps it at extracting
+	// (no failure). It must NOT flip to failed.
+	time.Sleep(50 * time.Millisecond)
+	final := pollUntil(t, app, sessionID, func(s orchestrator.StatusResponse) bool { return true })
+	if final.Stage == models.StageFailed {
+		t.Fatalf("extraction failed unexpectedly: %q", final.Error)
+	}
+}
+
+// TestProcessEndToEnd404RePick: HTML server 404s → session returns to selection
+// with a recoverable notice and candidates intact (re-pick without restart).
+func TestProcessEndToEnd404RePick(t *testing.T) {
+	app, _ := setupWith(t, buildFeed(5), "", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	})
+	sessionID, status := discoverToSelection(t, app)
+	nCandidates := len(status.Candidates)
+
+	selectPaper(t, app, sessionID, status.Candidates[0].ID)
+	got := pollUntil(t, app, sessionID, func(s orchestrator.StatusResponse) bool {
+		return s.Stage == models.StageSelection && s.Notice != ""
+	})
+	if len(got.Candidates) != nCandidates {
+		t.Fatalf("candidates must be preserved on re-pick: want %d, got %d", nCandidates, len(got.Candidates))
+	}
+	if !got.Recoverable {
+		t.Fatal("re-pick must be recoverable")
 	}
 }
 

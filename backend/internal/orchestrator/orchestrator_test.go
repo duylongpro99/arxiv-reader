@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/config"
+	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 )
@@ -51,6 +54,134 @@ func makePapers(n int) []models.Paper {
 
 func newOrch(cfg *config.Config, f PaperFetcher, u Unprocessor) *Orchestrator {
 	return &Orchestrator{cfg: cfg, disco: f, logCheck: u}
+}
+
+// --- process-path fakes ---
+
+type fakeContent struct {
+	md     string
+	err    error
+	called int32
+}
+
+func (f *fakeContent) FetchMarkdown(context.Context, string) (string, error) {
+	atomic.AddInt32(&f.called, 1)
+	return f.md, f.err
+}
+
+// fakeLLM satisfies llm.LLMClient; Phase 3 never invokes it, so it is inert.
+type fakeLLM struct{}
+
+func (fakeLLM) Complete(context.Context, llm.CompletionRequest) (llm.CompletionResponse, error) {
+	return llm.CompletionResponse{}, nil
+}
+
+func newProcessOrch(c PaperContent) *Orchestrator {
+	return &Orchestrator{cfg: testCfg(5), disco: &fakeFetcher{}, logCheck: passthrough(), content: c, llm: fakeLLM{}}
+}
+
+// selectionSession stores a session already at the selection stage with the
+// given candidates, ready for HandleProcess.
+func selectionSession(o *Orchestrator, candidates []models.Paper) *models.PipelineSession {
+	s := models.NewSession("sess-test", time.Now())
+	s.Complete(candidates, "")
+	o.sessions.Store(s.SessionID, s)
+	return s
+}
+
+// process POSTs /process and returns the recorder.
+func process(o *Orchestrator, sessionID, paperID string) *httptest.ResponseRecorder {
+	body := `{"session_id":"` + sessionID + `","paper_id":"` + paperID + `"}`
+	rec := httptest.NewRecorder()
+	o.HandleProcess(rec, httptest.NewRequest(http.MethodPost, "/process", strings.NewReader(body)))
+	return rec
+}
+
+// waitFor polls until pred() is true or the deadline passes.
+func waitFor(t *testing.T, pred func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for pipeline outcome")
+}
+
+func TestProcessHappyPathStoresMarkdown(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "# Extracted paper"})
+	s := selectionSession(o, makePapers(3))
+
+	rec := process(o, s.SessionID, "a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	waitFor(t, func() bool { return s.Markdown() != "" })
+	if s.Snapshot().Stage != models.StageExtracting {
+		t.Fatalf("stage: want extracting, got %s", s.Snapshot().Stage)
+	}
+	if s.Markdown() != "# Extracted paper" {
+		t.Fatalf("markdown not stored, got %q", s.Markdown())
+	}
+}
+
+func TestProcess404RecoversToSelection(t *testing.T) {
+	o := newProcessOrch(&fakeContent{err: tools.ErrPaperHTMLNotFound})
+	s := selectionSession(o, makePapers(3))
+
+	if rec := process(o, s.SessionID, "a"); rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageSelection && s.Snapshot().Notice != "" })
+
+	snap := s.Snapshot()
+	if len(snap.Candidates) != 3 {
+		t.Fatalf("candidates must be preserved on re-pick, got %d", len(snap.Candidates))
+	}
+	if !snap.Recoverable {
+		t.Fatal("re-pick must be recoverable")
+	}
+}
+
+func TestProcessOtherErrorFailsRecoverable(t *testing.T) {
+	o := newProcessOrch(&fakeContent{err: tools.ErrPaperHTMLFailed})
+	s := selectionSession(o, makePapers(3))
+
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageFailed })
+
+	snap := s.Snapshot()
+	if !snap.Recoverable || snap.Error == "" {
+		t.Fatalf("expected recoverable failure with message, got %#v", snap)
+	}
+}
+
+func TestProcessWrongStage400(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "x"})
+	s := models.NewSession("sess-test", time.Now()) // still in discovery
+	o.sessions.Store(s.SessionID, s)
+
+	if rec := process(o, s.SessionID, "a"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for non-selection stage, got %d", rec.Code)
+	}
+}
+
+func TestProcessUnknownPaper400(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "x"})
+	s := selectionSession(o, makePapers(3))
+
+	if rec := process(o, s.SessionID, "zzz"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for unknown paper_id, got %d", rec.Code)
+	}
+}
+
+func TestProcessUnknownSession404(t *testing.T) {
+	o := newProcessOrch(&fakeContent{md: "x"})
+	if rec := process(o, "nope", "a"); rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404 for unknown session, got %d", rec.Code)
+	}
 }
 
 // discover triggers a run and returns the new session ID.

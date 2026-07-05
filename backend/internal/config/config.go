@@ -21,6 +21,12 @@ type LLMConfig struct {
 	Provider string `yaml:"provider"`
 	Model    string `yaml:"model"`
 	APIKey   string `yaml:"-"` // from .env ONLY — never parsed from config.yaml
+	// LLM knobs consumed by Phase 3/4 provider clients. LLM calls are slow, so
+	// RequestTimeoutSec is a separate, larger budget than the arXiv agent timeout.
+	MaxTokens         int     `yaml:"max_tokens"`              // > 0
+	Temperature       float32 `yaml:"temperature"`             // 0..2
+	RequestTimeoutSec int     `yaml:"request_timeout_seconds"` // > 0
+	BaseURL           string  `yaml:"base_url"`                // optional; "" = provider default
 }
 
 type PathsConfig struct {
@@ -40,6 +46,11 @@ type AgentConfig struct {
 	RequestTimeoutSec     int    `yaml:"request_timeout_seconds"`
 	MinRequestIntervalSec int    `yaml:"min_request_interval_seconds"`
 	MaxRetries            int    `yaml:"max_retries"`
+	// Phase 3 HTML extraction: base URL for arXiv's LaTeXML HTML rendering
+	// (configurable so tests can point at an httptest.Server, like ArxivBaseURL),
+	// and a byte cap feeding io.LimitReader as the OOM guard on fetched bodies.
+	ArxivHTMLBaseURL string `yaml:"arxiv_html_base_url"` // default https://arxiv.org/html
+	MaxContentBytes  int64  `yaml:"max_content_bytes"`   // io.LimitReader cap; > 0
 }
 
 // validProviders is the whitelist enforced by validate().
@@ -114,6 +125,15 @@ func (c *Config) validate() error {
 	if c.LLM.Model == "" {
 		return fmt.Errorf("llm.model is required but not set.\n  → Set llm.model in config.yaml (or LLM_MODEL in .env)")
 	}
+	if c.LLM.MaxTokens <= 0 {
+		return fmt.Errorf("llm.max_tokens must be > 0, got %d.\n  → Set llm.max_tokens in config.yaml", c.LLM.MaxTokens)
+	}
+	if c.LLM.Temperature < 0 || c.LLM.Temperature > 2 {
+		return fmt.Errorf("llm.temperature must be between 0 and 2, got %v.\n  → Set llm.temperature in config.yaml", c.LLM.Temperature)
+	}
+	if c.LLM.RequestTimeoutSec <= 0 {
+		return fmt.Errorf("llm.request_timeout_seconds must be > 0, got %d.\n  → Set llm.request_timeout_seconds in config.yaml", c.LLM.RequestTimeoutSec)
+	}
 	if !filepath.IsAbs(c.Paths.ObsidianVault) {
 		return fmt.Errorf("paths.obsidian_vault must be an absolute path, got %q.\n  → Set paths.obsidian_vault in config.yaml (or OBSIDIAN_VAULT_PATH in .env)", c.Paths.ObsidianVault)
 	}
@@ -153,6 +173,12 @@ func (a *AgentConfig) validate() error {
 	}
 	if a.MaxRetries < 0 {
 		return fmt.Errorf("agent.max_retries must be >= 0, got %d.\n  → Set agent.max_retries in config.yaml", a.MaxRetries)
+	}
+	if a.ArxivHTMLBaseURL == "" {
+		return fmt.Errorf("agent.arxiv_html_base_url is required but not set.\n  → Set agent.arxiv_html_base_url (e.g. https://arxiv.org/html) in config.yaml")
+	}
+	if a.MaxContentBytes <= 0 {
+		return fmt.Errorf("agent.max_content_bytes must be > 0, got %d.\n  → Set agent.max_content_bytes in config.yaml", a.MaxContentBytes)
 	}
 	return nil
 }

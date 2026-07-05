@@ -8,9 +8,13 @@ import { PaperCard } from "./paper-card";
 export function CandidateList({
   candidates,
   notice,
+  selectedId,
+  onSelect,
 }: {
   candidates: Paper[];
   notice?: string;
+  selectedId?: string | null;
+  onSelect?: (paperId: string) => void;
 }) {
   return (
     <section className="flex flex-col gap-4">
@@ -24,7 +28,16 @@ export function CandidateList({
           No new papers right now. Try again later.
         </p>
       ) : (
-        candidates.map((p) => <PaperCard key={p.id} paper={p} />)
+        candidates.map((p) => (
+          <PaperCard
+            key={p.id}
+            paper={p}
+            onSelect={onSelect}
+            // Disable every card once one is chosen; mark the chosen one selected.
+            disabled={selectedId != null && selectedId !== p.id}
+            selected={selectedId === p.id}
+          />
+        ))
       )}
     </section>
   );

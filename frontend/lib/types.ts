@@ -16,8 +16,8 @@ export interface Paper {
 export type PipelineStage =
   | "discovery"
   | "selection"
+  | "extracting" // Phase 3: fetching + converting the paper HTML → Markdown
   | "failed"
-  | "fetching_pdf"
   | "generating"
   | "reviewing"
   | "revising"
@@ -33,5 +33,10 @@ export interface PipelineStatus {
 }
 
 export interface TriggerResponse {
+  session_id: string;
+}
+
+// Selecting a paper returns the same session id (the panel keeps polling it).
+export interface SelectResponse {
   session_id: string;
 }

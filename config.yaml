@@ -5,6 +5,10 @@
 llm:
   provider: anthropic          # anthropic | openai | gemini  (override: LLM_PROVIDER)
   model: claude-sonnet-4-6     # provider-valid model string  (override: LLM_MODEL)
+  max_tokens: 4096             # per-completion output cap (> 0)
+  temperature: 0.3             # sampling temperature (0..2)
+  request_timeout_seconds: 120 # LLM calls are slow — larger budget than arXiv fetch
+  base_url: ""                 # optional custom endpoint/proxy; "" = provider default
 
 paths:
   obsidian_vault: ~/obsidian/arxiv-papers    # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
@@ -21,3 +25,5 @@ agent:
   request_timeout_seconds: 10
   min_request_interval_seconds: 3    # arXiv politeness: min gap between requests
   max_retries: 3                     # 429/5xx backoff: 3s -> 6s -> 12s
+  arxiv_html_base_url: https://arxiv.org/html   # LaTeXML HTML rendering base (Phase 3)
+  max_content_bytes: 52428800        # 50MB cap on fetched HTML (io.LimitReader OOM guard)

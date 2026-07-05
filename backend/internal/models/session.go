@@ -11,9 +11,10 @@ import (
 type PipelineStage string
 
 const (
-	StageDiscovery PipelineStage = "discovery" // fetching + filtering in progress
-	StageSelection PipelineStage = "selection" // candidates ready, awaiting user pick
-	StageFailed    PipelineStage = "failed"    // pipeline aborted; see Error/Recoverable
+	StageDiscovery  PipelineStage = "discovery"  // fetching + filtering in progress
+	StageSelection  PipelineStage = "selection"  // candidates ready, awaiting user pick
+	StageExtracting PipelineStage = "extracting" // fetching + converting paper HTML → Markdown
+	StageFailed     PipelineStage = "failed"     // pipeline aborted; see Error/Recoverable
 )
 
 // PipelineSession is the in-memory state of one discovery run.
@@ -32,6 +33,11 @@ type PipelineSession struct {
 	errMsg      string
 	recoverable bool
 	startedAt   time.Time
+	// Phase 3 extraction state. Both are server-only and deliberately excluded
+	// from Snapshot(): markdownText is large (~50KB–500KB) and never shipped to
+	// the frontend; selectedPaper's metadata already rides along in candidates.
+	selectedPaper *Paper
+	markdownText  string
 }
 
 // SessionSnapshot is an immutable, mutex-free copy of a session's observable
@@ -94,6 +100,57 @@ func (s *PipelineSession) Fail(message string, recoverable bool) {
 	s.errMsg = message
 	s.recoverable = recoverable
 	s.stage = StageFailed
+}
+
+// SetStage transitions the session to an arbitrary stage under the lock. Used by
+// the orchestrator to move selection → extracting once a paper is chosen.
+func (s *PipelineSession) SetStage(stage PipelineStage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stage = stage
+}
+
+// SetSelectedPaper records the paper the user picked (server-only; not in Snapshot).
+func (s *PipelineSession) SetSelectedPaper(p *Paper) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.selectedPaper = p
+}
+
+// SetMarkdown stores the extracted paper Markdown (server-only; excluded from
+// Snapshot so it never inflates the /status payload).
+func (s *PipelineSession) SetMarkdown(md string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markdownText = md
+}
+
+// SetNotice sets a user-facing notice under the lock without changing the stage.
+func (s *PipelineSession) SetNotice(n string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notice = n
+}
+
+// RecoverToSelection returns an extracting session to selection WITHOUT touching
+// candidates, clearing any prior error and setting a recoverable notice. This is
+// the 404 re-pick path — distinct from Fail (which sets StageFailed). Marking it
+// recoverable lets the frontend re-enable the candidate cards for another pick.
+func (s *PipelineSession) RecoverToSelection(notice string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stage = StageSelection
+	s.notice = notice
+	s.errMsg = ""
+	s.recoverable = true
+}
+
+// Markdown returns the stored paper Markdown under the lock. Server-only (kept
+// out of Snapshot); Phase 4's ExplainerAgent reads it here as its input.
+func (s *PipelineSession) Markdown() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.markdownText
 }
 
 // StartedAt exposes the immutable start time for duration logging.
