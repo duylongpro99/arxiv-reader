@@ -10,7 +10,7 @@
 The system is a **local, trigger-based, two-service application**:
 
 - A **Next.js frontend** handles all user interaction — triggering runs, displaying paper candidates, selection, progress, and the final explainer preview.
-- A **Go backend** built on ADK Go handles all agent logic — paper discovery, duplicate checking, PDF retrieval, explainer generation, critic-review loop, and Obsidian vault writing.
+- A **Go backend** built on ADK Go handles all agent logic — paper discovery, duplicate checking, HTML content extraction, explainer generation, critic-review loop, and Obsidian vault writing.
 
 The two services communicate via HTTP. Both run locally on the user's machine.
 
@@ -29,10 +29,12 @@ User Trigger
 [Next.js UI] ◀──→ Present candidates → User selects one paper
     │
     ▼
-[PDFFetchTool] ──→ Download selected paper PDF
+[PaperContentTool] ──→ Fetch arXiv HTML, convert to Markdown
+    │         │
+    │    [404 Not Found] ──→ Recoverable: return to selection, re-pick
     │
     ▼
-[ExplainerAgent] ──→ Read PDF + Generate rich Markdown explainer
+[ExplainerAgent] ──→ Read Markdown text + Generate rich explainer
     │
     ▼
 [ReviewerAgent] ──→ Critique explainer against quality rubric
@@ -60,11 +62,11 @@ User Trigger
 │  - Trigger UI               │         │  - ADK Agent Orchestrator        │
 │  - Paper selection UI       │         │  - DiscoveryTool                 │
 │  - Progress display         │         │  - LogCheckTool                  │
-│  - Explainer preview        │         │  - PDFFetchTool                  │
+│  - Explainer preview        │         │  - PaperContentTool (HTML→MD)    │
 │                             │         │  - ExplainerAgent                │
 │                             │         │  - ReviewerAgent                 │
 │                             │         │  - VaultWriterTool               │
-│                             │         │  - LLM Client (configurable)     │
+│                             │         │  - LLM Client (text-only)        │
 └─────────────────────────────┘         └──────────────────────────────────┘
                                                         │
                                     ┌───────────────────┼───────────────────┐
@@ -173,70 +175,52 @@ func MarkAsProcessed(paperID string) error
 
 ---
 
-### 5. PDFFetchTool (ADK Tool)
+### 5. PaperContentTool
 
-**Purpose:** Download the PDF of the selected paper from arXiv.
+**Purpose:** Fetch paper content from arXiv's LaTeXML HTML rendering and convert it to clean Markdown text.
 
 **Responsibilities:**
-- Fetch PDF binary from arXiv PDF URL
-- Handle arXiv redirects to versioned PDF URLs automatically
-- Store temporarily in memory
-- Return raw PDF bytes for rendering
+- Query `https://arxiv.org/html/{arxiv_id}` (follows same-host redirect to versioned URL automatically)
+- Fetch HTML under a 50MB size limit (`io.LimitReader`)
+- Convert LaTeXML HTML to Markdown using pure-Go `html-to-markdown/v2` (no external dependencies, no CGO)
+- Extract the main `ltx_document` body
+- Strip math formulas, navigation elements, bibliography, and appendix sections (keep headings and figure captions)
+- Return clean Markdown text
+
+**Why Markdown over PDF-as-image:** Pure text extraction avoids the complexity and token cost of vision APIs while preserving the essential content — paper structure, reasoning, and key figures/captions. The Markdown approach is compatible with any text-capable LLM model, maximizing provider flexibility.
+
+**Error Handling:**
+- 404 Not Found → `ErrPaperHTMLNotFound` — treated as recoverable re-pick (return to selection)
+- Transient failures (429, 5xx, network) → retry with exponential backoff (max 3 retries, same schedule as DiscoveryTool)
+- Permanent failures (other 4xx, parse errors) → surface as non-recoverable error
 
 **Interface:**
 ```go
-func FetchPDF(ctx context.Context, pdfURL string) ([]byte, error)
+func (t *PaperContentTool) FetchMarkdown(ctx context.Context, arxivID string) (string, error)
+// Returns clean Markdown text ready for ExplainerAgent
 ```
 
-**Dependencies:** arXiv (external HTTP)
+**Dependencies:** `html-to-markdown/v2` (pure Go), `net/http`, `io`
 
 ---
 
-### 6. PDFRendererTool (ADK Tool)
+### 6. ExplainerAgent (ADK LlmAgent)
 
-**Purpose:** Convert raw PDF bytes into an ordered slice of PNG page images, one per page, ready for vision LLM input.
-
-**Why page-as-image:** AI research papers rely heavily on visual content — architecture diagrams, result tables, mathematical figures. Text extraction silently discards this content. Rendering every page as an image ensures the LLM sees exactly what a human reader would see, preserving full visual fidelity regardless of paper content.
-
-**Implementation:** Shells out to `poppler`'s `pdftoppm` binary — industry-standard quality, available as a single system package (`brew install poppler` / `apt install poppler-utils`), zero CGO complexity.
+**Purpose:** Core intelligence — read the paper's Markdown content and generate the rich, well-structured explainer.
 
 **Responsibilities:**
-- Write PDF to temp file (required by `pdftoppm`)
-- Execute `pdftoppm -png -r {dpi}` as a subprocess
-- Read output PNGs in sorted order into memory
-- Clean up all temp files on success or failure
-
-**Interface:**
-```go
-func RenderPages(ctx context.Context, pdfBytes []byte) ([][]byte, error)
-// Returns [][]byte — one PNG []byte per page, in reading order
-```
-
-**Config:** `pdf.dpi` (default `150`) — controls rendering resolution and token cost tradeoff.
-
-**Startup validation:** `ValidatePoppler()` called in `main.go` — server fails fast with install instructions if `pdftoppm` not in PATH.
-
-**Dependencies:** `os/exec` (poppler subprocess), `os` (temp files), `config`
-
----
-
-### 7. ExplainerAgent (ADK LlmAgent)
-
-**Purpose:** Core intelligence — read every page of the paper as a vision LLM would, reason about the authors' core intent, and generate the rich Markdown explainer.
-
-**Responsibilities:**
-- Receive page images (one PNG per page, in order) + structured prompt
-- Reason about the paper's core intent — including visual content (diagrams, tables, figures)
+- Receive paper Markdown text + metadata + structured prompt
+- Reason about the paper's core intent and significance
 - Generate all explainer sections per PRD spec
-- Handle math and visual content contextually
+- Handle mathematical concepts and figures contextually
 - Accept structured revision feedback from ReviewerAgent and rewrite accordingly
 
 **Interface:**
 ```go
 type ExplainerInput struct {
-    PageImages   [][]byte  // one PNG per page, in reading order
+    MarkdownText string           // extracted paper Markdown from PaperContentTool
     PaperMeta    Paper
-    RevisionNote string    // empty on first pass
+    RevisionNote string           // empty on first pass
 }
 
 type ExplainerOutput struct {
@@ -253,7 +237,7 @@ func Generate(ctx context.Context, input ExplainerInput) (ExplainerOutput, error
 
 ---
 
-### 8. ReviewerAgent (ADK LlmAgent)
+### 7. ReviewerAgent (ADK LlmAgent)
 
 **Purpose:** Independent critic — evaluates explainer quality and drives the revision loop.
 
@@ -285,7 +269,7 @@ func Review(ctx context.Context, explainer ExplainerOutput, iteration int) (Revi
 
 ---
 
-### 9. VaultWriterTool (ADK Tool)
+### 8. VaultWriterTool (ADK Tool)
 
 **Purpose:** Persist the approved explainer to the Obsidian vault.
 
@@ -305,16 +289,17 @@ func WriteToVault(ctx context.Context, explainer ExplainerOutput, meta Paper) (s
 
 ---
 
-### 10. LLM Client (configurable)
+### 9. LLM Client (configurable, text-only)
 
-**Purpose:** Provider-agnostic LLM interface. Decouples all agent logic from any specific LLM API. Accepts page images as vision input — not PDF bytes — making it compatible with any vision-capable model regardless of native PDF support.
+**Purpose:** Provider-agnostic LLM interface. Decouples all agent logic from any specific LLM API. Text-only design (no vision) maximizes model and provider flexibility.
 
 **Responsibilities:**
-- Expose a unified `Complete(prompt, images)` interface
-- Accept page images (PNG bytes, one per page) as vision input — universal across all vision-capable providers
-- Load provider, model, API key, and parameters from config
+- Expose a unified `Complete(req)` interface
+- Accept paper Markdown as text input (DocumentText field)
+- Load provider, model, API key, and parameters from config at startup
 - Concrete implementations for: Anthropic Claude, OpenAI, Google Gemini (others addable by implementing the interface)
-- Validate at startup that configured model is vision-capable
+- Implement shared retry logic: 429 (3 retries), 503 (1 retry), 400 (immediate fail)
+- Return separate input/output token counts
 
 **Interface:**
 ```go
@@ -325,7 +310,7 @@ type LLMClient interface {
 type CompletionRequest struct {
     SystemPrompt string
     UserPrompt   string
-    PageImages   [][]byte  // one PNG per page, in reading order
+    DocumentText string    // paper Markdown from PaperContentTool
     MaxTokens    int
     Temperature  float32
 }
@@ -337,18 +322,24 @@ type CompletionResponse struct {
 }
 ```
 
-**Dependencies:** Config, respective provider SDKs
+**Shared Retry Logic (`withRetry` wrapper):**
+- 429 (rate limit): exponential backoff, max 3 retries
+- 503 (unavailable): exponential backoff, max 1 retry
+- 400 (bad request): fail immediately (configuration error)
+- Timeout: fail immediately (not retried)
+
+**Dependencies:** Config, respective provider SDKs, `internal/llm/retry.go`
 
 ---
 
-### 11. Config
+### 10. Config
 
 **Purpose:** Single source of truth for all runtime configuration.
 
 ```yaml
 llm:
   provider: "anthropic"             # anthropic | openai | gemini
-  model: "claude-sonnet-4-6"        # any vision-capable model string
+  model: "claude-sonnet-4-6"        # any text-capable model string
   api_key: "${LLM_API_KEY}"         # loaded from .env
   max_tokens: 8000
   temperature: 0.3
@@ -358,12 +349,12 @@ llm:
 agent:
   max_review_iterations: 2          # reviewer loop cap (0 = disable review)
   paper_fetch_limit: 5              # top N papers per discovery run
+  request_timeout_sec: 30           # timeout for HTTP requests (arXiv API, HTML fetch)
+  max_retries: 3                    # max retries for transient failures
+  arxiv_html_base_url: "https://arxiv.org/html"  # arXiv HTML rendering endpoint
 
 arxiv:
   category: "cs.AI"
-
-pdf:
-  dpi: 150                          # 100=fast/cheap, 150=balanced, 200=high quality
 
 paths:
   obsidian_vault: "~/obsidian/AI Papers"  # overridden by OBSIDIAN_VAULT_PATH in .env
@@ -428,30 +419,34 @@ type ReviewVerdict struct {
 ### PipelineSession
 ```go
 type PipelineSession struct {
-    SessionID     string
-    Stage         PipelineStage
-    Candidates    []Paper
-    SelectedPaper *Paper
-    PDF           []byte
-    Explainer     *ExplainerOutput
-    LastVerdict   *ReviewVerdict
-    Iterations    int
-    Error         string
+    SessionID   string
+    Stage       PipelineStage
+    Candidates  []Paper           // frontend-visible: candidates for selection
+    Notice      string            // optional user-facing message
+    Error       string            // error message if stage = "failed"
+    Recoverable bool              // whether error is transient (can retry)
+    
+    // Server-only (excluded from Snapshot, never sent to frontend)
+    SelectedPaper *Paper          // paper user selected
+    MarkdownText  string          // extracted HTML→Markdown from PaperContentTool
+    Explainer     *ExplainerOutput    // Phase 4
+    LastVerdict   *ReviewVerdict      // Phase 5
+    
     StartedAt     time.Time
     CompletedAt   *time.Time
 }
 
 type PipelineStage string
 const (
-    StageDiscovery  PipelineStage = "discovery"
-    StageSelection  PipelineStage = "selection"
-    StageFetching   PipelineStage = "fetching_pdf"
-    StageGenerating PipelineStage = "generating"
-    StageReviewing  PipelineStage = "reviewing"
-    StageRevising   PipelineStage = "revising"
-    StageWriting    PipelineStage = "writing"
-    StageComplete   PipelineStage = "complete"
-    StageFailed     PipelineStage = "failed"
+    StageDiscovery  PipelineStage = "discovery"      // fetching + filtering papers
+    StageSelection  PipelineStage = "selection"      // candidates ready, awaiting pick
+    StageExtracting PipelineStage = "extracting"     // fetching + converting HTML → Markdown
+    StageGenerating PipelineStage = "generating"     // Phase 4: explainer generation
+    StageReviewing  PipelineStage = "reviewing"      // Phase 5: quality review
+    StageRevising   PipelineStage = "revising"       // Phase 5: revision loop
+    StageWriting    PipelineStage = "writing"        // Phase 4: vault write
+    StageComplete   PipelineStage = "complete"       // success
+    StageFailed     PipelineStage = "failed"         // pipeline aborted
 )
 ```
 
@@ -518,8 +513,7 @@ tags: [ai, paper, explainer]
 | PipelineSession | In-memory Go struct | Go backend process | Single run |
 | ProcessedLog | JSON file on disk | Configured path | Permanent |
 | Obsidian Note | Markdown file | Obsidian vault folder | Permanent |
-| PDF bytes | In-memory `[]byte` | Go backend process | Until rendering complete |
-| Page images | In-memory `[][]byte` | Go backend process | Single run |
+| Paper Markdown | In-memory `string` | Go backend process (session) | Single run |
 | Config | YAML + `.env` | Project root | Permanent |
 
 ---
@@ -556,31 +550,35 @@ Orchestrator updates PipelineSession { stage: "selection", candidates: []Paper }
 Next.js renders candidate list (title, authors, abstract snippet, date, arXiv ID)
 ```
 
-### Flow 2 — PDF Fetch + Render + Explainer Generation + Review Loop
+### Flow 2 — HTML Fetch + Markdown Conversion + Explainer Generation + Review Loop
 
 ```
 User selects one paper in Next.js UI
     │
     ▼
-Next.js → POST /process { paper_id: "2401.12345" } → Go Orchestrator
+Next.js → POST /process { session_id, paper_id: "2401.12345" } → Go Orchestrator
     │
     ▼
-PDFFetchTool → GET https://arxiv.org/pdf/2401.12345 → []byte in memory
+Orchestrator sets stage → "extracting" (async, returns session_id immediately)
     │
     ▼
-PDFRendererTool
-    → pdftoppm -png -r 150 → [][]byte (one PNG per page, in reading order)
-    → temp files cleaned up
+PaperContentTool detached goroutine
+    → GET https://arxiv.org/html/2401.12345 (follows same-host redirect)
+    → HTML → Markdown conversion
+    → Return clean Markdown text OR ErrPaperHTMLNotFound (404)
+    │         │
+    │    [404 Not Found] ──→ Orchestrator.RecoverToSelection() 
+    │                          (candidates preserved, return to selection)
     │
     ▼
 ExplainerAgent (iteration 1)
-    → CompletionRequest { system_prompt, user_prompt, page_images: [PNG×N], revision_note: "" }
+    → CompletionRequest { system_prompt, user_prompt, document_text: markdown, revision_note: "" }
     → LLMClient.Complete()
     → ExplainerOutput { content, sections, iteration: 1 }
     │
     ▼
 ReviewerAgent
-    → CompletionRequest { system_prompt, rubric, explainer sections (text only, no images) }
+    → CompletionRequest { system_prompt, rubric, explainer sections (text) }
     → LLMClient.Complete()
     → ReviewVerdict { pass, score, feedback, iteration }
     │
@@ -625,12 +623,14 @@ Next.js renders success + Markdown preview + vault file path
 Next.js polls GET /status/:sessionId every 2 seconds via TanStack Query
     │
     ▼
-Go Orchestrator returns { stage, iteration, error }
+Go Orchestrator returns { stage, candidates, notice, error, recoverable }
     │
     ▼
 Next.js displays live status:
-"Fetching PDF..." → "Generating explainer (pass 1)..."
+"Fetching paper..." → "Extracting HTML..." → "Generating explainer (pass 1)..."
 → "Reviewing..." → "Revising (pass 2)..." → "Saving to vault..."
+
+On 404 (recoverable): candidates re-enabled, selection UI re-shown
 ```
 
 ---
@@ -656,19 +656,19 @@ Next.js displays live status:
 | **`gopkg.in/yaml.v3`** | latest | Parse YAML config file. |
 | **`godotenv`** | latest | Load `.env` for API keys in local development. |
 | **`air`** | latest | Live reload for Go backend during development. |
-| **`poppler-utils`** | system package | Provides `pdftoppm` for high-quality PDF page rendering. `brew install poppler` / `apt install poppler-utils`. Required prerequisite — server validates at startup. |
+| **`html-to-markdown/v2`** | latest | Pure-Go HTML-to-Markdown conversion (no CGO, no external dependencies). Converts arXiv LaTeXML HTML to clean text. |
 
-### LLM Providers (configurable, vision-capable required)
+### LLM Providers (configurable, text-capable required)
 
-All providers sit behind the `LLMClient` interface. Page images (PNG bytes) are sent as vision input — not PDF bytes — making the interface compatible with any vision-capable model or custom endpoint.
+All providers sit behind the `LLMClient` interface. Paper content is sent as **text only** (Markdown) — not images — making the interface compatible with any text-capable model.
 
-**Vision requirement:** The configured model must support image/vision input. Validated at startup against a known-models list. Unknown/custom models produce a warning but are allowed.
+**No vision requirement:** Any text-capable model works. No validation for vision capability. This maximizes flexibility: cheaper models, longer context windows, models without vision support.
 
-| Provider | SDK | Default Model | Vision Input Format |
+| Provider | SDK | Default Model | Text Input Format |
 |---|---|---|---|
-| **Anthropic Claude** | `github.com/anthropics/anthropic-sdk-go` | `claude-sonnet-4-6` | Base64 PNG image blocks in messages array |
-| **OpenAI** | `github.com/openai/openai-go` | `gpt-4o` | Base64 data URL image_url content parts |
-| **Google Gemini** | `google.golang.org/genai` | `gemini-2.0-flash` | Inline PNG blob parts; largest context window |
+| **Anthropic Claude** | `github.com/anthropics/anthropic-sdk-go` | `claude-sonnet-4-6` | Text blocks in messages array |
+| **OpenAI** | `github.com/openai/openai-go` | `gpt-4o` (or `gpt-4-turbo`) | Text content in messages array |
+| **Google Gemini** | `google.golang.org/genai` | `gemini-2.0-flash` (large context) | Inline text parts; largest context window |
 
 **LLM configuration block:**
 ```yaml
@@ -695,7 +695,7 @@ llm:
 |---|---|
 | **Local filesystem** | Obsidian vault is a local folder. Direct file write is simplest and most reliable. |
 | **JSON file (processed log)** | Flat list of paper IDs needs no database. Human-readable and manually editable. |
-| **In-memory (PDF + session)** | Transient data — exists only for duration of one run. |
+| **In-memory (session state)** | Transient data — pipeline session and paper Markdown exist only for duration of one run. |
 
 ---
 
@@ -725,49 +725,53 @@ GET https://export.arxiv.org/api/query
 
 ---
 
-### 2. arXiv PDF Download
+### 2. arXiv HTML Rendering
 
-**URL pattern:** `https://arxiv.org/pdf/{arxiv_id}`
+**URL pattern:** `https://arxiv.org/html/{arxiv_id}`
 **Auth:** None
 
-- Direct `GET` to PDF URL, streamed into `[]byte` in memory
-- Handle redirects (arXiv redirects to versioned PDF URL)
-- Timeout: 30 seconds
-- Respect same 3-second delay as API calls
+- Direct `GET` to HTML rendering endpoint
+- Follows same-host redirect (arXiv redirects to versioned URL automatically)
+- Timeout: configurable (`config.Agent.RequestTimeoutSec`, default 30s)
+- Size limit: 50MB (`io.LimitReader`) for safety
+- Retry on transient failures (429, 503, network) per `config.Agent.MaxRetries`
+- **404 Not Found** → treated as recoverable (return to selection, allow re-pick)
 
 ---
 
-### 3. LLM Provider APIs
+### 3. LLM Provider APIs (Text-Only)
+
+All providers receive paper content as **text only** (Markdown). No images, no vision APIs.
 
 **Anthropic Claude:**
 ```
 POST https://api.anthropic.com/v1/messages
 Headers: x-api-key, anthropic-version
-PDF: base64 document block in messages[]
+Content: DocumentText as message content block
 ```
 
 **OpenAI:**
 ```
 POST https://api.openai.com/v1/chat/completions
 Headers: Authorization: Bearer {key}
-PDF: base64 encoded content block
+Content: DocumentText as message content
 ```
 
 **Google Gemini:**
 ```
 POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
 Headers: Authorization: Bearer {key}
-PDF: inline_data base64 part
+Content: DocumentText as inline text part
 ```
 
-**Error handling across all providers:**
+**Error handling (shared `withRetry` logic):**
 
 | Error | Behaviour |
 |---|---|
 | `429` | Exponential backoff, max 3 retries |
-| `400` | Surface as configuration error |
-| `500/503` | Retry once, then surface as provider error |
-| Timeout | Surface with duration and paper ID |
+| `503` | Exponential backoff, max 1 retry |
+| `400` | Surface immediately as configuration error (not retried) |
+| Timeout | Surface immediately (not retried) |
 
 ---
 
@@ -816,14 +820,18 @@ GET    localhost:8080/health           → { status: "ok" }
 
 ### Error Handling
 
-**Philosophy:** Fail loudly, never silently. Never write a partial note to the vault.
+**Philosophy:** Fail loudly, never silently. Distinguish between transient (retryable) and permanent failures.
 
 | Stage | Failure | Behaviour |
 |---|---|---|
 | arXiv fetch | Network error / 429 | Retry 3x with backoff, surface error if all fail |
-| PDF download | Timeout / 404 | Surface error with paper ID, abort run |
-| LLM call | 429 / timeout | Retry 3x with backoff, surface provider error |
-| LLM call | 400 bad request | Surface as config error |
+| HTML fetch | Network error / 429 / 503 | Retry with backoff per config.Agent.MaxRetries |
+| HTML fetch | 404 Not Found | **Recoverable re-pick**: RecoverToSelection(), candidates preserved, return to selection UI |
+| HTML fetch | Other 4xx / timeout | Surface as non-recoverable error |
+| LLM call | 429 rate limit | Retry 3x with backoff (shared withRetry logic) |
+| LLM call | 503 unavailable | Retry 1x with backoff (shared withRetry logic) |
+| LLM call | 400 bad request | Surface immediately as config error (not retried) |
+| LLM call | Timeout | Surface immediately (not retried) |
 | Reviewer loop | Max iterations reached | Accept last output, proceed with warning flag in frontmatter |
 | Vault write | Permission error / disk full | Surface error, do NOT update processed log |
 | Log write | Failure after vault write | Log warning — paper remains re-processable |
@@ -868,12 +876,13 @@ GET    localhost:8080/health           → { status: "ok" }
 |---|---|---|---|---|
 | R1 | LLM hallucination in explainer content | Medium | ReviewerAgent catches inconsistencies against explainer text. arXiv ID and link in frontmatter enable source verification. |
 | R2 | arXiv API instability / 429 enforcement | Low | Retry with backoff; sequential requests stay within limits. |
-| R3 | Very long papers (40+ pages) may exceed model context window at 150 DPI | Medium | Context window pre-check warns before LLM call. Gemini available as large-context fallback. DPI configurable to reduce token cost. |
-| R4 | `poppler` version differences across OS produce slightly different rendering | Low | Text legibility consistent across versions. Cosmetic differences do not affect LLM comprehension. |
-| R5 | Reviewer loop adds cost and latency | Low | Configurable cap; can set to 0 to disable. Full run with 2 cycles may cost $0.05–$0.50 per paper depending on length and provider. |
-| R6 | ADK Go maturity (released Nov 2025) | Medium | Used for orchestration only; blast radius limited. Pinning dependency version in `go.mod` reduces surprise upgrades. |
-| T1 | Page-as-image uses significantly more tokens than text extraction | Accepted | Full visual fidelity is the core design goal — diagrams, tables, and figures are central to understanding AI papers. DPI is configurable to manage cost. MarkItDown and text-extraction approaches were evaluated and rejected. |
-| T2 | External `poppler` dependency | Accepted | Single install command. Well-maintained, available on all target platforms. CGO-based alternatives add more complexity, not less. |
+| R3 | arXiv HTML rendering unavailable (404) for some papers | Low | 404 is treated as recoverable re-pick. User can select another paper without losing session. |
+| R4 | HTML-to-Markdown conversion loses important visual structure (diagrams, tables) | Medium | Figure captions are preserved in Markdown. Limitations documented in system prompt — agents instructed to note "see figure X" for complex diagrams. |
+| R5 | Very long papers (40+ pages) may exceed model context window | Medium | Context window pre-check in ExplainerAgent Phase 4. Gemini available as large-context fallback. |
+| R6 | Reviewer loop adds cost and latency | Low | Configurable cap; can set to 0 to disable. Full run with 2 cycles may cost $0.05–$0.50 per paper depending on length and provider. |
+| R7 | ADK Go maturity (released Nov 2025) | Medium | Used for orchestration only; blast radius limited. Pinning dependency version in `go.mod` reduces surprise upgrades. |
+| T1 | Text-only vs. vision-capable models | Accepted | Pure text approach maximizes flexibility (cheaper models, longer context, more providers). HTML conversion with figure captions provides sufficient semantic content. Vision reserved for future enhancement if needed. |
+| T2 | HTML rendering via `html-to-markdown/v2` (pure Go) | Accepted | No external dependencies, no CGO, no poppler. Clean, simple, maintainable. Converts semantic structure well. |
 | T3 | Same LLM for reviewer and explainer | Accepted | Single config, simpler operation. Different system prompts and temperatures create meaningfully different evaluation behaviour. |
 | T4 | Single paper per run | Accepted | Human-in-the-loop control, simpler state management. |
 | T5 | In-memory session state | Accepted | Zero infrastructure complexity. Crash recovery not required for a local, single-user tool. |

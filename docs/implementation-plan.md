@@ -11,7 +11,7 @@ Six phases ordered by dependency and risk. Each phase produces a working, testab
 |---|---|---|
 | 1 | Scaffolding & Config | Both services run, config validates |
 | 2 | Discovery & Deduplication | 5 candidate papers in UI |
-| 3 | PDF Fetch & LLM Client | PDF downloads, LLM calls work |
+| 3 | HTML Extraction & LLM Client | Paper Markdown extracted, LLM calls work, 404 recovery implemented |
 | 4 | Explainer & Vault Write | Full note saved to Obsidian |
 | 5 | Reviewer & Revision Loop | Critic-generator loop working |
 | 6 | Polish & Hardening | Error handling, logging, README |
@@ -172,21 +172,25 @@ explainer:
 
 ---
 
-## Phase 3 — PDF Fetch + LLM Client
+## Phase 3 — HTML Fetch + Markdown Conversion + LLM Client
 
-**Goal:** PDF downloads successfully. LLM client works with at least one provider.
+**Goal:** Paper HTML extracted successfully and converted to Markdown. LLM client works with at least one provider. 404 recovery implemented.
 
 ### Tasks
 
-#### PDFFetchTool
-- [ ] Implement `FetchPDF(ctx, pdfURL string) ([]byte, error)`
-- [ ] Handle arXiv redirects to versioned PDF URL
-- [ ] Set 30-second download timeout
-- [ ] Respect 3-second delay (same domain as arXiv API)
-- [ ] Return clear error with paper ID on failure
+#### PaperContentTool
+- [x] Implement `FetchMarkdown(ctx, arxivID string) (string, error)`
+- [x] Fetch from `https://arxiv.org/html/{arxivID}` (handle same-host redirect)
+- [x] Implement `io.LimitReader` (50MB cap) for safety
+- [x] Convert LaTeXML HTML to Markdown using `html-to-markdown/v2`
+- [x] Extract main `ltx_document` body
+- [x] Strip math, navigation, bibliography, appendix (keep headings + captions)
+- [x] Implement retry logic for transient failures (429, 5xx, network)
+- [x] Distinguish 404 → `ErrPaperHTMLNotFound` (recoverable re-pick)
+- [x] Set timeout per `config.Agent.RequestTimeoutSec`
 
-#### LLMClient Interface
-- [ ] Define `LLMClient` interface:
+#### LLMClient Interface (Text-Only)
+- [x] Define `LLMClient` interface:
   ```go
   type LLMClient interface {
       Complete(ctx context.Context, req CompletionRequest) (CompletionResponse, error)
@@ -195,60 +199,84 @@ explainer:
   type CompletionRequest struct {
       SystemPrompt string
       UserPrompt   string
-      Documents    [][]byte
+      DocumentText string              // Markdown text (no images)
       MaxTokens    int
       Temperature  float32
   }
 
   type CompletionResponse struct {
-      Content    string
-      TokensUsed int
+      Content      string
+      InputTokens  int
+      OutputTokens int
   }
   ```
-- [ ] Implement config-driven provider selector (reads `llm.provider` from config)
+- [x] Implement config-driven provider selector (reads `llm.provider` from config)
+- [x] Implement shared `withRetry` wrapper: 429 (3 retries), 503 (1 retry), 400 (immediate fail)
 
 #### Anthropic Claude Implementation
-- [ ] Install `github.com/anthropics/anthropic-sdk-go`
-- [ ] Implement `AnthropicClient.Complete()`:
-  - PDF as base64 document block in `messages[]`
+- [x] Install `github.com/anthropics/anthropic-sdk-go`
+- [x] Implement `AnthropicClient.Complete()`:
+  - DocumentText as text block in `messages[]`
   - Map `CompletionRequest` → Anthropic API request format
-  - Map response → `CompletionResponse`
-- [ ] Handle 429, 400, 500 per error strategy
-- [ ] Implement retry with exponential backoff (max 3 retries)
-- [ ] Enforce `timeout_seconds` from config
+  - Map response → `CompletionResponse` (extract input/output tokens separately)
+- [x] Apply `withRetry` wrapper for error handling
 
 #### OpenAI Implementation
-- [ ] Install `github.com/openai/openai-go`
-- [ ] Implement `OpenAIClient.Complete()`:
-  - PDF as base64 encoded content block
+- [x] Install `github.com/openai/openai-go`
+- [x] Implement `OpenAIClient.Complete()`:
+  - DocumentText as text content in messages
   - Map request/response formats
-  - Same error handling and retry logic
+  - Apply `withRetry` wrapper
 
 #### Google Gemini Implementation
-- [ ] Install `google.golang.org/genai`
-- [ ] Implement `GeminiClient.Complete()`:
-  - PDF as `inline_data` base64 part
+- [x] Install `google.golang.org/genai`
+- [x] Implement `GeminiClient.Complete()`:
+  - DocumentText as inline text part
   - Map request/response formats
-  - Same error handling and retry logic
+  - Apply `withRetry` wrapper
 
-#### Orchestrator — Process Endpoint
-- [ ] Implement `POST /process { session_id, paper_id }`:
+#### Orchestrator — Process Endpoint + Async Pipeline
+- [x] Implement `POST /process { session_id, paper_id }`:
   - Validate session exists and is in `selection` stage
-  - Update stage to `fetching_pdf`
-  - Run PDFFetchTool asynchronously
-  - Return `{ session_id }` immediately (processing is async)
+  - Update stage to `extracting`
+  - Return `{ session_id }` immediately
+  - Run `runPipeline` detached goroutine
+- [x] Implement 404 recovery in `runPipeline`:
+  - On `ErrPaperHTMLNotFound`: call `session.RecoverToSelection(notice)`
+  - Candidates preserved, return to selection UI for re-pick
+- [x] Wire: `PaperContentTool.FetchMarkdown()` → store in session
+- [x] Construct LLMClient at startup (`orchestrator.New()` returns error if config invalid)
+
+#### Session Model Updates
+- [x] Add `StageExtracting` pipeline stage
+- [x] Add server-only fields: `selectedPaper`, `markdownText`
+- [x] Add `SetSelectedPaper()`, `SetMarkdown()` accessors
+- [x] Add `RecoverToSelection(notice)` for 404 re-pick
+- [x] Update `Snapshot()` to exclude server-only fields
+
+#### Next.js — Async Processing + Recovery UI
+- [x] Update `POST /api/select` to trigger async `POST /orchestrator/process`
+- [x] Display `extracting` stage in progress labels
+- [x] Implement 404 re-pick UI:
+  - Show notice: "Paper not available on arXiv. Please select another."
+  - Re-enable candidate cards
+  - Clear error state
+- [x] Poll `GET /api/status` during extraction
 
 ### Exit Criteria
-- [ ] Given a valid arXiv paper ID, Go backend downloads the PDF into memory
-- [ ] Anthropic LLM call with PDF content returns a valid response
-- [ ] Switching `llm.provider` in config routes to the correct provider
-- [ ] 429 from LLM retries automatically; 400 surfaces as config error
+- [x] Given a valid arXiv paper ID, Go backend fetches HTML and converts to Markdown
+- [x] Markdown text is stored server-side and excludes images/math
+- [x] Anthropic LLM call with Markdown text returns a valid response
+- [x] Switching `llm.provider` in config routes to the correct provider
+- [x] 429 from LLM retries automatically per `withRetry` logic
+- [x] 404 HTML not found triggers re-pick back to selection (candidates preserved)
+- [x] Input/output tokens counted separately in LLM response
 
 ---
 
 ## Phase 4 — ExplainerAgent + Vault Write
 
-**Goal:** Full single-pass explainer generated and saved to Obsidian.
+**Goal:** Full single-pass explainer generated from Markdown and saved to Obsidian.
 
 ### Tasks
 
@@ -257,6 +285,7 @@ explainer:
   - Role: deep AI research explainer for technical practitioners
   - Audience: engineers who know ML basics, not research-level math
   - Goal: understand and re-explain the paper's core intent, not summarize
+  - Input: clean Markdown text extracted from arXiv HTML (may reference "figure X" for diagrams)
   - Analogy approach: everyday intuition first, bridge to engineering mental models
   - Math handling: translate simple equations to plain English; summarize complex proofs at intent level only
   - Soft word target: ~2,500 words, may exceed for complex papers
@@ -277,7 +306,7 @@ explainer:
 
 #### ExplainerAgent Implementation
 - [ ] Implement `Generate(ctx, ExplainerInput) (ExplainerOutput, error)`
-- [ ] Build `CompletionRequest` from PDF bytes + system prompt + paper metadata
+- [ ] Build `CompletionRequest` from Markdown text + system prompt + paper metadata
 - [ ] Parse LLM response into `ExplainerOutput.Sections` map (keyed by section name)
 - [ ] Accept `RevisionNote` on subsequent passes — prepend structured feedback to prompt
 - [ ] Update pipeline session stage to `generating` with iteration count
@@ -311,15 +340,16 @@ explainer:
 - [ ] Implement atomic write: write to `.tmp` file → `os.Rename()` to final path
 - [ ] Call `LogCheckTool.MarkAsProcessed()` immediately after successful rename
 
-#### Orchestrator — Full Pipeline (single pass)
-- [ ] Wire: `PDFFetchTool` → `ExplainerAgent` → `VaultWriterTool` → `LogCheckTool`
+#### Orchestrator — Full Pipeline (Phase 3 + Phase 4)
+- [ ] Wire (Phase 3 → Phase 4): `PaperContentTool.FetchMarkdown()` → `ExplainerAgent.Generate()` → `VaultWriterTool.Write()` → `LogCheckTool.MarkAsProcessed()`
+- [ ] On Phase 4 start: load Markdown from session, pass to ExplainerAgent
 - [ ] Update session stage at each step
 - [ ] Implement `GET /result/:sessionId` → `{ content, vault_file_path, tokens_used }`
 
 #### Next.js — Progress + Preview UI
 - [ ] Implement TanStack Query polling of `GET /api/status` every 2 seconds
 - [ ] Display live stage labels:
-  - `"Fetching PDF..."`
+  - `"Extracting paper..."`
   - `"Generating explainer (pass 1)..."`
   - `"Saving to vault..."`
   - `"Complete"`
@@ -416,8 +446,9 @@ explainer:
 #### Error Handling
 - [ ] Implement `recoverable` flag in all error responses:
   ```json
-  { "stage": "failed", "error": "PDF download timed out after 30s", "recoverable": true }
+  { "stage": "failed", "error": "HTML fetch timed out after 30s", "recoverable": true }
   ```
+- [ ] Implement 404 recovery: `stage: "selection"`, candidates preserved, notice displayed
 - [ ] Retry button in UI for recoverable errors
 - [ ] Clear non-recoverable error messages (e.g. config errors, permission errors)
 - [ ] Verify vault write failure does NOT update `processed.json`
@@ -485,7 +516,7 @@ Phase 1 (Scaffolding)
 Phase 2 (Discovery)
     │
     ▼
-Phase 3 (PDF + LLM)
+Phase 3 (HTML Extraction + LLM)
     │
     ▼
 Phase 4 (Explainer + Vault)   ← first fully working end-to-end slice

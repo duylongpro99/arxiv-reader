@@ -1,17 +1,17 @@
-# Phase 3 — PDF Fetch, Page Rendering & LLM Client
+# Phase 3 — HTML Fetch, Markdown Conversion & LLM Client
 ## ArXiv AI Paper Explainer Agent
 
 ---
 
 ## Intent
 
-The user has selected a paper. Now the system must do three things before any intelligence can be applied: **get the paper's full content, render it into a format any vision-capable model can read, and establish a reliable, provider-agnostic channel to the language model.**
+The user has selected a paper. Now the system must do three things before any intelligence can be applied: **get the paper's full content in a clean, structured text format; convert it to Markdown for easy consumption; and establish a reliable, provider-agnostic channel to the language model.**
 
-Phase 3 is the infrastructure phase of the agent's core capability. No explainer is generated yet — but by the end of this phase, the system can put every page of a research paper — including diagrams, tables, figures, and equations — in front of any configured vision-capable LLM and get a response back.
+Phase 3 is the infrastructure phase of the agent's core capability. No explainer is generated yet — but by the end of this phase, the system can extract the full text of a research paper from arXiv's HTML rendering, convert it to clean Markdown with preserved structure and captions, and send it to any configured text-capable LLM to get a response back.
 
-The central design decision here is **page-as-image rendering**: every PDF page is converted to a PNG image using `poppler`'s `pdftoppm`, then sent to the LLM as vision input. This is the only approach that guarantees no visual content is lost regardless of what the paper contains — architecture diagrams, performance tables, loss curves, and image-embedded equations are all preserved exactly as a human reader would see them.
+The central design decision here is **arXiv HTML → Markdown text extraction**: the system fetches each paper's HTML rendering from `arxiv.org/html/{id}`, converts it to Markdown using pure-Go `html-to-markdown`, and sends the text to the LLM. This approach eliminates the need for a vision model, system dependencies (no poppler), and expensive image tokens. We accept the tradeoff of dropping rendered diagrams/figures/equations for now — captions are retained, and alttext recovery is a cheap future seam.
 
-Every architectural decision here serves one long-term goal: **the choice of LLM provider must never be a constraint on what the agent can do — but the model must be vision-capable.**
+Every architectural decision here serves one long-term goal: **the choice of LLM provider must never be a constraint on what the agent can do — and any text-capable model is sufficient.**
 
 ---
 
@@ -19,13 +19,13 @@ Every architectural decision here serves one long-term goal: **the choice of LLM
 
 ## 1. Problem Statement
 
-A user has selected a paper. The system now needs to acquire the paper's full content and route it to the configured LLM in a form that preserves everything — not just extractable text. AI research papers rely heavily on visual content: architecture diagrams, comparison tables, mathematical notation, and figure-referenced explanations. A text-only extraction approach silently discards this content, producing a lower-quality explainer without the system or user knowing why.
+A user has selected a paper. The system now needs to acquire the paper's full content and route it to the configured LLM in a clean, structured text format. Extracting text from PDF directly (e.g. using pdftotext) is fragile on arXiv papers: the two-column layout causes text interleaving, structure is lost, and the reading order becomes unintelligible. However, arXiv publishes a LaTeXML-rendered HTML version alongside every paper — linear reading order, real section headings, tables, captions, and equations as MathML — making HTML extraction far superior to PDF text extraction on this corpus.
 
 Three problems must be solved reliably:
 
-1. **PDF acquisition** — arXiv hosts papers as PDFs. The system must download the correct file, handle redirects, and manage failures gracefully.
-2. **PDF rendering** — every page must be converted to a PNG image that a vision LLM can read, at a resolution that preserves legible text and diagram detail.
-3. **LLM provider abstraction** — the model is fully configurable and may be any vision-capable provider or custom endpoint. The system must work identically regardless of which provider is configured.
+1. **HTML acquisition** — arXiv hosts papers as structured HTML at `arxiv.org/html/{id}`. The system must fetch the correct HTML document, handle redirects transparently, and manage failures gracefully.
+2. **HTML-to-Markdown conversion** — the HTML must be converted to clean Markdown while preserving structure, captions, headings, and list hierarchy. Minimal cleanup: strip navigation boilerplate, bibliography, and appendix; remove MathML noise; collapse excess whitespace.
+3. **LLM provider abstraction** — the model is fully configurable and may be any text-capable provider or custom endpoint. The system must work identically regardless of which provider is configured.
 
 ## 2. Target Users
 
@@ -34,11 +34,11 @@ Three problems must be solved reliably:
 
 ## 3. User Stories
 
-- As a practitioner, I want the system to automatically download and process the selected paper so that I never have to find, convert, or upload it manually.
-- As a practitioner, I want diagrams and tables in the paper to be understood by the agent so that architectural figures and result tables are reflected in the explanation, not missing from it.
-- As a practitioner, I want a clear error if the PDF cannot be downloaded or rendered so that I know whether to retry or select a different paper.
+- As a practitioner, I want the system to automatically fetch and convert the selected paper to text so that I never have to find, extract, or manually process it.
+- As a practitioner, I want table captions and figure references in the paper to be understood by the agent so that architectural context and result summaries are reflected in the explanation.
+- As a practitioner, I want a clear error if the HTML cannot be fetched so that I know whether to retry or select a different paper.
 - As a developer, I want to switch LLM providers by changing one config value so that I'm never locked into a single provider.
-- As a developer, I want the system to validate at startup that the configured model is vision-capable so that I discover misconfiguration immediately, not mid-pipeline.
+- As a developer, I want the system to work with any text-capable model, not just vision models, so I have maximum flexibility in provider choice.
 
 ## 4. Functional Requirements
 
@@ -46,94 +46,93 @@ Three problems must be solved reliably:
 - User selects one paper from the candidate list displayed in Phase 2
 - Selection triggers the processing pipeline for that paper
 - UI transitions to a processing state with live progress updates
-- The "Select" action is irreversible within a session (no back navigation — start a new session to change)
+- **Relaxed:** if HTML fetch fails with 404 or empty content, the session returns to the `selection` stage (candidates preserved) with a recoverable notice, allowing the user to pick a different paper without restarting the session
 
-### F2 — PDF Download
-- System downloads the full PDF of the selected paper from arXiv
-- PDF bytes held in memory for the duration of the pipeline run
-- Download handles arXiv redirects to versioned PDF URLs automatically
-- Download timeout: 30 seconds
-- On failure: surface clear error with paper ID and failure reason
+### F2 — HTML Fetch
+- System fetches the full HTML of the selected paper from arXiv at `https://arxiv.org/html/{arxiv_id}`
+- `arxiv_id` is bare (no version suffix, e.g. `2312.00752`); `http.Client` follows same-host redirects to versioned URL automatically
+- HTML bytes held in memory for the duration of the pipeline run
+- Fetch timeout: 30 seconds (reuses `agent.request_timeout_seconds` from config)
+- Fetch respects arXiv politeness: retry backoff and User-Agent reuse discovery tool's pattern
+- Wrapper in `io.LimitReader` prevents OOM on unexpectedly large documents
+- Errors: `ErrPaperHTMLNotFound` (404 → recoverable), `ErrPaperHTMLFailed` (network/other), timeout
 
-### F3 — PDF Page Rendering
-- Every PDF page is rendered as a PNG image using `poppler`'s `pdftoppm`
-- Resolution configurable via `pdf.dpi` in config (default: `150 DPI`)
-  - 150 DPI: good quality, moderate token cost — recommended default
-  - 200 DPI: higher quality for dense figures, higher token cost
-  - 100 DPI: lower quality, lower token cost — for cost-sensitive runs
-- Pages rendered in order and held in memory as `[][]byte` (one `[]byte` per page)
-- On render failure: surface clear error with paper ID
+### F3 — HTML-to-Markdown Conversion
+- HTML is converted to clean Markdown using pure-Go `github.com/JohannesKaufmann/html-to-markdown/v2`
+- Minimal cleanup applied:
+  - Strip LaTeXML-generated navigation, header, and footer boilerplate
+  - Trim bibliography and appendix sections (preserve body + captions)
+  - **Retain** figure and table captions (context for diagrams)
+  - Strip `<math>` nodes (MathML noise; alttext seam noted for future)
+  - Collapse excess whitespace and normalize line breaks
+- Markdown held in memory as `markdownText` field (mutex-guarded, excluded from `Snapshot()` — large, never sent to frontend)
+- On conversion failure: surface clear error with paper ID
 
-### F4 — Vision Model Requirement
-- The configured LLM model must support vision / image input
-- System validates this at startup using a known-vision-models list in config
-- If model is not in the known list: log a warning but proceed (custom/unknown models allowed)
-- If model is in a known-non-vision list: fail at startup with a clear error
-- README documents vision requirement explicitly as a prerequisite
-
-### F5 — LLM Client Interface
+### F4 — LLM Client Interface
 - All LLM calls throughout the system go through a single `LLMClient` interface
-- Interface accepts: system prompt, user prompt, page images (`[][]byte`), max tokens, temperature
+- Interface accepts: system prompt, user prompt, document text (Markdown), max tokens, temperature
 - Interface returns: generated text content, token usage count (input + output separately)
 - Concrete implementations exist for: Anthropic Claude, OpenAI, Google Gemini
 - Custom/other providers: implement `LLMClient` interface (~50 lines)
 - Active provider selected at startup from config — no runtime switching
+- **Simplified:** no vision validation needed; any text model is valid
 
-### F6 — LLM Provider Configuration
+### F5 — LLM Provider Configuration
 - Provider, model, API key, max tokens, temperature, timeout, and optional base URL configurable
 - Switching providers requires only changing `llm.provider` and `llm.model` in config (+ API key in `.env`)
 - Adding a new provider requires only implementing the `LLMClient` interface
 
-### F7 — LLM Error Handling
+### F6 — LLM Error Handling
 - `429 rate limited` → retry with exponential backoff, max 3 attempts
-- `400 bad request` → surface as configuration error (wrong model name, payload too large)
+- `400 bad request` → surface as configuration error (wrong model name, context too large)
 - `500/503 provider error` → retry once, then surface as provider error
 - Timeout → surface with duration and paper ID
 - All errors set session to `failed` with `recoverable` flag
 
-### F8 — Pipeline Status (Phase 3 stages)
-- New stage labels surfaced to UI:
-  - `"Downloading paper..."` (`fetching_pdf`)
-  - `"Rendering pages..."` (`rendering_pdf`)
+### F7 — Pipeline Status (Phase 3 stages)
+- New stage label surfaced to UI:
+  - `"Extracting paper text..."` (`extracting`) — replaces old `fetching_pdf` + `rendering_pdf`
 - `GET /status/:sessionId` updated to reflect new stages
 
 ## 5. Non-Functional Requirements
 
-- **Full fidelity** — no visual content (diagrams, tables, figures) is lost between PDF and LLM input
-- **Provider parity** — the `LLMClient` interface must be implementable by any vision-capable provider without leaking provider-specific concepts into calling code
-- **Failure isolation** — a PDF download or render failure must not affect the session log or any persisted state
-- **Configurability** — DPI, max tokens, temperature, provider, model — all configurable without code changes
+- **Correctness** — extracted Markdown has correct reading order (no column interleave), preserves structure, and includes captions
+- **Provider parity** — the `LLMClient` interface must be implementable by any text-capable provider without leaking provider-specific concepts into calling code
+- **Failure recovery** — on HTML 404/empty, session returns to selection stage (not failure) so user can pick another paper
+- **Configurability** — HTML base URL, content size cap, max tokens, temperature, provider, model — all configurable without code changes
+- **No system dependencies** — pure-Go HTML-to-Markdown conversion; no poppler, no Python, no CGO
 
 ## 6. Success Metrics
 
-- PDF downloads successfully for any valid arXiv paper ID within 30 seconds
-- All pages render to PNG images that preserve legible text and diagram detail at 150 DPI
-- LLM call with page images returns a valid response for all three supported providers
+- HTML fetches successfully for any valid arXiv paper ID within 30 seconds
+- Markdown conversion produces readable text with correct heading hierarchy and captions preserved
+- LLM call with Markdown text returns a valid response for all three supported providers (Anthropic, OpenAI, Gemini)
 - Switching `llm.provider` in config routes correctly to the new provider without code changes
-- Startup with a known-non-vision model fails immediately with a clear, actionable error
+- HTML 404 gracefully transitions session back to selection stage with recoverable notice
 - LLM 429 errors retry automatically and succeed in the majority of cases
+- No poppler, no vision model requirement, no Python dependencies in the build
 
 ## 7. Scope & Non-Goals
 
 **In scope:**
 - Paper selection UI (select button → triggers pipeline)
-- PDF download from arXiv (`PDFFetchTool`)
-- PDF page-to-image rendering via `poppler` (`PDFRendererTool`)
-- `LLMClient` interface definition
-- Anthropic, OpenAI, Gemini concrete implementations
-- Config-driven provider selection and DPI setting
-- Vision model validation at startup
+- HTML fetch from arXiv (`PaperContentTool.FetchMarkdown`)
+- HTML-to-Markdown conversion with minimal cleanup (`PaperContentTool`)
+- `LLMClient` interface definition (text-only)
+- Anthropic, OpenAI, Gemini concrete implementations (text-only clients)
+- Config-driven provider selection and HTML base URL
 - `POST /process` endpoint in Go backend
-- Error handling for PDF download, render, and LLM failures
-- New prerequisite: `poppler-utils` documented in README
+- Error handling for HTML fetch, conversion, and LLM failures
+- Recovery path: on HTML 404/empty, return to selection stage (no restart)
 
 **Out of scope:**
 - Explainer generation (Phase 4)
 - Any prompt engineering (Phase 4)
 - Reviewer agent (Phase 5)
 - Vault writing (Phase 4)
-- Text extraction from PDF (not used — page-as-image is the only path)
-- MarkItDown or any other text-based PDF conversion
+- Rendered equations / diagrams / figure images (deferred — captions retained)
+- PDF extraction (not used — HTML is the only path)
+- Vision model requirement (any text model works)
 
 ## 8. Open Questions
 
@@ -145,9 +144,9 @@ None for this phase. All requirements are fully defined.
 
 ## Intent
 
-Three components are introduced in this phase: `PDFFetchTool`, `PDFRendererTool`, and `LLMClient`. They are deliberately decoupled — the fetcher knows nothing about rendering, the renderer knows nothing about LLMs, and the LLM client knows nothing about arXiv or PDF. The Orchestrator connects them in sequence. This separation means each can be replaced or tested independently, and the LLM client is reused identically by both `ExplainerAgent` and `ReviewerAgent` in later phases.
+Two components are introduced in this phase: `PaperContentTool` and `LLMClient`. They are deliberately decoupled — the content fetcher knows nothing about LLMs, and the LLM client knows nothing about arXiv or HTML. The Orchestrator connects them in sequence. This separation means each can be replaced or tested independently, and the LLM client is reused identically by both `ExplainerAgent` and `ReviewerAgent` in later phases.
 
-The `PDFRendererTool` is the key new component in this phase. It shells out to `poppler`'s `pdftoppm` binary, which produces the highest quality page rendering available without CGO complexity. The external dependency (`poppler-utils`) is a single install command on any developer machine and is documented as a prerequisite.
+The `PaperContentTool` is the key new component in this phase. It combines HTML fetching, conversion, and cleanup in one responsible unit. Unlike the old PDF-based approach, it requires no system dependencies — the pure-Go `html-to-markdown` library handles all conversion logic. This eliminates build complexity and makes the system portable across platforms without special install steps.
 
 ---
 
@@ -166,28 +165,35 @@ Next.js API route → POST localhost:8080/process { session_id, paper_id }
 Go Orchestrator.HandleProcess()
     │
     ├── Validates session exists and is in "selection" stage
-    ├── Updates session { stage: "fetching_pdf" }
+    ├── Sets session.SelectedPaper
+    ├── Updates session { stage: "extracting" }
     ├── Spawns async goroutine for pipeline
     └── Returns { session_id } immediately (pipeline runs async)
     │
     ▼ (async goroutine)
-PDFFetchTool.FetchPDF(ctx, paper.PDFURL)
+PaperContentTool.FetchMarkdown(ctx, arxivID)
     │
-    └── GET https://arxiv.org/pdf/{arxiv_id} → []byte in memory
+    ├── GET https://arxiv.org/html/{arxiv_id} (follows same-host redirect to versioned URL)
+    ├── Wrap body in io.LimitReader (prevent OOM)
+    ├── Parse HTML; convert to Markdown with minimal cleanup
+    │   ├── Strip navigation/header/footer boilerplate
+    │   ├── Trim bibliography and appendix
+    │   ├── Retain captions (figures, tables)
+    │   ├── Strip <math> nodes (MathML noise)
+    │   └── Collapse whitespace
+    │
+    ├── On 404: return ErrPaperHTMLNotFound (recoverable)
+    │   → session transitions back to "selection" stage
+    │   → frontend clears selectedId, re-enables candidate list
+    │   → user picks another paper without restart
+    │
+    └── Return markdownText or error
     │
     ▼
-session { stage: "rendering_pdf" }
+[Phase 4 picks up here: ExplainerAgent.Generate(markdownText)]
     │
     ▼
-PDFRendererTool.RenderPages(ctx, pdfBytes)
-    │
-    └── shells out to pdftoppm → [][]byte (one PNG per page, in order)
-    │
-    ▼
-[Phase 4 picks up here: ExplainerAgent.Generate(pageImages)]
-    │
-    ▼
-LLMClient.Complete(CompletionRequest{ PageImages, prompts })
+LLMClient.Complete(CompletionRequest{ DocumentText: markdownText, prompts })
     │
     └── Routes to configured provider:
           anthropic → AnthropicClient
@@ -197,7 +203,7 @@ LLMClient.Complete(CompletionRequest{ PageImages, prompts })
 
 
 Progress polling (parallel, established in Phase 2):
-Next.js polls GET /api/status → { stage: "fetching_pdf" | "rendering_pdf", error }
+Next.js polls GET /api/status → { stage: "extracting", error }
 ```
 
 ---
@@ -242,8 +248,7 @@ POST /api/select
 const stageLabels: Record<PipelineStage, string> = {
   discovery:     "Connecting to arXiv...",
   selection:     "Select a paper to continue",
-  fetching_pdf:  "Downloading paper...",
-  rendering_pdf: "Rendering pages...",
+  extracting:    "Extracting paper text...",
   generating:    "Generating explainer (pass {iteration})...",
   reviewing:     "Reviewing (pass {iteration})...",
   revising:      "Revising (pass {iteration})...",
@@ -290,14 +295,15 @@ func (o *Orchestrator) HandleProcess(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "session not found", http.StatusNotFound)
         return
     }
-    if session.Stage != models.StageSelection {
+    snap := session.Snapshot()
+    if snap.Stage != models.StageSelection {
         http.Error(w, "session not in selection stage", http.StatusBadRequest)
         return
     }
 
     // Find selected paper in candidates
     var selected *models.Paper
-    for _, p := range session.Candidates {
+    for _, p := range snap.Candidates {
         if p.ID == req.PaperID {
             selected = &p
             break
@@ -308,9 +314,8 @@ func (o *Orchestrator) HandleProcess(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    session.SelectedPaper = selected
-    session.Stage = models.StageFetching
-    o.setSession(session)
+    session.SetSelectedPaper(selected)
+    session.SetStage(models.StageExtracting)
 
     // Return immediately — pipeline runs async
     json.NewEncoder(w).Encode(ProcessResponse{SessionID: session.SessionID})
@@ -319,222 +324,123 @@ func (o *Orchestrator) HandleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func (o *Orchestrator) runPipeline(ctx context.Context, session *models.PipelineSession) {
-    // Phase 3: PDF fetch + render
-    pdf, err := o.pdfFetchTool.FetchPDF(ctx, session.SelectedPaper.PDFURL)
+    // Phase 3: HTML fetch + Markdown conversion
+    snap := session.Snapshot()
+    markdown, err := o.paperContentTool.FetchMarkdown(ctx, snap.SelectedPaper.ID)
     if err != nil {
+        // On 404, recover by returning to selection stage (candidates already held)
+        if errors.Is(err, tools.ErrPaperHTMLNotFound) {
+            session.SetStage(models.StageSelection)
+            session.SetNotice("Paper HTML not available. Select another paper.")
+            return
+        }
         o.failSession(session, err, true)
         return
     }
-    session.PDF = pdf
-
-    session.Stage = models.StageRendering
-    o.setSession(session)
-
-    pages, err := o.pdfRendererTool.RenderPages(ctx, pdf)
-    if err != nil {
-        o.failSession(session, err, true)
-        return
-    }
-    session.PageImages = pages
+    
+    session.SetMarkdown(markdown)
 
     // Phase 4+: ExplainerAgent called here
 }
 ```
 
-**Dependencies:** PDFFetchTool, PDFRendererTool, `models`, `config`
+**Important:** `SetStage()` and `SetMarkdown()` are accessor methods that hold the mutex lock. Never mutate `session.Stage` or `session.markdownText` directly — the mutex guards concurrent access from the status-poll handler.
+
+**Dependencies:** PaperContentTool, `models`, `config`
 
 ---
 
-### 2.4 PDFFetchTool
+### 2.4 PaperContentTool
 
-**Intent:** This tool owns one responsibility: given a PDF URL, return the bytes. It handles arXiv redirect behaviour and enforces download constraints. Nothing outside this tool needs to know how arXiv serves PDFs.
+**Intent:** This tool owns one responsibility: given an arXiv ID, return clean Markdown text. It handles HTML fetching, conversion, and minimal cleanup. Combines the old PDF fetch and render responsibilities into one unit. Nothing outside this tool needs to know how arXiv serves HTML or how conversion works.
 
-**Why in-memory, not disk:** The PDF is transient — it exists only for the duration of one pipeline run. Writing to disk adds a cleanup concern with no benefit. The bytes are passed directly to `PDFRendererTool`.
+**Why pure-Go `html-to-markdown`:**
+- Pure Go library — zero system dependencies, no poppler, no Python
+- Fast in-memory conversion — no subprocess, no temp files
+- Integrates seamlessly with the discovery tool's existing retry/backoff pattern
 
 **Interface:**
 ```go
-// /internal/tools/pdffetch.go
+// /internal/tools/papercontent.go
 
-type PDFFetchTool struct {
-    httpClient *http.Client  // configured with 30s timeout
+type PaperContentTool struct {
+    cfg        *config.AgentConfig
+    httpClient *http.Client  // configured with request timeout
 }
 
-func NewPDFFetchTool() *PDFFetchTool
+func NewPaperContentTool(cfg *config.AgentConfig) *PaperContentTool
 
-func (t *PDFFetchTool) FetchPDF(ctx context.Context, pdfURL string) ([]byte, error)
+func (t *PaperContentTool) FetchMarkdown(ctx context.Context, arxivID string) (string, error)
+// Returns clean Markdown text or an error
 ```
 
-**Implementation:**
+**Implementation outline:**
 ```go
-func (t *PDFFetchTool) FetchPDF(ctx context.Context, pdfURL string) ([]byte, error) {
-    req, _ := http.NewRequestWithContext(ctx, "GET", pdfURL, nil)
-    req.Header.Set("User-Agent", "arxiv-explainer-agent/1.0")
-
+func (t *PaperContentTool) FetchMarkdown(ctx context.Context, arxivID string) (string, error) {
+    // 1. Fetch HTML from arxiv.org/html/{id} (bare id, no version)
+    htmlURL := t.cfg.ArxivHTMLBaseURL + "/" + arxivID
+    req, _ := http.NewRequestWithContext(ctx, "GET", htmlURL, nil)
+    req.Header.Set("User-Agent", t.cfg.UserAgent)
+    
+    // Wrap response in io.LimitReader to prevent OOM on large documents
     resp, err := t.httpClient.Do(req)
-    // http.Client follows redirects automatically
-    if err != nil {
-        return nil, fmt.Errorf("%w: %v", ErrPDFDownloadFailed, err)
+    if resp.StatusCode == http.StatusNotFound {
+        return "", ErrPaperHTMLNotFound  // recoverable — user can re-pick
+    }
+    if err != nil || resp.StatusCode != http.StatusOK {
+        return "", ErrPaperHTMLFailed
     }
     defer resp.Body.Close()
-
-    if resp.StatusCode == http.StatusNotFound {
-        return nil, ErrPDFNotFound
+    
+    limitedBody := io.LimitReader(resp.Body, 50*1024*1024)  // 50MB cap
+    htmlBytes, _ := io.ReadAll(limitedBody)
+    
+    // 2. Convert HTML to Markdown
+    converter := md.NewConverter("", true, &md.Options{...})
+    markdown, err := converter.ConvertString(string(htmlBytes))
+    if err != nil {
+        return "", ErrPaperHTMLFailed
     }
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("%w: status %d", ErrPDFDownloadFailed, resp.StatusCode)
-    }
+    
+    // 3. Minimal cleanup: strip nav, trim appendix, remove math nodes, collapse whitespace
+    cleaned := t.cleanup(markdown)
+    return cleaned, nil
+}
 
-    return io.ReadAll(resp.Body)
+// cleanup strips boilerplate and normalizes whitespace
+func (t *PaperContentTool) cleanup(markdown string) string {
+    // Remove header/footer/nav sections (LaTeXML patterns)
+    // Trim bibliography and appendix if present
+    // Strip MathML noise (alttext seam retained for future)
+    // Collapse multiple newlines
+    // ... implementation details ...
+    return cleaned
 }
 ```
 
 **Error types:**
 ```go
 var (
-    ErrPDFNotFound       = errors.New("PDF not found on arXiv (404)")
-    ErrPDFDownloadFailed = errors.New("PDF download failed")
-    ErrPDFTimeout        = errors.New("PDF download timed out after 30s")
+    ErrPaperHTMLNotFound = errors.New("paper HTML not found on arXiv (404)")
+    ErrPaperHTMLFailed   = errors.New("failed to fetch or convert paper HTML")
+    ErrPaperHTMLTimeout  = errors.New("HTML fetch timed out")
 )
 ```
 
-**Dependencies:** `net/http`, `io`
+**Reused from DiscoveryTool:**
+- User-Agent politeness header
+- Retry backoff pattern (same domain, same politeness rules)
+- HTTP client timeout configuration
+
+**Dependencies:** `net/http`, `io`, `github.com/JohannesKaufmann/html-to-markdown/v2`, `config`
 
 ---
 
-### 2.5 PDFRendererTool
+### 2.5 LLMClient Interface
 
-**Intent:** This tool converts PDF bytes into an ordered slice of PNG page images. It is the bridge between raw PDF content and the vision LLM. Every page is rendered — text pages, figure pages, table pages, reference pages — so the LLM sees the complete paper exactly as a human reader would.
+**Intent:** The `LLMClient` interface is the most important abstraction in the system. It decouples every agent from any specific LLM provider. The interface accepts plain Markdown text — not images — making it compatible with any text-capable model. No vision requirement anywhere.
 
-**Why `poppler` (`pdftoppm`):**
-- Industry-standard rendering quality — text is crisp, diagrams are clear at 150 DPI
-- Available as a single install: `brew install poppler` (macOS) / `apt install poppler-utils` (Linux)
-- No CGO complexity — shells out as a subprocess
-- Widely battle-tested for PDF rendering in production pipelines
-
-**Why shell out rather than a Go library:**
-- Pure Go PDF rendering libraries (`pdfcpu`, etc.) produce significantly lower quality output
-- CGO-based libraries (`go-fitz` / MuPDF) require MuPDF headers at build time — more complex developer setup
-- `poppler` is a single system package, simpler than CGO build dependencies
-
-**Interface:**
-```go
-// /internal/tools/pdfrenderer.go
-
-type PDFRendererTool struct {
-    config *config.Config
-}
-
-func NewPDFRendererTool(cfg *config.Config) *PDFRendererTool
-
-func (t *PDFRendererTool) RenderPages(ctx context.Context, pdfBytes []byte) ([][]byte, error)
-// Returns [][]byte — one PNG []byte per page, in reading order
-```
-
-**Implementation:**
-```go
-func (t *PDFRendererTool) RenderPages(ctx context.Context, pdfBytes []byte) ([][]byte, error) {
-    // Write PDF to temp file (pdftoppm requires a file path)
-    tmpPDF, err := os.CreateTemp("", "arxiv-*.pdf")
-    if err != nil {
-        return nil, fmt.Errorf("failed to create temp PDF file: %w", err)
-    }
-    defer os.Remove(tmpPDF.Name())
-
-    if _, err := tmpPDF.Write(pdfBytes); err != nil {
-        return nil, fmt.Errorf("failed to write temp PDF: %w", err)
-    }
-    tmpPDF.Close()
-
-    // Create temp dir for output PNGs
-    tmpDir, err := os.MkdirTemp("", "arxiv-pages-*")
-    if err != nil {
-        return nil, fmt.Errorf("failed to create temp dir: %w", err)
-    }
-    defer os.RemoveAll(tmpDir)
-
-    // Run pdftoppm
-    dpi := strconv.Itoa(t.config.PDF.DPI)
-    outputPrefix := filepath.Join(tmpDir, "page")
-    cmd := exec.CommandContext(ctx, "pdftoppm",
-        "-png",           // output format
-        "-r", dpi,        // resolution (DPI)
-        tmpPDF.Name(),    // input PDF
-        outputPrefix,     // output prefix (pages saved as page-001.png, page-002.png, ...)
-    )
-
-    if output, err := cmd.CombinedOutput(); err != nil {
-        return nil, fmt.Errorf("%w: %v — %s", ErrPDFRenderFailed, err, string(output))
-    }
-
-    // Read output PNGs in order
-    entries, err := os.ReadDir(tmpDir)
-    if err != nil {
-        return nil, fmt.Errorf("failed to read rendered pages: %w", err)
-    }
-
-    // Sort entries — pdftoppm names files page-001.png, page-002.png, etc.
-    sort.Slice(entries, func(i, j int) bool {
-        return entries[i].Name() < entries[j].Name()
-    })
-
-    var pages [][]byte
-    for _, entry := range entries {
-        if !strings.HasSuffix(entry.Name(), ".png") {
-            continue
-        }
-        data, err := os.ReadFile(filepath.Join(tmpDir, entry.Name()))
-        if err != nil {
-            return nil, fmt.Errorf("failed to read page %s: %w", entry.Name(), err)
-        }
-        pages = append(pages, data)
-    }
-
-    if len(pages) == 0 {
-        return nil, ErrPDFRenderNoPages
-    }
-
-    return pages, nil
-}
-```
-
-**Error types:**
-```go
-var (
-    ErrPDFRenderFailed   = errors.New("PDF rendering failed — is poppler installed?")
-    ErrPDFRenderNoPages  = errors.New("PDF rendering produced no pages")
-    ErrPopplNotFound     = errors.New("pdftoppm not found — install poppler: brew install poppler")
-)
-```
-
-**Startup validation (checks poppler is installed):**
-```go
-func ValidatePoppler() error {
-    _, err := exec.LookPath("pdftoppm")
-    if err != nil {
-        return ErrPopplNotFound
-    }
-    return nil
-}
-// Called in main.go during startup — fails fast with install instructions
-```
-
-**Config field:**
-```yaml
-pdf:
-  dpi: 150   # 100=fast/cheap, 150=balanced (default), 200=high quality
-```
-
-**Temp file cleanup:** Both the temp PDF file and temp directory are removed via `defer` — no cleanup required on success or failure.
-
-**Dependencies:** `os`, `os/exec`, `path/filepath`, `sort`, `strconv`, `config`
-
----
-
-### 2.6 LLMClient Interface
-
-**Intent:** The `LLMClient` interface is the most important abstraction in the system. It decouples every agent from any specific LLM provider. The interface accepts page images — not PDF bytes — making it compatible with any vision-capable model regardless of whether the provider has native PDF support.
-
-**Why images not PDF bytes in the interface:** PDF-as-document is a provider-specific feature (Anthropic and Gemini support it natively; others do not). Images are a universal vision input supported by every vision-capable model. Standardising on images in the interface means the LLM client implementations are simpler and more consistent, and custom/unknown models can be supported without special cases.
+**Why text not images in the interface:** Text is a universal input supported by every language model. Standardising on text in the interface means the LLM client implementations are simpler and more consistent, token costs are lower, and custom/unknown models can be supported without special cases.
 
 **Interface:**
 ```go
@@ -545,9 +451,9 @@ type LLMClient interface {
 }
 
 type CompletionRequest struct {
-    SystemPrompt string
-    UserPrompt   string
-    PageImages   [][]byte  // one PNG []byte per page, in reading order
+    SystemPrompt string   // system instruction
+    UserPrompt   string   // user message (may reference DocumentText)
+    DocumentText string   // paper Markdown (extracted from arXiv HTML)
     MaxTokens    int
     Temperature  float32
 }
@@ -579,44 +485,7 @@ func NewLLMClient(cfg *config.LLMConfig) (LLMClient, error) {
 }
 ```
 
-**Vision model validation:**
-```go
-// /internal/llm/vision.go
-
-// Models known to support vision input
-var KnownVisionModels = map[string]bool{
-    "claude-opus-4-6":   true,
-    "claude-sonnet-4-6": true,
-    "claude-haiku-4-5":  true,
-    "gpt-4o":            true,
-    "gpt-4o-mini":       true,
-    "gemini-2.0-flash":  true,
-    "gemini-2.5-pro":    true,
-}
-
-// Models known NOT to support vision input
-var KnownNonVisionModels = map[string]bool{
-    "gpt-3.5-turbo": true,
-    "o1-mini":       true,
-}
-
-func ValidateVisionSupport(model string) error {
-    if KnownNonVisionModels[model] {
-        return fmt.Errorf(
-            "model %q does not support vision input — this system requires a vision-capable model.\n"+
-            "Supported models include: claude-sonnet-4-6, gpt-4o, gemini-2.0-flash",
-            model,
-        )
-    }
-    if !KnownVisionModels[model] {
-        // Unknown model — warn but allow (custom/self-hosted models)
-        slog.Warn("model not in known-vision list — proceeding, but vision support is unverified",
-            "model", model)
-    }
-    return nil
-}
-// Called in main.go during startup
-```
+**No vision validation needed:** Any text-capable model works. No startup checks required.
 
 **Shared retry logic:**
 ```go
@@ -635,13 +504,13 @@ var (
 )
 ```
 
-**Dependencies:** `config`, `slog`
+**Dependencies:** `config`
 
 ---
 
-### 2.7 Anthropic Claude Implementation
+### 2.6 Anthropic Claude Implementation
 
-**Intent:** Send page images as base64-encoded vision blocks in the messages array. Anthropic's vision API accepts PNG images natively — one content block per page.
+**Intent:** Send Markdown text as a text block in the messages array. No vision required; any Anthropic text model works.
 
 ```go
 // /internal/llm/anthropic.go
@@ -649,17 +518,14 @@ var (
 func (c *AnthropicClient) Complete(ctx context.Context, req CompletionRequest) (CompletionResponse, error) {
     var contentBlocks []anthropic.ContentBlock
 
-    // Attach each page as a vision image block
-    for _, pageImage := range req.PageImages {
-        contentBlocks = append(contentBlocks, anthropic.ImageBlock{
-            Source: anthropic.Base64ImageSource{
-                MediaType: "image/png",
-                Data:      base64.StdEncoding.EncodeToString(pageImage),
-            },
+    // Add document text as context
+    if req.DocumentText != "" {
+        contentBlocks = append(contentBlocks, anthropic.TextBlock{
+            Text: "Paper content:\n\n" + req.DocumentText,
         })
     }
 
-    // Add user prompt after images
+    // Add user prompt
     contentBlocks = append(contentBlocks, anthropic.TextBlock{Text: req.UserPrompt})
 
     resp, err := c.client.Messages.New(ctx, anthropic.MessageNewParams{
@@ -684,9 +550,9 @@ func (c *AnthropicClient) Complete(ctx context.Context, req CompletionRequest) (
 
 ---
 
-### 2.8 OpenAI Implementation
+### 2.7 OpenAI Implementation
 
-**Intent:** Send page images as base64-encoded image_url content parts in the user message. This is OpenAI's standard vision input format — works with gpt-4o and any future vision-capable model.
+**Intent:** Send Markdown text as a text content part in the user message. Any OpenAI text model works.
 
 ```go
 // /internal/llm/openai.go
@@ -696,17 +562,11 @@ func (c *OpenAIClient) Complete(ctx context.Context, req CompletionRequest) (Com
 
     messages = append(messages, openai.SystemMessage(req.SystemPrompt))
 
-    // Build user message with page images
+    // Build user message with document text
     var userContent []openai.ChatCompletionContentPartUnionParam
-    for _, pageImage := range req.PageImages {
-        dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pageImage)
-        userContent = append(userContent, openai.ImageContentPart(
-            openai.ChatCompletionContentPartImageParam{
-                ImageURL: openai.ChatCompletionContentPartImageImageURLParam{
-                    URL:    dataURL,
-                    Detail: openai.ImageURLDetailAuto,
-                },
-            },
+    if req.DocumentText != "" {
+        userContent = append(userContent, openai.TextContentPart(
+            "Paper content:\n\n" + req.DocumentText,
         ))
     }
     userContent = append(userContent, openai.TextContentPart(req.UserPrompt))
@@ -732,9 +592,9 @@ func (c *OpenAIClient) Complete(ctx context.Context, req CompletionRequest) (Com
 
 ---
 
-### 2.9 Google Gemini Implementation
+### 2.8 Google Gemini Implementation
 
-**Intent:** Send page images as inline base64 PNG blobs in the content parts array. Gemini's vision API accepts PNG blobs natively alongside text parts.
+**Intent:** Send Markdown text as a text part in the content parts array. Any Gemini text model works.
 
 ```go
 // /internal/llm/gemini.go
@@ -748,12 +608,9 @@ func (c *GeminiClient) Complete(ctx context.Context, req CompletionRequest) (Com
     model.SetMaxOutputTokens(int32(req.MaxTokens))
 
     var parts []genai.Part
-    // Attach each page as an image blob
-    for _, pageImage := range req.PageImages {
-        parts = append(parts, genai.Blob{
-            MIMEType: "image/png",
-            Data:     pageImage,
-        })
+    // Add document text as context
+    if req.DocumentText != "" {
+        parts = append(parts, genai.Text("Paper content:\n\n"+req.DocumentText))
     }
     parts = append(parts, genai.Text(req.UserPrompt))
 
@@ -774,45 +631,53 @@ func (c *GeminiClient) Complete(ctx context.Context, req CompletionRequest) (Com
 
 ## 3. Data Model
 
-Phase 3 adds two fields to `PipelineSession` and introduces one new config section:
+Phase 3 adds one mutex-guarded field to `PipelineSession` and introduces new config fields:
 
 ```go
-// PipelineSession additions
+// PipelineSession additions (see session.go for full structure)
 type PipelineSession struct {
     // ... existing fields from Phase 2 ...
-    PDF        []byte    // raw PDF bytes (set after fetch, cleared after rendering)
-    PageImages [][]byte  // one PNG per page (set after rendering, held for LLM calls)
+    mu              sync.RWMutex
+    markdownText    string   // mutex-guarded; EXCLUDED from Snapshot()
+    selectedPaper   *Paper   // holds chosen paper; accessed via SetSelectedPaper()
 }
+
+// Accessor methods (MUST be used, never mutate directly)
+func (s *PipelineSession) SetStage(stage PipelineStage)
+func (s *PipelineSession) SetMarkdown(markdown string)
+func (s *PipelineSession) SetSelectedPaper(paper *Paper)
+func (s *PipelineSession) Snapshot() SessionSnapshot  // excludes markdownText
 
 // New pipeline stage
-const StageRendering PipelineStage = "rendering_pdf"
+const StageExtracting PipelineStage = "extracting"
 ```
 
-```go
-// New config section
-type PDFConfig struct {
-    DPI int  // default 150
-}
+**Why excluded from Snapshot():** The markdown text is large (~50KB–500KB per paper) and transient. It is never sent to the frontend — only held server-side for the pipeline. Excluding it from Snapshot() prevents accidental serialization and keeps the status endpoint cheap.
 
-type Config struct {
-    // ... existing fields ...
-    PDF PDFConfig
+```go
+// New config fields (Phase 3 additions to AgentConfig)
+type AgentConfig struct {
+    // ... existing fields from Phase 2 ...
+    ArxivHTMLBaseURL  string `yaml:"arxiv_html_base_url"`  // default https://arxiv.org/html
+    ContentSizeCap    int    `yaml:"content_size_cap"`     // bytes; default 50MB (prevents OOM)
 }
 ```
 
 ```yaml
-# config.yaml addition
-pdf:
-  dpi: 150
+# config.yaml additions
+agent:
+  # ... existing Phase 2 fields ...
+  arxiv_html_base_url: https://arxiv.org/html
+  content_size_cap: 52428800   # 50MB in bytes; prevents OOM on unusual documents
 ```
 
-**Memory note:** For a typical 12-page AI paper at 150 DPI, each PNG page is approximately 500KB–1MB. Total page image memory: ~6–12MB per pipeline run. Cleared from session after pipeline completes.
+**Memory note:** For a typical 12-page AI paper, the Markdown text is approximately 50–200KB. Total memory per pipeline run: ~200KB–500KB (vs 6–12MB with page images). Markdown is discarded after pipeline completes.
 
 ---
 
 ## 4. Data Flow
 
-### Selection, Fetch & Render Flow
+### Selection, Fetch & Conversion Flow
 
 ```
 1. User clicks "Select" on paper card
@@ -823,45 +688,53 @@ pdf:
       ▼
 3. Go Orchestrator.HandleProcess()
       ├── Validate session in "selection" stage
+      ├── Find paper in session.Candidates
       ├── Set session.SelectedPaper
-      ├── Set session.Stage = "fetching_pdf"
+      ├── Set session.Stage = "extracting"
       ├── Return { session_id } immediately
       └── Spawn goroutine: runPipeline(ctx, session)
       │
       ▼ (async goroutine)
-4. PDFFetchTool.FetchPDF(ctx, paper.PDFURL)
-      ├── GET https://arxiv.org/pdf/2401.12345
-      │     (follows redirect → https://arxiv.org/pdf/2401.12345v2)
-      ├── Read response body → []byte (~500KB–5MB)
-      └── session.PDF = pdfBytes
+4. PaperContentTool.FetchMarkdown(ctx, arxiv_id)
+      ├── GET https://arxiv.org/html/2401.12345
+      │     (follows same-host redirect to https://arxiv.org/html/2401.12345v2)
+      ├── Wrap body in io.LimitReader (50MB cap)
+      ├── Read HTML bytes (~100KB–500KB)
+      │
+      ├── On 404: return ErrPaperHTMLNotFound
+      │   ↓
+      │   session.SetStage("selection")
+      │   session.SetNotice("Paper HTML not available. Select another paper.")
+      │   (candidates preserved, selectedId cleared on frontend)
+      │   ↓
+      │   Return to user — no restart needed
+      │
+      ├── Convert HTML to Markdown using html-to-markdown/v2
+      ├── Minimal cleanup:
+      │   ├── Strip LaTeXML nav/header/footer
+      │   ├── Trim bibliography and appendix
+      │   ├── Retain figure/table captions
+      │   ├── Strip <math> nodes
+      │   └── Collapse whitespace
+      │
+      └── session.SetMarkdown(markdown)  // mutex-guarded
       │
       ▼
-5. session.Stage = "rendering_pdf"
-      │
-      ▼
-6. PDFRendererTool.RenderPages(ctx, session.PDF)
-      ├── Write PDF to temp file
-      ├── exec: pdftoppm -png -r 150 /tmp/arxiv-xxx.pdf /tmp/arxiv-pages-xxx/page
-      ├── Read output PNGs in sorted order
-      ├── Return [][]byte (e.g. 12 pages × ~700KB each)
-      └── session.PageImages = pages
-      │
-      ▼
-7. [Phase 4: ExplainerAgent.Generate({ PageImages, PaperMeta }) called here]
+5. [Phase 4: ExplainerAgent.Generate({ markdownText, PaperMeta }) called here]
 ```
 
 ### LLM Call Flow (wired in Phase 3, invoked in Phase 4)
 
 ```
-ExplainerAgent.Generate(ExplainerInput{ PageImages, PaperMeta, RevisionNote })
+ExplainerAgent.Generate(ExplainerInput{ markdownText, PaperMeta, RevisionNote })
       │
       ▼
 Build CompletionRequest {
-    SystemPrompt: "...",
-    UserPrompt:   "Paper: Title...\nPlease generate the explainer.",
-    PageImages:   session.PageImages,  // [][]byte — one PNG per page
-    MaxTokens:    config.LLM.MaxTokens,
-    Temperature:  config.LLM.Temperature,
+    SystemPrompt:  "...",
+    UserPrompt:    "Paper: Title...\nPlease generate the explainer.",
+    DocumentText:  session.markdownText,  // Markdown string
+    MaxTokens:     config.LLM.MaxTokens,
+    Temperature:   config.LLM.Temperature,
 }
       │
       ▼
@@ -871,80 +744,77 @@ LLMClient.Complete(ctx, request)
 Provider router → AnthropicClient | OpenAIClient | GeminiClient
       │
       ▼
-Each page PNG sent as vision input block (base64 encoded)
+Markdown text sent as text input
       │
       ▼
-CompletionResponse { Content: "...", InputTokens: 42000, OutputTokens: 3200 }
+CompletionResponse { Content: "...", InputTokens: 2400, OutputTokens: 3200 }
 ```
 
-### Error Flow — poppler Not Installed
+### Error Flow — HTML Fetch Fails
 
 ```
-main.go startup: ValidatePoppler()
+PaperContentTool.FetchMarkdown(ctx, arxiv_id)
       │
-      ▼
-exec.LookPath("pdftoppm") → not found
+      ├─ 404 Not Found: ErrPaperHTMLNotFound (recoverable)
+      │  ↓
+      │  runPipeline() calls session.SetStage(StageSelection)
+      │  ↓
+      │  Frontend shows recoverable notice
+      │  ↓
+      │  User picks different paper (same session)
       │
-      ▼
-FATAL: pdftoppm not found — install poppler:
-  macOS:  brew install poppler
-  Linux:  apt install poppler-utils
+      ├─ Network error / timeout: ErrPaperHTMLFailed (recoverable)
+      │  ↓
+      │  failSession(session, err, true)
+      │  ↓
+      │  Frontend shows "Try again" option
       │
-      ▼
-os.Exit(1) — server does not start
+      └─ Size exceeded: ErrPaperHTMLFailed (recoverable)
+         ↓
+         failSession(session, err, true)
+         ↓
+         Frontend shows "Try another paper" option
 ```
 
 ---
 
 ## 5. Tech Stack
 
-**New system dependency (Phase 3):**
+**New system dependencies (Phase 3):**
 
-| Dependency | Install | Why |
-|---|---|---|
-| `poppler-utils` | `brew install poppler` / `apt install poppler-utils` | Provides `pdftoppm` for high-quality PDF page rendering. Industry standard, zero CGO complexity. |
+None. This phase requires zero system dependencies — all work is done in pure Go.
 
 **New Go dependencies (Phase 3):**
 
 | Package | Provider | Why |
 |---|---|---|
-| `github.com/anthropics/anthropic-sdk-go` | Anthropic | Official Go SDK. Vision image blocks in messages array. |
-| `github.com/openai/openai-go` | OpenAI | Official Go SDK. Vision image_url content parts. |
-| `google.golang.org/genai` | Google Gemini | Official Go SDK. Native image blob support. |
+| `github.com/JohannesKaufmann/html-to-markdown/v2` | Johannes Kaufmann | Pure-Go HTML-to-Markdown conversion. No dependencies, works cross-platform. |
+| `github.com/anthropics/anthropic-sdk-go` | Anthropic | Official Go SDK. Text messages in messages array. |
+| `github.com/openai/openai-go` | OpenAI | Official Go SDK. Text content parts. |
+| `google.golang.org/genai` | Google Gemini | Official Go SDK. Native text part support. |
 
 All three provider SDKs installed regardless of active provider. Unused clients add minimal binary size overhead (~5–10MB).
 
-**Config addition:**
+**Config additions:**
 ```yaml
-pdf:
-  dpi: 150  # rendering resolution — tradeoff between quality and token cost
+agent:
+  arxiv_html_base_url: https://arxiv.org/html
+  content_size_cap: 52428800   # 50MB in bytes
 ```
 
 ---
 
 ## 6. Integration Points
 
-### arXiv PDF Download
+### arXiv HTML Endpoint
 
-**URL pattern:** `https://arxiv.org/pdf/{arxiv_id}`
+**URL pattern:** `https://arxiv.org/html/{arxiv_id}` (bare id, no version suffix)
 **Auth:** None
-**Redirects:** arXiv redirects to versioned URL — `http.Client` follows automatically
-**Timeout:** 30 seconds
-**Rate limit:** Respect 3-second delay (same domain as arXiv API)
-
----
-
-### poppler (`pdftoppm`)
-
-**Binary:** `pdftoppm` (part of `poppler-utils` package)
-**Input:** PDF file path
-**Output:** PNG files written to output directory, named `{prefix}-001.png`, `{prefix}-002.png`, etc.
-**Key flags:**
-```
--png          output format PNG
--r 150        resolution in DPI (from config)
-```
-**Validated at startup** — server fails fast if `pdftoppm` not found in PATH.
+**Redirects:** arXiv redirects to versioned URL (e.g. `/html/2401.12345v2`) — `http.Client` follows automatically
+**Timeout:** 30 seconds (reuses `agent.request_timeout_seconds` from config)
+**Rate limit:** Respect `agent.min_request_interval_seconds` delay (same domain as discovery API)
+**Response:** HTML document (~100KB–500KB typical). Size capped by `agent.content_size_cap` to prevent OOM.
+**Availability:** Near-100% for recent papers in cs.AI and related categories. Older papers may lack HTML rendering (404 → recoverable fail).
 
 ---
 
@@ -952,8 +822,8 @@ pdf:
 
 **Endpoint:** `https://api.anthropic.com/v1/messages`
 **Auth:** `x-api-key` header
-**Vision input:** Base64 PNG image blocks in `messages[]` content array — one block per page
-**Token cost note:** Image tokens vary by resolution. At 150 DPI, a typical page ≈ 800–1,500 input tokens.
+**Text input:** Plain text in `messages[]` content array (TextBlock)
+**Token cost note:** Markdown text is typically 2,000–10,000 input tokens depending on paper length. Much cheaper than vision paths.
 
 ---
 
@@ -961,8 +831,8 @@ pdf:
 
 **Endpoint:** `https://api.openai.com/v1/chat/completions`
 **Auth:** `Authorization: Bearer` header
-**Vision input:** Base64 data URL image content parts in user message — one part per page
-**Key constraint:** Model must be vision-capable (e.g. `gpt-4o`) — validated at startup.
+**Text input:** Plain text content parts in user message
+**Any model works:** No vision requirement. Text-capable models like `gpt-4`, `gpt-4-turbo`, or `gpt-3.5-turbo` all work.
 
 ---
 
@@ -970,8 +840,8 @@ pdf:
 
 **Endpoint:** `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
 **Auth:** `Authorization: Bearer` header
-**Vision input:** Inline PNG blob parts in content array — one blob per page
-**Advantage:** Largest context window — best choice for very long papers (60+ pages).
+**Text input:** Plain text parts in content array
+**Advantage:** Largest context window — useful choice for very long papers (60+ pages).
 
 ---
 
@@ -981,44 +851,44 @@ pdf:
 
 | Failure | Behaviour | Recoverable |
 |---|---|---|
-| `pdftoppm` not found at startup | Fatal startup error with install instructions | N/A — fix before starting |
-| PDF 404 | "Paper PDF not found on arXiv. Select a different paper." | No |
-| PDF timeout (30s) | "PDF download timed out. Try again." | Yes |
-| PDF download error | "PDF download failed: [reason]. Try again." | Yes |
-| PDF render failure | "Failed to render PDF pages. Try again." | Yes |
-| PDF render produces 0 pages | "PDF rendered no pages — the file may be corrupt." | No — select different paper |
+| HTML 404 | "Paper HTML not available on arXiv. Select a different paper." | Yes — return to selection stage |
+| HTML timeout (30s) | "HTML fetch timed out. Try again." | Yes |
+| HTML fetch error | "Failed to fetch paper HTML: [reason]. Try again." | Yes |
+| Markdown conversion failed | "Failed to convert paper to text. Try again." | Yes |
+| Content size exceeded (>50MB) | "Paper HTML is too large. Select a shorter paper." | Yes — return to selection stage |
 | LLM 429 after retries | "LLM rate limit exceeded. Try again shortly." | Yes |
 | LLM 400 (bad model) | "LLM config error: model '[model]' rejected. Check llm.model in config." | No |
-| LLM 400 (context too large) | "Too many pages for model '[model]'. Try a shorter paper or switch to Gemini." | No |
+| LLM 400 (context too large) | "Paper is too long for model '[model]'. Try a shorter paper or switch to Gemini." | No |
 | LLM 500/503 | "LLM provider unavailable. Try again shortly." | Yes |
 | LLM timeout | "LLM request timed out after [N]s. Try again." | Yes |
 
 ### Observability
 
 ```json
-{"level":"INFO","msg":"pdf fetch started","session_id":"abc123","paper_id":"2401.12345"}
-{"level":"INFO","msg":"pdf fetch complete","session_id":"abc123","paper_id":"2401.12345","size_bytes":1245184,"duration_ms":2100}
-{"level":"INFO","msg":"pdf render started","session_id":"abc123","paper_id":"2401.12345","dpi":150}
-{"level":"INFO","msg":"pdf render complete","session_id":"abc123","paper_id":"2401.12345","pages":12,"duration_ms":3400}
-{"level":"INFO","msg":"llm call started","session_id":"abc123","provider":"anthropic","model":"claude-sonnet-4-6","pages":12}
-{"level":"INFO","msg":"llm call complete","session_id":"abc123","input_tokens":42800,"output_tokens":3200,"duration_ms":18400}
+{"level":"INFO","msg":"html fetch started","session_id":"abc123","paper_id":"2401.12345"}
+{"level":"INFO","msg":"html fetch complete","session_id":"abc123","paper_id":"2401.12345","html_bytes":234567,"duration_ms":1200}
+{"level":"INFO","msg":"markdown conversion started","session_id":"abc123","paper_id":"2401.12345"}
+{"level":"INFO","msg":"markdown conversion complete","session_id":"abc123","paper_id":"2401.12345","markdown_bytes":45678,"duration_ms":350}
+{"level":"INFO","msg":"llm call started","session_id":"abc123","provider":"anthropic","model":"claude-sonnet-4-6"}
+{"level":"INFO","msg":"llm call complete","session_id":"abc123","input_tokens":4200,"output_tokens":3200,"duration_ms":8400}
 {"level":"WARN","msg":"llm rate limited","session_id":"abc123","provider":"anthropic","attempt":1,"backoff_ms":5000}
-{"level":"ERROR","msg":"pdf render failed","session_id":"abc123","error":"pdftoppm not found"}
+{"level":"WARN","msg":"paper html not found","session_id":"abc123","paper_id":"2401.12345"}
 ```
 
 ### Security
-- PDF bytes and page images held in memory only — never written to permanent storage
-- Temp files (`/tmp/arxiv-*.pdf`, `/tmp/arxiv-pages-*/`) cleaned up via `defer os.Remove` / `defer os.RemoveAll`
-- `pdftoppm` subprocess runs without shell (`exec.Command`, not `exec.Command("sh", "-c", ...)`) — no shell injection risk
+- HTML bytes held in memory only — never written to permanent storage (no temp files)
+- Markdown text held in memory only — never persisted (excluded from Snapshot)
+- Size limit enforced by `io.LimitReader` to prevent OOM attacks
 - API keys never logged, never passed to frontend
+- No shell execution — pure Go conversion, no subprocess risk
 
 ### Token Cost Awareness
-At 150 DPI, a typical 12-page AI paper sends approximately:
-- ~800–1,500 input tokens per page (vision)
-- ~10,000–18,000 total input tokens for page images alone
-- Plus system prompt (~800 tokens) and user prompt (~100 tokens)
+A typical 12-page AI paper in Markdown format sends approximately:
+- ~2,000–8,000 input tokens (text-based)
+- Plus system prompt (~500 tokens) and user prompt (~100 tokens)
+- Total: ~2,600–8,600 tokens vs 10,000–18,000+ with vision
 
-This is significantly more than text-only approaches. The tradeoff is full visual fidelity. Documented in README.
+Text extraction is 2–3x cheaper than page-as-image. This enables more iterations and longer papers within budget.
 
 ---
 
@@ -1026,12 +896,12 @@ This is significantly more than text-only approaches. The tradeoff is full visua
 
 | ID | Risk/Tradeoff | Severity | Mitigation |
 |---|---|---|---|
-| R1 | Very long papers (60+ pages) generate very high token counts | Medium | Context window pre-check added in Phase 6. Gemini recommended for long papers (largest context). `pdf.dpi` can be lowered to 100 to reduce token cost. |
-| R2 | `poppler` version differences across OS produce slightly different output | Low | PDF rendering quality differences are cosmetic — text legibility is consistent across versions. Validated on macOS (brew) and Ubuntu (apt). |
+| R1 | Very old papers may lack HTML rendering on arXiv | Low | Discovery sorts newest-first (Phase 2), so 404 hits are rare in typical usage. 404 is recoverable — user picks another paper without restart. |
+| R2 | LaTeXML HTML rendering artifacts (minor formatting noise) | Low | Minimal cleanup strategy + LLM tolerance. Users see captions (context preserved), not images. |
 | R3 | Provider SDK API changes break concrete implementations | Low | Each provider isolated behind interface. Breaking SDK change affects one file. Versions pinned in `go.mod`. |
-| R4 | Temp files not cleaned up if process is killed mid-render | Low | Temp files in `/tmp` — OS cleans on reboot. For long-running processes, `/tmp` cleanup is standard OS behaviour. |
-| T1 | Page-as-image uses significantly more tokens than text extraction | Accepted | Full visual fidelity is the core design goal. Diagrams, tables, and figures are central to understanding AI papers. Token cost is documented; DPI is configurable to manage cost. |
-| T2 | External `poppler` dependency | Accepted | Single install command. Well-maintained, available on all target platforms. Alternative (CGO libraries) adds more complexity, not less. |
+| R4 | Unusual documents >50MB HTML size | Low | Capped by `io.LimitReader(content_size_cap)`. Oversized fetch fails gracefully with recoverable error. |
+| T1 | Diagrams, figures, rendered equations are dropped (for now) | Accepted | Captions preserved, LaTeX in `alttext` forms a seam for future recovery. Text-only approach eliminates vision model requirement and system dependencies. Lower ceiling on figure-heavy papers, but rare in typical cs.AI workflows. |
+| T2 | Depends on arXiv HTML endpoint availability | Accepted | Same domain already trusted for discovery (Phase 2). Retry/backoff reused from discovery tool. 404 is recoverable (user re-picks). |
 | T3 | All three provider SDKs installed regardless of active provider | Accepted | Binary size overhead minimal (~5–10MB). Any provider is one config change away. |
 | T4 | No streaming LLM responses | Accepted | Streaming adds significant UI complexity. Progress communicated via stage polling. |
 
@@ -1039,24 +909,27 @@ This is significantly more than text-only approaches. The tradeoff is full visua
 
 ## Exit Criteria
 
-All of the following must be true before Phase 4 begins:
+All of the following must be true before Phase 4 begins.
+Legend: [x] verified · [~] verified via httptest, live-key smoke test pending (no `.env` keys in the automated run).
 
-- [ ] `poppler` (`pdftoppm`) validated at startup — server fails with install instructions if not found
-- [ ] Vision model validated at startup — known-non-vision models rejected with clear error
-- [ ] Unknown/custom models produce a warning log but allow startup
-- [ ] Clicking "Select" on a paper card transitions UI to processing state
-- [ ] PDF downloads successfully for any valid arXiv paper ID within 30 seconds
-- [ ] PDF download handles arXiv redirects to versioned URLs automatically
-- [ ] PDF timeout (30s) surfaces a clear, recoverable error in the UI
-- [ ] All PDF pages render to PNG images at configured DPI (default 150)
-- [ ] Page images are ordered correctly (page 1 first, last page last)
-- [ ] Progress UI shows `"Rendering pages..."` stage after download
-- [ ] `LLMClient.Complete()` with page images returns a valid response for Anthropic
-- [ ] `LLMClient.Complete()` with page images returns a valid response for OpenAI
-- [ ] `LLMClient.Complete()` with page images returns a valid response for Gemini
-- [ ] Switching `llm.provider` in config routes to the correct provider without code changes
-- [ ] LLM 429 retries automatically (max 3 attempts with backoff) before surfacing error
-- [ ] LLM 400 surfaces as a config error naming the configured model
-- [ ] PDF size, page count, render duration, and LLM token counts logged for every run
-- [ ] Input and output tokens returned separately in `CompletionResponse` for all providers
-- [ ] Temp PDF and temp page directory cleaned up after every run (success or failure)
+- [x] No poppler or system dependency validation at startup — pure Go only _(verified: `CGO_ENABLED=0 go build ./...` succeeds; grep finds no poppler/pdftoppm)_
+- [x] No vision model validation needed — any text-capable model works _(no vision code; text-only `CompletionRequest.DocumentText`)_
+- [x] Clicking "Select" on a paper card transitions UI to processing state _(`discovery-panel.tsx`; polling re-armed on select)_
+- [x] HTML fetches successfully for any valid arXiv paper ID within 30 seconds _(live: 1706.03762 fetched in 303ms; timeout from `request_timeout_seconds`)_
+- [x] HTML fetch handles arXiv redirects to versioned URLs automatically _(default `CheckRedirect`; live redirect to v7 followed)_
+- [x] HTML timeout surfaces a clear, recoverable error in the UI _(`ErrPaperHTMLTimeout` → recoverable message via `describeError`)_
+- [x] HTML 404 transitions session back to selection stage (candidates preserved, selectedId cleared) _(`RecoverToSelection` + frontend re-pick; integration + unit tests)_
+- [x] HTML-to-Markdown conversion produces readable text with heading hierarchy intact _(live test: `#`/`##` headings present)_
+- [x] Captions (figures, tables) are preserved in the Markdown _(unit test asserts `figcaption` kept)_
+- [x] Progress UI shows `"Extracting paper text..."` stage during extraction _(`progress-indicator.tsx`)_
+- [~] `LLMClient.Complete()` with Markdown text returns a valid response for Anthropic _(httptest happy-path: content + tokens parsed)_
+- [~] `LLMClient.Complete()` with Markdown text returns a valid response for OpenAI _(httptest happy-path: content + tokens parsed)_
+- [~] `LLMClient.Complete()` with Markdown text returns a valid response for Gemini _(httptest happy-path: content + tokens parsed)_
+- [x] Switching `llm.provider` in config routes to the correct provider without code changes _(`NewLLMClient` config switch)_
+- [x] LLM 429 retries automatically (max 3 attempts with backoff) before surfacing error _(`retry_test.go`)_
+- [~] LLM 400 surfaces as a config error naming the configured model _(sentinel `ErrLLMBadRequest` mapped; user-facing model-naming surfaces when the LLM is invoked in Phase 4)_
+- [x] HTML size, markdown size, extraction duration logged for every run; LLM token counts logged when invoked (Phase 4) _(`papercontent.go` structured logs)_
+- [x] Input and output tokens returned separately in `CompletionResponse` for all providers _(`InputTokens`/`OutputTokens`; httptest-verified per provider)_
+- [x] Markdown text excluded from `Snapshot()` — never sent to frontend _(`session_test.go`)_
+- [x] Session recovers to selection stage on HTML 404 — user can re-pick without restarting session _(integration test)_
+- [x] No temp files left on disk after any run (success or failure) _(HTML held in memory only; no filesystem writes in the tool)_
