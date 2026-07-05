@@ -185,21 +185,36 @@ The project is organized into six sequential phases, each delivering a complete,
 ---
 
 ## Phase 6 — Polish & Hardening
-**Status:** ⏳ Planned
+**Status:** ✅ Complete (2026-07-05) — cross-provider E2E validation is a manual user task (see `docs/phase6/e2e-validation.md`)
 
-**Expected Deliverables:**
-- Comprehensive error handling with user-friendly messages
-- Enhanced logging (structured JSON, trace-level detail)
-- README with setup instructions, environment variables, troubleshooting
-- Test suite: unit tests for tools, agents, orchestrator
-- Documentation: API reference, config guide, operator manual
-- Performance optimization: token budgets, LLM timeouts, cleanup handlers
+**Delivered:**
+- **Retry from failed stage (F2):** `POST /retry/{sessionId}` resumes the pipeline
+  from the failed segment via cached outputs — selection preserved, no LLM recompute
+  on a transient vault failure. Never resumes mid-review-loop.
+- **Error action hints:** `describe*` mappings return a machine-readable action
+  (`retry` / `fix_config` / `fix_permissions`) surfaced via `StatusResponse.errorAction`.
+- **Cost estimation (F3):** `llm/pricing.go` + `/result` cost fields; UI hides cost
+  for unpriced models.
+- **Context-window pre-check (F4):** `llm/limits.go` + non-blocking `ContextWarning`
+  (len/4 heuristic); pipeline always proceeds.
+- **arXiv retry counter (F5):** `FetchPapers` `onRetry` callback → `arxivRetryCount`
+  → "Connecting to arXiv (retry n/3)…" label.
+- **Logging & security audit (F6/F1):** split input/output tokens on LLM-complete;
+  cost + review outcome on `pipeline complete`; uniform stage-failure log
+  (stage/action/recoverable/cause); source-scanning test asserts no secret is logged.
+- **Frontend integration:** `/api/retry` route, retry wiring (preserves selection),
+  context-warning banner, arXiv retry label, cost display.
+- **Docs (F11):** README provider/cost tables, full config reference, troubleshooting,
+  project map (poppler explicitly absent — HTML pipeline, no PDFs).
+
+**Realignment note:** the original Phase 6 PRD targeted a PDF/vision architecture
+that this project never used. All poppler/DPI/PDF-render scope was dropped; every
+change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-summary.md`).
 
 **Key Improvements:**
-- Observability: Every significant event logged with session_id, paper_id, duration_ms
-- Resilience: Graceful degradation on transient failures
-- User experience: Clear progress updates, actionable error messages
-- Developer experience: Contributing guide, local dev setup, CI/CD pipeline
+- Observability: split token accounting + estimated cost on the pipeline-complete log.
+- Resilience: segment-level resume; transient vault failure re-writes at zero LLM cost.
+- User experience: actionable error hints, retry progress, non-blocking context advisory.
 
 ---
 

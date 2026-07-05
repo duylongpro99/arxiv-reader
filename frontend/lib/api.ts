@@ -4,6 +4,7 @@
 import type {
   PipelineStatus,
   ResultResponse,
+  RetryResponse,
   SelectResponse,
   TriggerResponse,
 } from "./types";
@@ -30,6 +31,22 @@ export async function selectPaper(
   });
   if (!res.ok) {
     throw new Error(`Failed to select paper (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// retryPipeline resumes a failed, recoverable pipeline from the stage that
+// failed WITHOUT re-selecting a paper (the backend routes by the failed stage
+// and skips cached segments). Throws on a non-OK response — the caller (panel)
+// falls back to a fresh discovery when the session is gone (404).
+export async function retryPipeline(sessionId: string): Promise<RetryResponse> {
+  const res = await fetch("/api/retry", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to retry (HTTP ${res.status})`);
   }
   return res.json();
 }

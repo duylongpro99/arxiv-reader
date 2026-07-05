@@ -88,6 +88,8 @@ func (a *ExplainerAgent) Generate(ctx context.Context, in ExplainerInput) (model
 
 	slog.Info("explainer generation complete",
 		"paper_id", in.PaperMeta.ID,
+		"input_tokens", resp.InputTokens,
+		"output_tokens", resp.OutputTokens,
 		"tokens_used", resp.InputTokens+resp.OutputTokens,
 		"word_count", wordCount(resp.Content),
 		"duration_ms", time.Since(start).Milliseconds(),

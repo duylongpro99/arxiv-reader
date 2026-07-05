@@ -21,7 +21,9 @@ import (
 // depends on. Defining them here (consumer-side) keeps the orchestrator
 // testable with fakes and decoupled from the concrete tools.
 type PaperFetcher interface {
-	FetchPapers(ctx context.Context) ([]models.Paper, error)
+	// onRetry (nil-safe) fires per transient arXiv retry so the orchestrator can
+	// surface a progress counter (F5) without the tool touching the session.
+	FetchPapers(ctx context.Context, onRetry func(attempt int)) ([]models.Paper, error)
 }
 
 type Unprocessor interface {
@@ -157,6 +159,65 @@ func (o *Orchestrator) HandleProcess(w http.ResponseWriter, r *http.Request) {
 	go o.runPipeline(context.WithoutCancel(r.Context()), s, selected.ID)
 }
 
+// HandleRetry resumes a failed, recoverable pipeline from the segment that
+// failed — WITHOUT discarding the user's paper pick or re-running already-cached
+// segments. It validates the session is retryable, clears the transient error
+// state, then routes by the failed stage: a discovery failure re-runs discovery;
+// any pipeline-stage failure re-enters runPipeline, which skips cached segments
+// (markdown/explainer) and re-runs only what's missing.
+//
+// Safety: the session is only reachable here from StageFailed, which is terminal
+// until a retry, so the spawned goroutine cannot race a still-running pipeline.
+func (o *Orchestrator) HandleRetry(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sessionId")
+	v, ok := o.sessions.Load(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	s := v.(*models.PipelineSession)
+
+	// failedStage and the selected paper are immutable once a failure occurs, so
+	// we validate routing against them BEFORE the atomic transition. Reject an
+	// unknown/unroutable failed stage up front.
+	failed := s.FailedStage()
+	switch failed {
+	case models.StageDiscovery, models.StageExtracting, models.StageGenerating,
+		models.StageReviewing, models.StageRevising, models.StageWriting:
+		// routable
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "this error is not retryable"})
+		return
+	}
+	// Pipeline stages need the selected paper (discovery does not); the pick is
+	// preserved across the failure so the user does NOT re-select.
+	if failed != models.StageDiscovery && s.SelectedPaper() == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no paper selected to retry"})
+		return
+	}
+
+	// Atomically confirm retryable + transition out of StageFailed. A concurrent
+	// second retry gets false here and is rejected, so only one goroutine spawns.
+	if _, ok := s.BeginRetry(); !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session not retryable"})
+		return
+	}
+
+	// Detach from the request context (cancelled once this handler returns) so the
+	// resumed work survives — mirrors HandleDiscover/HandleProcess.
+	ctx := context.WithoutCancel(r.Context())
+	slog.Info("retry", "session_id", s.SessionID, "from_stage", string(failed))
+	if failed == models.StageDiscovery {
+		go o.runDiscovery(ctx, s)
+	} else {
+		// runPipeline skips cached segments; it reads the paper ID from the
+		// selection preserved on the session.
+		go o.runPipeline(ctx, s, s.SelectedPaper().ID)
+	}
+
+	writeJSON(w, http.StatusOK, RetryResponse{SessionID: id})
+}
+
 // HandleStatus returns the current session snapshot, or 404 for an unknown ID.
 func (o *Orchestrator) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sessionId")
@@ -170,14 +231,17 @@ func (o *Orchestrator) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := v.(*models.PipelineSession).Snapshot()
 	writeJSON(w, http.StatusOK, StatusResponse{
-		Stage:        snap.Stage,
-		Candidates:   snap.Candidates,
-		Notice:       snap.Notice,
-		Error:        snap.Error,
-		Recoverable:  snap.Recoverable,
-		Iteration:    snap.Iteration,
-		ReviewScore:  snap.ReviewScore,
-		ReviewPassed: snap.ReviewPassed,
+		Stage:           snap.Stage,
+		Candidates:      snap.Candidates,
+		Notice:          snap.Notice,
+		Error:           snap.Error,
+		Recoverable:     snap.Recoverable,
+		Iteration:       snap.Iteration,
+		ReviewScore:     snap.ReviewScore,
+		ReviewPassed:    snap.ReviewPassed,
+		ErrorAction:     snap.ErrorAction,
+		ArxivRetryCount: snap.ArxivRetryCount,
+		ContextWarning:  snap.ContextWarning,
 	})
 }
 
@@ -202,9 +266,17 @@ func (o *Orchestrator) HandleResult(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "result not ready"})
 		return
 	}
+	// Cost is estimated from the split token totals against the configured model.
+	// CostKnown=false when the model isn't in the pricing table → the UI hides it.
+	in, out := s.InputTokens(), s.OutputTokens()
+	cost, known := llm.EstimateCost(o.cfg.LLM.Model, in, out)
 	writeJSON(w, http.StatusOK, ResultResponse{
-		Content:    ex.Content,
-		VaultFile:  s.VaultFile(),
-		TokensUsed: s.TokensUsed(),
+		Content:          ex.Content,
+		VaultFile:        s.VaultFile(),
+		TokensUsed:       s.TokensUsed(),
+		InputTokens:      in,
+		OutputTokens:     out,
+		EstimatedCostUSD: cost,
+		CostKnown:        known,
 	})
 }

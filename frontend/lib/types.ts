@@ -35,6 +35,22 @@ export interface PipelineStatus {
   iteration?: number;
   reviewScore?: number;
   reviewPassed?: boolean;
+  // Phase 6 additive fields (match the Go StatusResponse json tags exactly).
+  // errorAction is a machine hint for the failure ("retry" | "fix_config" |
+  // "fix_permissions"); arxivRetryCount drives the discovery retry label;
+  // contextWarning is the non-blocking over-limit advisory.
+  errorAction?: string;
+  arxivRetryCount?: number;
+  contextWarning?: ContextWarning;
+}
+
+// ContextWarning mirrors the Go models.ContextWarning json tags. Advisory only —
+// the pipeline proceeds; the UI shows it as a non-blocking notice.
+export interface ContextWarning {
+  estimatedTokens: number;
+  modelLimit: number;
+  model: string;
+  suggestion: string;
 }
 
 export interface TriggerResponse {
@@ -52,4 +68,17 @@ export interface ResultResponse {
   content: string; // note body Markdown (no frontmatter)
   vaultFile: string; // absolute path of the written note
   tokensUsed: number;
+  // Phase 6 cost breakdown (match the Go ResultResponse json tags). Present only
+  // when known: costKnown is false/absent when the model isn't in the pricing
+  // table, in which case the UI hides the cost figure.
+  inputTokens?: number;
+  outputTokens?: number;
+  estimatedCostUSD?: number;
+  costKnown?: boolean;
+}
+
+// Retrying a failed pipeline resumes the SAME session (backend routes by the
+// failed stage); the id is echoed back so the panel keeps polling it.
+export interface RetryResponse {
+  session_id: string;
 }

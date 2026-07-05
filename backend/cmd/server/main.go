@@ -19,8 +19,8 @@ func main() {
 		slog.Error("FATAL config error", "error", err.Error())
 		os.Exit(1)
 	}
-	// Log provider+model only. NEVER log cfg.LLM.APIKey.
-	slog.Info("config loaded", "provider", cfg.LLM.Provider, "model", cfg.LLM.Model)
+	// Log provider+model+vault path only. NEVER log cfg.LLM.APIKey.
+	slog.Info("config loaded", "provider", cfg.LLM.Provider, "model", cfg.LLM.Model, "vault_path", cfg.Paths.ObsidianVault)
 
 	if err := server.Run(cfg); err != nil {
 		slog.Error("server error", "error", err.Error())

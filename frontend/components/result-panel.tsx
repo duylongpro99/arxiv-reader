@@ -10,7 +10,7 @@ export function ResultPanel({ result }: { result: ResultResponse }) {
   return (
     <div className="flex flex-col gap-4">
       <SuccessBanner vaultFile={result.vaultFile} />
-      <TokenUsage tokens={result.tokensUsed} />
+      <TokenUsage result={result} />
       <div className="rounded-lg border border-gray-200 bg-white p-5 dark:border-gray-700 dark:bg-gray-900">
         <MarkdownPreview content={result.content} />
       </div>
@@ -35,13 +35,30 @@ function SuccessBanner({ vaultFile }: { vaultFile: string }) {
   );
 }
 
-function TokenUsage({ tokens }: { tokens: number }) {
+// TokenUsage shows total tokens and, when the backend knows the model's pricing
+// (costKnown), an estimated USD cost with an explicit "approximate" caveat. The
+// cost is hidden entirely when costKnown is false/absent — never show a guess.
+function TokenUsage({ result }: { result: ResultResponse }) {
+  const showCost =
+    result.costKnown && typeof result.estimatedCostUSD === "number";
   return (
     <div className="text-sm text-gray-600 dark:text-gray-400">
       Token usage:{" "}
       <span className="font-mono font-medium text-gray-800 dark:text-gray-200">
-        {tokens.toLocaleString()}
+        {result.tokensUsed.toLocaleString()}
       </span>
+      {showCost && (
+        <>
+          {" · "}
+          <span className="font-mono font-medium text-gray-800 dark:text-gray-200">
+            ~${result.estimatedCostUSD!.toFixed(3)}
+          </span>{" "}
+          estimated{" "}
+          <span className="text-xs text-gray-500 dark:text-gray-500">
+            (approximate — check your provider dashboard)
+          </span>
+        </>
+      )}
     </div>
   );
 }

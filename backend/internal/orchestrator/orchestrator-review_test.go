@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -288,5 +289,96 @@ func TestLoopStagesEmittedInOrder(t *testing.T) {
 		if stages[i] != want[i] {
 			t.Fatalf("stage[%d] = %s, want %s (full: %v)", i, stages[i], want[i], stages)
 		}
+	}
+}
+
+// --- Phase 6: resume after a review-call failure ---
+
+// errorReviewer errors on its first call, then returns a passing verdict, so a
+// test can drive a transient review failure followed by a successful retry.
+type errorReviewer struct {
+	calls int
+}
+
+func (r *errorReviewer) Review(context.Context, models.ExplainerOutput, models.Paper, int) (models.ReviewVerdict, error) {
+	r.calls++
+	if r.calls == 1 {
+		return models.ReviewVerdict{}, llm.ErrLLMTimeout // transient → recoverable
+	}
+	return models.ReviewVerdict{Pass: true, Score: 0.9, Iteration: 1, TokensUsed: 500, InputTokens: 400, OutputTokens: 100}, nil
+}
+
+// With the reviewer enabled, a review-call failure leaves verdict==nil after a
+// successful generation. On retry, the WHOLE loop must re-run (so the note is
+// actually reviewed) rather than skipping to a vault write that would mislabel
+// an unreviewed note as review_passed:true.
+func TestRetryReviewFailureReRunsLoop(t *testing.T) {
+	exp := &scriptedExplainer{body: reviewBody}
+	rev := &errorReviewer{}
+	fv := &fakeVault{path: "/vault/AI Papers/n.md"}
+	o := reviewOrch(2, exp, rev, fv)
+	s := selectionSession(o, makePapers(3))
+
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageFailed })
+
+	// After the failure: generation ran once, explainer cached, verdict still nil.
+	if exp.calls != 1 {
+		t.Fatalf("generation calls before retry = %d, want 1", exp.calls)
+	}
+	if s.Verdict() != nil {
+		t.Fatal("verdict must be nil after a review-call failure")
+	}
+	if !s.Snapshot().Recoverable {
+		t.Fatal("transient review failure must be recoverable")
+	}
+
+	// Retry: the loop must re-run (regenerate + review), producing a real verdict.
+	if rec := retry(o, s.SessionID); rec.Code != http.StatusOK {
+		t.Fatalf("retry: want 200, got %d", rec.Code)
+	}
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
+
+	if exp.calls != 2 {
+		t.Fatalf("generation calls after retry = %d, want 2 (loop re-ran)", exp.calls)
+	}
+	v := s.Verdict()
+	if v == nil || !v.Pass {
+		t.Fatalf("expected a passing verdict after retry, got %+v", v)
+	}
+	// The vault write must carry the real (passing) verdict, not a nil that
+	// buildFrontmatter would render as review_passed:true for a disabled reviewer.
+	if fv.lastVerdict == nil || !fv.lastVerdict.Pass {
+		t.Fatalf("vault write verdict = %+v, want a real passing verdict", fv.lastVerdict)
+	}
+}
+
+// A second retry issued after the first has already transitioned the session out
+// of StageFailed must be rejected (400) — the atomic BeginRetry closes the
+// double-spawn window. Sequential calls make this deterministic: the first retry
+// synchronously leaves StageFailed before returning.
+func TestRetrySecondIsRejected(t *testing.T) {
+	content := &fakeContent{md: "# extracted"}
+	o := newProcessOrch(content)
+	fv := &toggleVault{path: "/vault/AI Papers/n.md"} // fails once, then succeeds
+	o.vault = fv
+	s := selectionSession(o, makePapers(3))
+
+	process(o, s.SessionID, "a")
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageFailed })
+
+	if rec := retry(o, s.SessionID); rec.Code != http.StatusOK {
+		t.Fatalf("first retry: want 200, got %d", rec.Code)
+	}
+	// The first retry has already left StageFailed synchronously, so a second one
+	// is not retryable.
+	if rec := retry(o, s.SessionID); rec.Code != http.StatusBadRequest {
+		t.Fatalf("second retry: want 400, got %d", rec.Code)
+	}
+
+	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
+	// Exactly one fail + one success write — no double-spawn from the 2nd retry.
+	if atomic.LoadInt32(&fv.written) != 2 {
+		t.Fatalf("vault writes = %d, want 2 (one fail + one success)", fv.written)
 	}
 }

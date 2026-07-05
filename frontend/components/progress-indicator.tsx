@@ -22,6 +22,14 @@ const STAGE_LABEL: Partial<Record<PipelineStatus["stage"], string>> = {
 function getLabel(status: PipelineStatus): string {
   const pass = status.iteration ?? 1;
   switch (status.stage) {
+    case "discovery": {
+      // Surface arXiv 429/5xx backoff so a slow connect doesn't look hung. The
+      // "/3" matches the backend's default max_retries.
+      const retries = status.arxivRetryCount ?? 0;
+      return retries > 0
+        ? `Connecting to arXiv (retry ${retries}/3)…`
+        : STAGE_LABEL.discovery!;
+    }
     case "reviewing": {
       const score =
         typeof status.reviewScore === "number" && status.reviewScore > 0

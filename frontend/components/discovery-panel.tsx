@@ -2,8 +2,15 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { fetchResult, fetchStatus, selectPaper, triggerDiscovery } from "@/lib/api";
+import {
+  fetchResult,
+  fetchStatus,
+  retryPipeline,
+  selectPaper,
+  triggerDiscovery,
+} from "@/lib/api";
 import { CandidateList } from "./candidate-list";
+import { ContextWarningBanner } from "./context-warning";
 import { ErrorBanner } from "./error-banner";
 import { ProgressIndicator } from "./progress-indicator";
 import { ResultPanel } from "./result-panel";
@@ -44,6 +51,20 @@ export function DiscoveryPanel() {
       queryClient.invalidateQueries({ queryKey: ["status", sessionId] });
     },
     onError: () => setSelectedId(null),
+  });
+
+  // Retry resumes a failed pipeline IN PLACE — the backend routes by the failed
+  // stage and preserves the paper pick, so we do NOT call `start` (which would
+  // re-run discovery and drop the selection). On success the backend has already
+  // set the resume stage, so invalidating re-arms the paused status poll (the
+  // same loop, not a second one). If the session is gone (404 → onError), fall
+  // back to a fresh discovery run.
+  const retry = useMutation({
+    mutationFn: () => retryPipeline(sessionId as string),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["status", sessionId] });
+    },
+    onError: () => trigger.mutate(),
   });
 
   const { data: status } = useQuery({
@@ -108,11 +129,16 @@ export function DiscoveryPanel() {
         <ProgressIndicator status={status} />
       )}
 
+      {/* Non-blocking over-limit advisory (F4): the pipeline keeps running. */}
+      {status?.contextWarning && (
+        <ContextWarningBanner warning={status.contextWarning} />
+      )}
+
       {status?.stage === "failed" && (
         <ErrorBanner
           message={status.error ?? "Discovery failed."}
           recoverable={status.recoverable}
-          onRetry={start}
+          onRetry={() => retry.mutate()}
         />
       )}
 

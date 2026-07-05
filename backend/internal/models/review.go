@@ -14,6 +14,10 @@ type ReviewVerdict struct {
 	Score      float32
 	Feedback   map[string]string // section key → actionable revision note
 	Iteration  int
-	TokensUsed int
-	CreatedAt  time.Time
+	TokensUsed int // total (InputTokens + OutputTokens); kept for back-compat
+	// Split token counts, mirroring ExplainerOutput, so the orchestrator can feed
+	// AddIO for cost estimation. TokensUsed remains the authoritative total.
+	InputTokens  int
+	OutputTokens int
+	CreatedAt    time.Time
 }

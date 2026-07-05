@@ -5,6 +5,55 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
+## [Phase 6] — 2026-07-05
+
+Polish & hardening of the HTML→Markdown product. All changes are additive and
+extend the existing sentinel-error + mutex-encapsulated-session patterns; the
+original PDF/vision-oriented PRD was realigned to the actual HTML architecture
+(poppler/DPI scope dropped).
+
+### Added
+
+#### Backend
+- **Retry from failed stage (F2)** — `POST /retry/{sessionId}` resumes a failed,
+  recoverable pipeline from the segment that failed via cached outputs
+  (markdown/explainer). Paper selection is preserved; a transient vault failure
+  re-writes with **zero** additional LLM cost. An atomic `BeginRetry()` transition
+  rejects a concurrent second retry (no double-spawn). `runPipeline` refactored
+  into cache-guarded segments (extract / generate+review / write).
+- **Error action hints** — `describe*` mappings return a machine-readable action
+  (`retry` / `fix_config` / `fix_permissions`), surfaced via `StatusResponse.errorAction`.
+  `ErrLLMBadRequest` is now non-recoverable (config is immutable at runtime).
+- **Cost estimation (F3)** — `llm/pricing.go` (`EstimateCost`) + `/result` cost
+  fields (`inputTokens`, `outputTokens`, `estimatedCostUSD`, `costKnown`). Unknown
+  models report `costKnown:false` so the UI hides the figure.
+- **Context-window pre-check (F4)** — `llm/limits.go` (`EstimateTokens`, len/4
+  heuristic) + non-blocking `ContextWarning`; the pipeline always proceeds.
+- **arXiv retry counter (F5)** — `FetchPapers` gains an `onRetry` callback wired to
+  `arxivRetryCount`, driving a "Connecting to arXiv (retry n/3)…" label.
+- **Split token accounting** — session `AddIO`; `ReviewVerdict` carries
+  `InputTokens`/`OutputTokens`.
+- **Logging & security (F6/F1)** — split tokens on LLM-complete; cost + review
+  outcome on `pipeline complete`; uniform stage-failure log (stage/action/
+  recoverable/cause); a source-scanning test (`internal/audit`) asserts no API key
+  appears in any `slog` call.
+
+#### Frontend
+- `/api/retry` proxy route; retry wiring that resumes in place (preserves the
+  paper pick, re-arms the same poll loop); non-blocking context-warning banner;
+  arXiv retry progress label; estimated-cost line in the success panel.
+
+#### Docs
+- README: LLM provider table, estimated-cost table, full `config.yaml` reference,
+  troubleshooting table, project map (poppler explicitly absent).
+- `docs/phase6/e2e-validation.md`: runnable cross-provider validation checklist.
+
+### Changed
+- `PaperFetcher.FetchPapers` signature gains an `onRetry func(int)` parameter
+  (all call sites + fakes updated).
+
+---
+
 ## [Phase 5] — 2026-07-05
 
 ### Added

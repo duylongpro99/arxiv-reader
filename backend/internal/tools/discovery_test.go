@@ -70,7 +70,7 @@ func TestFetchPapersHappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background())
+	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestFetchPapersRetriesThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background())
+	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("expected success after retry, got %v", err)
 	}
@@ -123,13 +123,43 @@ func TestFetchPapersRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+// F5: onRetry must fire once per transient retry, with the attempt number, so
+// the orchestrator can surface a "retry n/3" progress counter.
+func TestFetchPapersOnRetryCallbackFires(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Fail the first two attempts (429, then 5xx), succeed on the third.
+		switch calls.Add(1) {
+		case 1:
+			w.WriteHeader(http.StatusTooManyRequests)
+		case 2:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			_, _ = w.Write([]byte(sampleFeed))
+		}
+	}))
+	defer srv.Close()
+
+	var attempts []int
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), func(attempt int) {
+		attempts = append(attempts, attempt)
+	})
+	if err != nil {
+		t.Fatalf("expected success after retries, got %v", err)
+	}
+	// Two failures → two retries → attempts 1 and 2 (attempt 0 is the first try).
+	if len(attempts) != 2 || attempts[0] != 1 || attempts[1] != 2 {
+		t.Fatalf("onRetry attempts = %v, want [1 2]", attempts)
+	}
+}
+
 func TestFetchPapersRateLimitExhausted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer srv.Close()
 
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background())
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
 	if !errors.Is(err, ErrArxivRateLimit) {
 		t.Fatalf("expected ErrArxivRateLimit, got %v", err)
 	}
@@ -141,7 +171,7 @@ func TestFetchPapersServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background())
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
 	if !errors.Is(err, ErrArxivUnavailable) {
 		t.Fatalf("expected ErrArxivUnavailable, got %v", err)
 	}
@@ -153,7 +183,7 @@ func TestFetchPapersParseError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background())
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
 	if !errors.Is(err, ErrArxivParse) {
 		t.Fatalf("expected ErrArxivParse, got %v", err)
 	}
@@ -167,7 +197,7 @@ func TestFetchPapersEmptyFeedIsNotError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background())
+	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("empty feed should not error, got %v", err)
 	}

@@ -79,11 +79,16 @@ type arxivLink struct {
 // papers. It retries transient failures (429/5xx) with exponential backoff and
 // aborts promptly if ctx is cancelled. An empty-but-well-formed feed returns an
 // empty slice with no error — "no papers right now" is not a failure.
-func (t *DiscoveryTool) FetchPapers(ctx context.Context) ([]models.Paper, error) {
+//
+// onRetry (optional; pass nil when not needed) is invoked with the attempt
+// number on each transient retry, letting the caller surface a progress counter
+// (F5) WITHOUT this tool depending on the session. It keeps DiscoveryTool
+// decoupled — the callback is the only seam.
+func (t *DiscoveryTool) FetchPapers(ctx context.Context, onRetry func(attempt int)) ([]models.Paper, error) {
 	start := time.Now()
 	reqURL := t.buildQueryURL()
 
-	body, err := t.fetchWithRetry(ctx, reqURL)
+	body, err := t.fetchWithRetry(ctx, reqURL, onRetry)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +128,7 @@ func (t *DiscoveryTool) buildQueryURL() string {
 // fetchWithRetry performs the request, retrying only on transient (429/5xx)
 // responses. Parse-level or permanent 4xx failures are NOT retried — they will
 // not fix themselves and retrying only burns the user's time budget.
-func (t *DiscoveryTool) fetchWithRetry(ctx context.Context, reqURL string) ([]byte, error) {
+func (t *DiscoveryTool) fetchWithRetry(ctx context.Context, reqURL string, onRetry func(attempt int)) ([]byte, error) {
 	var lastTransient error
 
 	// attempt 0 is the first try; up to MaxRetries additional attempts follow,
@@ -131,6 +136,11 @@ func (t *DiscoveryTool) fetchWithRetry(ctx context.Context, reqURL string) ([]by
 	for attempt := 0; attempt <= t.cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := t.backoffFor(attempt)
+			// Notify the caller so it can surface a retry progress counter (F5),
+			// alongside the structured log below.
+			if onRetry != nil {
+				onRetry(attempt)
+			}
 			// Log the actual prior failure — the loop retries both 429 and
 			// 5xx/network, so a hardcoded "rate limited" message would mislead
 			// during a real arXiv outage.

@@ -128,3 +128,56 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// Fail must snapshot the stage that was active BEFORE the transition to failed —
+// this is what Phase 6 retry routing keys off to resume the correct segment.
+func TestFailCapturesFailedStage(t *testing.T) {
+	s := NewSession("s1", time.Now())
+	s.SetStage(StageWriting)
+	s.Fail("disk full", false)
+
+	if s.Snapshot().Stage != StageFailed {
+		t.Fatal("Fail must land in StageFailed")
+	}
+	if got := s.FailedStage(); got != StageWriting {
+		t.Fatalf("FailedStage = %q, want %q (the pre-fail stage)", got, StageWriting)
+	}
+}
+
+// The Phase 6 accessors round-trip under the lock, split-token accounting is
+// additive, and the poll-surfaced fields (errorAction/arxivRetryCount/
+// contextWarning) reach Snapshot while the large in/out totals do NOT.
+func TestPhase6AccessorsRoundTrip(t *testing.T) {
+	s := NewSession("s1", time.Now())
+
+	s.SetErrorAction("fix_config")
+	if got := s.ErrorAction(); got != "fix_config" {
+		t.Fatalf("ErrorAction = %q, want fix_config", got)
+	}
+
+	// AddIO accumulates input/output separately across calls.
+	s.AddIO(1000, 200)
+	s.AddIO(500, 100)
+	if in, out := s.InputTokens(), s.OutputTokens(); in != 1500 || out != 300 {
+		t.Fatalf("AddIO totals = (%d,%d), want (1500,300)", in, out)
+	}
+
+	s.SetArxivRetryCount(2)
+	if got := s.ArxivRetryCount(); got != 2 {
+		t.Fatalf("ArxivRetryCount = %d, want 2", got)
+	}
+
+	cw := &ContextWarning{EstimatedTokens: 90000, ModelLimit: 64000, Model: "m", Suggestion: "switch"}
+	s.SetContextWarning(cw)
+	if got := s.ContextWarning(); got == nil || got.EstimatedTokens != 90000 {
+		t.Fatalf("ContextWarning round-trip failed: %+v", got)
+	}
+
+	// Snapshot surfaces the small poll fields...
+	snap := s.Snapshot()
+	if snap.ErrorAction != "fix_config" || snap.ArxivRetryCount != 2 || snap.ContextWarning == nil {
+		t.Fatalf("Snapshot missing Phase 6 poll fields: %+v", snap)
+	}
+	// ...but SessionSnapshot has no in/out token fields by type (compile-time
+	// guarantee they stay off /status); the accessors remain the only source.
+}

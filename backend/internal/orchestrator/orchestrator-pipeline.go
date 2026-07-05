@@ -11,9 +11,16 @@ import (
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
+	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 )
+
+// systemPromptTokenAllowance is a rough, conservative allowance (in tokens) for
+// the explainer's system prompt when estimating whether a request fits the
+// model's context window. It only needs to be in the right ballpark — the check
+// is advisory (F4).
+const systemPromptTokenAllowance = 900
 
 // This file holds the detached background goroutines (discovery + extraction)
 // and their shared helpers, kept separate from the HTTP surface in orchestrator.go.
@@ -26,22 +33,30 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 	defer func() {
 		if r := recover(); r != nil {
 			session.Fail("Discovery crashed unexpectedly. Please try again.", true)
+			session.SetErrorAction(actionRetry)
 			slog.Error("discovery panic", "session_id", session.SessionID, "panic", fmt.Sprintf("%v", r))
 		}
 	}()
 
-	papers, err := o.disco.FetchPapers(ctx)
+	// Surface arXiv retry attempts as a progress counter (F5). On success we reset
+	// it to 0 below so the "Connecting to arXiv (retry n/3)…" label disappears.
+	papers, err := o.disco.FetchPapers(ctx, func(attempt int) {
+		session.SetArxivRetryCount(attempt)
+	})
 	if err != nil {
-		msg, recoverable := describeError(err)
+		msg, recoverable, action := describeError(err)
 		session.Fail(msg, recoverable)
+		session.SetErrorAction(action)
 		o.logFailure(session, err)
 		return
 	}
+	session.SetArxivRetryCount(0) // fetch succeeded — clear any retry label
 
 	unprocessed, err := o.logCheck.FilterUnprocessed(papers)
 	if err != nil {
-		msg, recoverable := describeError(err)
+		msg, recoverable, action := describeError(err)
 		session.Fail(msg, recoverable)
+		session.SetErrorAction(action)
 		o.logFailure(session, err)
 		return
 	}
@@ -66,37 +81,51 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 	)
 }
 
-// runPipeline fetches the chosen paper's Markdown and records the outcome. A 404
-// is a *recoverable re-pick* (back to selection, candidates preserved) rather
-// than a hard failure; any other error fails the session recoverably. On success
-// it stores the Markdown and stops — Phase 4's ExplainerAgent resumes here.
+// runPipeline fetches the chosen paper's Markdown, generates + reviews the
+// explainer, and writes it to the vault. A 404 is a *recoverable re-pick* (back
+// to selection, candidates preserved); any other error fails the session.
+//
+// Phase 6 makes this RESUMABLE: each of the three heavy segments is guarded by
+// its own cached output, so a retry re-runs only what actually failed —
+//   - extraction   skipped when Markdown() is already cached
+//   - generate+review skipped when Explainer() is already cached (one unit — we
+//     never resume mid-loop, keeping the Phase 5 loop logic untouched)
+//   - vault write   always runs; it is idempotent on retry because a prior
+//     failure wrote no file and never marked the paper processed
+//
+// On a fresh run all caches are empty → the full pipeline runs.
 func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSession, paperID string) {
 	// A panic on this fully-detached goroutine would crash the whole process;
 	// contain it to this one session (mirrors runDiscovery).
 	defer func() {
 		if r := recover(); r != nil {
 			s.Fail("Processing crashed unexpectedly. Please try again.", true)
+			s.SetErrorAction(actionRetry)
 			slog.Error("pipeline panic", "session_id", s.SessionID, "panic", fmt.Sprintf("%v", r))
 		}
 	}()
 
-	md, err := o.content.FetchMarkdown(ctx, paperID)
-	if err != nil {
-		if errors.Is(err, tools.ErrPaperHTMLNotFound) {
-			s.RecoverToSelection("Paper HTML not available on arXiv. Please select another paper.")
-			slog.Warn("paper html not found", "session_id", s.SessionID, "paper_id", paperID)
+	// --- Segment 1: extraction (skipped on resume when markdown is cached). ---
+	if s.Markdown() == "" {
+		md, err := o.content.FetchMarkdown(ctx, paperID)
+		if err != nil {
+			if errors.Is(err, tools.ErrPaperHTMLNotFound) {
+				s.RecoverToSelection("Paper HTML not available on arXiv. Please select another paper.")
+				slog.Warn("paper html not found", "session_id", s.SessionID, "paper_id", paperID)
+				return
+			}
+			msg, recoverable, action := describeError(err)
+			s.Fail(msg, recoverable)
+			s.SetErrorAction(action)
+			o.logFailure(s, err, "paper_id", paperID)
 			return
 		}
-		msg, recoverable := describeError(err)
-		s.Fail(msg, recoverable)
-		slog.Error("pipeline failed", "session_id", s.SessionID, "paper_id", paperID, "error", err.Error())
-		return
+		s.SetMarkdown(md)
+		slog.Info("markdown stored", "session_id", s.SessionID, "paper_id", paperID, "markdown_bytes", len(md))
 	}
+	md := s.Markdown()
 
-	s.SetMarkdown(md)
-	slog.Info("markdown stored", "session_id", s.SessionID, "paper_id", paperID, "markdown_bytes", len(md))
-
-	// --- Phase 4: generate the explainer, write it to the vault, complete. ---
+	// --- Phase 4/5: generate + review the explainer, write it, complete. ---
 
 	// SelectedPaper carries the full metadata (title/authors/published) the
 	// ExplainerAgent and VaultWriter need. HandleProcess always sets it before
@@ -104,18 +133,105 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 	paper := s.SelectedPaper()
 	if paper == nil {
 		s.Fail("Internal error: no paper selected. Please try again.", true)
-		slog.Error("pipeline missing selected paper", "session_id", s.SessionID, "paper_id", paperID)
+		s.SetErrorAction(actionRetry)
+		o.logFailure(s, errors.New("no paper selected"), "paper_id", paperID)
 		return
 	}
 
-	// --- Phase 5: bounded critic-generator loop. ---
+	// --- Segment 2: bounded critic-generator loop (skipped on resume when the
+	// explainer is cached — the loop is ONE resume unit; never resume mid-loop).
 	//
-	// The loop always terminates (via one of the explicit breaks), always writes
-	// exactly one note (the last explainer), and honours max=0 (reviewer disabled,
+	// The loop always terminates (via one of the explicit breaks), always stores
+	// exactly one explainer (the last), and honours max=0 (reviewer disabled,
 	// Phase-4 path). A revision note produced by a failing review is threaded back
 	// into the next generation via the existing ExplainerInput.RevisionNote seam.
+	// Re-run the loop when there is no cached explainer OR when the reviewer is
+	// enabled but no verdict was recorded — the latter means a prior run failed
+	// mid-loop (e.g. the review LLM call errored after a successful generation),
+	// so a resume must re-run the WHOLE loop rather than write an unreviewed note
+	// mislabeled review_passed:true. Re-generation cost is real and accounted for.
+	// (A legitimately nil verdict — reviewer disabled, maxIter==0 — does NOT
+	// trip this, so a vault-only retry still skips the loop at zero LLM cost.)
+	reviewerEnabled := o.cfg.Agent.MaxReviewIterations > 0
+	if s.Explainer() == nil || (reviewerEnabled && s.Verdict() == nil) {
+		o.checkContextWindow(s, md) // F4: non-blocking over-limit advisory
+		if !o.runGenerateReview(ctx, s, md, paper, paperID) {
+			return // segment failed; error state already set on the session
+		}
+	}
+
+	// --- Segment 3: vault write (ALWAYS runs; idempotent on retry). Read the
+	// explainer from the session so a resumed run that skipped the loop still has
+	// the cached note to write.
+	ex := s.Explainer()
+	if ex == nil { // defensive: reachable only if the loop stored nothing
+		s.Fail("Internal error: no explainer to write. Please try again.", true)
+		s.SetErrorAction(actionRetry)
+		o.logFailure(s, errors.New("no explainer to write"), "paper_id", paperID)
+		return
+	}
+
+	s.SetStage(models.StageWriting)
+	path, err := o.vault.WriteToVault(ctx, *ex, *paper, s.Verdict())
+	if err != nil {
+		// Permission/disk failures won't fix themselves on retry; others might.
+		msg, action := vaultErrMsg(err)
+		s.Fail(msg, vaultRecoverable(err))
+		s.SetErrorAction(action)
+		o.logFailure(s, err, "paper_id", paperID)
+		return
+	}
+	s.SetVaultFile(path)
+	s.SetStage(models.StageComplete)
+
+	// A full-run summary: token split, estimated cost, and the review outcome, so
+	// a completed run is auditable from this single line (F6 event table).
+	// review_iterations is 0 when the reviewer was disabled (verdict stays nil).
+	cost, costKnown := llm.EstimateCost(o.cfg.LLM.Model, s.InputTokens(), s.OutputTokens())
+	reviewIterations, reviewPassed := 0, false
+	if v := s.Verdict(); v != nil {
+		reviewIterations, reviewPassed = v.Iteration, v.Pass
+	}
+	slog.Info("pipeline complete",
+		"session_id", s.SessionID, "paper_id", paperID,
+		"input_tokens", s.InputTokens(), "output_tokens", s.OutputTokens(),
+		"total_tokens", s.TokensUsed(),
+		"estimated_cost_usd", cost, "cost_known", costKnown,
+		"review_iterations", reviewIterations, "review_passed", reviewPassed,
+		"total_duration_ms", time.Since(s.StartedAt()).Milliseconds(),
+	)
+}
+
+// checkContextWindow attaches a non-blocking ContextWarning to the session when
+// the estimated prompt size (extracted Markdown + system prompt + output budget)
+// exceeds the configured model's context window. It NEVER aborts the pipeline —
+// the estimate is a len/4 heuristic and a genuine over-limit is caught later by
+// the provider's ErrLLMBadRequest. Unknown models (absent from the limits table)
+// are skipped silently.
+func (o *Orchestrator) checkContextWindow(s *models.PipelineSession, md string) {
+	limit, known := llm.ModelContextLimits[o.cfg.LLM.Model]
+	if !known {
+		return
+	}
+	est := llm.EstimateTokens(md)
+	total := est + systemPromptTokenAllowance + o.cfg.LLM.MaxTokens
+	if total > limit {
+		s.SetContextWarning(&models.ContextWarning{
+			EstimatedTokens: est,
+			ModelLimit:      limit,
+			Model:           o.cfg.LLM.Model,
+			Suggestion:      "Consider switching to Gemini (gemini-2.0-flash) for a larger context window.",
+		})
+	}
+}
+
+// runGenerateReview runs the Phase 5 bounded critic-generator loop as ONE
+// resume unit: it stores the accepted (or last) explainer on the session and
+// returns true, or sets the session's error state and returns false. Extracted
+// from runPipeline so the resume guard (Explainer()==nil) wraps a single call
+// and the vault-write segment stays linear.
+func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.PipelineSession, md string, paper *models.Paper, paperID string) bool {
 	maxIter := o.cfg.Agent.MaxReviewIterations
-	var lastEx models.ExplainerOutput
 	revisionNote := ""
 
 	for iteration := 1; ; iteration++ {
@@ -132,22 +248,29 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 		})
 		if err != nil {
 			// Generation errors are retryable — no vault file written, log untouched.
-			s.Fail(describeGenErr(err), true)
-			slog.Error("explainer generation failed", "session_id", s.SessionID, "paper_id", paperID, "iteration", iteration, "error", err.Error())
-			return
+			// A bad-request (paper too large / wrong model) won't fix itself on an
+			// in-process retry — config is immutable at runtime — so it is NOT
+			// recoverable; the fix_config action tells the user to change the model.
+			// Transient errors stay recoverable.
+			msg, action := describeGenErr(err)
+			s.Fail(msg, action != actionFixConfig)
+			s.SetErrorAction(action)
+			o.logFailure(s, err, "paper_id", paperID, "iteration", iteration)
+			return false
 		}
 		// A degenerate empty response (no error) would otherwise be written as a
 		// frontmatter-only note and mark the paper processed. Treat it as a
 		// recoverable generation failure so the paper re-surfaces for a retry.
 		if strings.TrimSpace(ex.Content) == "" {
 			s.Fail("The AI returned an empty explainer. Please try again.", true)
-			slog.Error("explainer generation empty", "session_id", s.SessionID, "paper_id", paperID, "iteration", iteration)
-			return
+			s.SetErrorAction(actionRetry)
+			o.logFailure(s, errors.New("empty explainer response"), "paper_id", paperID, "iteration", iteration)
+			return false
 		}
 		ex.Iteration = iteration // explainer hardcodes 1; stamp the real loop value
-		lastEx = ex
 		s.SetExplainer(&ex)
 		s.AddTokens(ex.InputTokens + ex.OutputTokens)
+		s.AddIO(ex.InputTokens, ex.OutputTokens) // split accounting for cost estimation
 
 		if maxIter == 0 {
 			break // reviewer disabled → Phase-4 path; verdict stays nil
@@ -162,17 +285,23 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 			// review call consumed, so token accounting stays accurate.
 			s.SetVerdict(&verdict)
 			s.AddTokens(verdict.TokensUsed)
+			s.AddIO(verdict.InputTokens, verdict.OutputTokens)
 			slog.Warn("reviewer json parse failed; stopping loop", "session_id", s.SessionID, "iteration", iteration)
 			break
 		}
 		if err != nil {
 			// Real LLM/network error — recoverable, fail the session (no write).
-			s.Fail(describeReviewErr(err), true)
-			slog.Error("reviewer failed", "session_id", s.SessionID, "paper_id", paperID, "iteration", iteration, "error", err.Error())
-			return
+			// Bad-request is non-recoverable (see the generation path); transient
+			// review errors stay recoverable.
+			msg, action := describeReviewErr(err)
+			s.Fail(msg, action != actionFixConfig)
+			s.SetErrorAction(action)
+			o.logFailure(s, err, "paper_id", paperID, "iteration", iteration)
+			return false
 		}
 		s.SetVerdict(&verdict)
 		s.AddTokens(verdict.TokensUsed)
+		s.AddIO(verdict.InputTokens, verdict.OutputTokens)
 
 		if verdict.Pass {
 			slog.Info("reviewer approved explainer", "session_id", s.SessionID, "iteration", iteration, "score", verdict.Score)
@@ -185,22 +314,7 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 		// Not passed and iterations remain: build the note for the next revision.
 		revisionNote = agents.FormatRevisionNote(verdict)
 	}
-
-	s.SetStage(models.StageWriting)
-	path, err := o.vault.WriteToVault(ctx, lastEx, *paper, s.Verdict())
-	if err != nil {
-		// Permission/disk failures won't fix themselves on retry; others might.
-		s.Fail(vaultErrMsg(err), vaultRecoverable(err))
-		slog.Error("vault write failed", "session_id", s.SessionID, "paper_id", paperID, "error", err.Error())
-		return
-	}
-	s.SetVaultFile(path)
-	s.SetStage(models.StageComplete)
-
-	slog.Info("pipeline complete",
-		"session_id", s.SessionID, "paper_id", paperID,
-		"total_duration_ms", time.Since(s.StartedAt()).Milliseconds(),
-	)
+	return true // explainer stored on the session; vault write happens in runPipeline
 }
 
 // newSession creates a session with a unique, dependency-free random ID.
@@ -221,11 +335,21 @@ func newSessionID() string {
 	return hex.EncodeToString(b)
 }
 
-func (o *Orchestrator) logFailure(session *models.PipelineSession, err error) {
-	slog.Error("pipeline failed",
+// logFailure emits the standard ERROR entry for a failed stage. It reads the
+// failure metadata the caller just set via Fail + SetErrorAction (stage, action,
+// recoverable) so a failed run is fully reconstructable from logs alone (F6
+// event table). MUST be called AFTER Fail + SetErrorAction. extra carries any
+// stage-specific context (paper_id, iteration) as key/value pairs.
+func (o *Orchestrator) logFailure(session *models.PipelineSession, cause error, extra ...any) {
+	snap := session.Snapshot()
+	args := []any{
 		"session_id", session.SessionID,
-		"stage", string(models.StageFailed),
-		"error", err.Error(),
+		"stage", string(session.FailedStage()),
+		"action", session.ErrorAction(),
+		"recoverable", snap.Recoverable,
+		"cause", cause.Error(),
 		"duration_ms", time.Since(session.StartedAt()).Milliseconds(),
-	)
+	}
+	args = append(args, extra...)
+	slog.Error("pipeline failed", args...)
 }

@@ -73,12 +73,14 @@ func (a *ReviewerAgent) Review(ctx context.Context, ex models.ExplainerOutput, p
 		// (plus the fail metadata) on the returned verdict even alongside the
 		// sentinel error — the orchestrator accounts for them before it stops.
 		v := models.ReviewVerdict{
-			PaperID:    paper.ID,
-			Pass:       false,
-			Score:      0,
-			Iteration:  iteration,
-			TokensUsed: resp.InputTokens + resp.OutputTokens,
-			CreatedAt:  time.Now().UTC(),
+			PaperID:      paper.ID,
+			Pass:         false,
+			Score:        0,
+			Iteration:    iteration,
+			TokensUsed:   resp.InputTokens + resp.OutputTokens,
+			InputTokens:  resp.InputTokens,
+			OutputTokens: resp.OutputTokens,
+			CreatedAt:    time.Now().UTC(),
 		}
 		return v, fmt.Errorf("%w: %v", ErrReviewParse, err)
 	}
@@ -92,13 +94,15 @@ func (a *ReviewerAgent) Review(ctx context.Context, ex models.ExplainerOutput, p
 	}
 
 	verdict := models.ReviewVerdict{
-		PaperID:    paper.ID,
-		Pass:       raw.Pass, // verbatim — score is advisory, never gates (decision 1)
-		Score:      raw.Score,
-		Feedback:   feedback,
-		Iteration:  iteration,
-		TokensUsed: resp.InputTokens + resp.OutputTokens,
-		CreatedAt:  time.Now().UTC(),
+		PaperID:      paper.ID,
+		Pass:         raw.Pass, // verbatim — score is advisory, never gates (decision 1)
+		Score:        raw.Score,
+		Feedback:     feedback,
+		Iteration:    iteration,
+		TokensUsed:   resp.InputTokens + resp.OutputTokens,
+		InputTokens:  resp.InputTokens,
+		OutputTokens: resp.OutputTokens,
+		CreatedAt:    time.Now().UTC(),
 	}
 
 	slog.Info("review complete",
@@ -107,6 +111,8 @@ func (a *ReviewerAgent) Review(ctx context.Context, ex models.ExplainerOutput, p
 		"score", verdict.Score,
 		"pass", verdict.Pass,
 		"feedback_sections", len(feedback),
+		"input_tokens", verdict.InputTokens,
+		"output_tokens", verdict.OutputTokens,
 		"tokens_used", verdict.TokensUsed,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)

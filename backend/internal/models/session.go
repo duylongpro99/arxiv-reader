@@ -55,6 +55,23 @@ type PipelineSession struct {
 	// (1-based). Both are surfaced to the frontend through Snapshot().
 	verdict   *ReviewVerdict
 	iteration int
+	// Phase 6 hardening state.
+	//   failedStage     — the stage active when Fail() ran; drives retry routing
+	//                     so a resumed run restarts the failed segment, not discovery.
+	//   errorAction     — machine-readable UI hint: "retry" | "fix_config" |
+	//                     "fix_permissions" | "select_other" (set right after Fail).
+	//   inputTokens/outputTokens — split token accounting for cost estimation
+	//                     (TokensUsed keeps the total for back-compat).
+	//   arxivRetryCount — current arXiv 429/5xx retry attempt (0 = none), for a
+	//                     "Connecting to arXiv (retry n/3)…" progress label.
+	//   contextWarning  — non-blocking advisory when the estimate exceeds the
+	//                     model's context window; nil unless the pre-check tripped.
+	failedStage     PipelineStage
+	errorAction     string
+	inputTokens     int
+	outputTokens    int
+	arxivRetryCount int
+	contextWarning  *ContextWarning
 }
 
 // SessionSnapshot is an immutable, mutex-free copy of a session's observable
@@ -72,6 +89,14 @@ type SessionSnapshot struct {
 	Iteration    int
 	ReviewScore  float32
 	ReviewPassed bool
+	// Phase 6 poll-surfaced fields. ErrorAction accompanies a failure so the UI
+	// can label the retry affordance; ArxivRetryCount drives the discovery retry
+	// label; ContextWarning is the non-blocking over-limit advisory. The large
+	// in/out token totals are deliberately NOT here — they ride /result, keeping
+	// the frequent /status poll small (mirrors the existing markdown/token split).
+	ErrorAction     string
+	ArxivRetryCount int
+	ContextWarning  *ContextWarning
 }
 
 // NewSession creates a session in the discovery stage. id must be unique.
@@ -101,16 +126,19 @@ func (s *PipelineSession) Snapshot() SessionSnapshot {
 		passed = s.verdict.Pass
 	}
 	return SessionSnapshot{
-		SessionID:    s.SessionID,
-		Stage:        s.stage,
-		Candidates:   cands,
-		Notice:       s.notice,
-		Error:        s.errMsg,
-		Recoverable:  s.recoverable,
-		StartedAt:    s.startedAt,
-		Iteration:    s.iteration,
-		ReviewScore:  score,
-		ReviewPassed: passed,
+		SessionID:       s.SessionID,
+		Stage:           s.stage,
+		Candidates:      cands,
+		Notice:          s.notice,
+		Error:           s.errMsg,
+		Recoverable:     s.recoverable,
+		StartedAt:       s.startedAt,
+		Iteration:       s.iteration,
+		ReviewScore:     score,
+		ReviewPassed:    passed,
+		ErrorAction:     s.errorAction,
+		ArxivRetryCount: s.arxivRetryCount,
+		ContextWarning:  s.contextWarning,
 	}
 }
 
@@ -126,9 +154,16 @@ func (s *PipelineSession) Complete(candidates []Paper, notice string) {
 
 // Fail transitions the session to the failed stage with a human-readable
 // message. recoverable indicates whether a retry might succeed.
+//
+// It captures the currently-active stage into failedStage BEFORE overwriting
+// s.stage with StageFailed — Phase 6 retry routing needs to know which segment
+// failed (e.g. writing vs generating) to resume the right part of the pipeline.
+// The signature is unchanged so no caller churns; the orchestrator sets the
+// machine-readable action separately via SetErrorAction right after Fail.
 func (s *PipelineSession) Fail(message string, recoverable bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.failedStage = s.stage
 	s.errMsg = message
 	s.recoverable = recoverable
 	s.stage = StageFailed
@@ -272,3 +307,105 @@ func (s *PipelineSession) Markdown() string {
 
 // StartedAt exposes the immutable start time for duration logging.
 func (s *PipelineSession) StartedAt() time.Time { return s.startedAt }
+
+// --- Phase 6 accessors (all mutex-guarded, mirroring the pattern above) ---
+
+// BeginRetry atomically confirms the session is retryable (failed + recoverable)
+// and, if so, clears the transient error state and transitions the stage OUT of
+// StageFailed to the failed stage (the resume point), returning (failedStage,
+// true). Doing the check-and-transition under one lock closes the TOCTOU window:
+// a concurrent second retry observes a non-failed session and gets false, so it
+// cannot double-spawn a pipeline goroutine (which would double-write the vault /
+// double-count tokens). Cached outputs (markdown/explainer/verdict) are left
+// intact so completed segments still skip on resume.
+func (s *PipelineSession) BeginRetry() (PipelineStage, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stage != StageFailed || !s.recoverable {
+		return "", false
+	}
+	failed := s.failedStage
+	s.errMsg = ""
+	s.recoverable = false
+	s.errorAction = ""
+	s.stage = failed // leave StageFailed so a concurrent retry is rejected
+	return failed, true
+}
+
+// FailedStage returns the stage that was active when Fail() ran. Used by the
+// retry handler to route a resumed run to the correct pipeline segment.
+func (s *PipelineSession) FailedStage() PipelineStage {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.failedStage
+}
+
+// SetErrorAction records the machine-readable UI hint for the current failure
+// ("retry" | "fix_config" | "fix_permissions" | "select_other"). The
+// orchestrator calls this immediately after Fail(), using the describe* mapping.
+func (s *PipelineSession) SetErrorAction(a string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.errorAction = a
+}
+
+// ErrorAction returns the machine-readable failure hint, or "" if none.
+func (s *PipelineSession) ErrorAction() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.errorAction
+}
+
+// AddIO accumulates split input/output token usage across LLM calls. Additive
+// (like AddTokens) so the Phase 5 revision loop can call it per iteration.
+func (s *PipelineSession) AddIO(in, out int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inputTokens += in
+	s.outputTokens += out
+}
+
+// InputTokens returns the accumulated input-token total (server-only; feeds the
+// /result cost estimate, deliberately kept off the /status poll).
+func (s *PipelineSession) InputTokens() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.inputTokens
+}
+
+// OutputTokens returns the accumulated output-token total (server-only).
+func (s *PipelineSession) OutputTokens() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.outputTokens
+}
+
+// SetArxivRetryCount records the current arXiv retry attempt (0 resets it).
+// Surfaced via Snapshot so the UI can show "Connecting to arXiv (retry n/3)…".
+func (s *PipelineSession) SetArxivRetryCount(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arxivRetryCount = n
+}
+
+// ArxivRetryCount returns the current arXiv retry attempt (0 = none).
+func (s *PipelineSession) ArxivRetryCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.arxivRetryCount
+}
+
+// SetContextWarning attaches (or clears, with nil) the non-blocking over-limit
+// advisory. Surfaced via Snapshot; never aborts the pipeline.
+func (s *PipelineSession) SetContextWarning(w *ContextWarning) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.contextWarning = w
+}
+
+// ContextWarning returns the current over-limit advisory, or nil if none.
+func (s *PipelineSession) ContextWarning() *ContextWarning {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.contextWarning
+}
