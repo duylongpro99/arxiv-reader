@@ -24,7 +24,11 @@ services:
       # Bound to loopback only — this is a single-user local tool, never exposed.
       - "127.0.0.1:5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PG 18+ images set PGDATA=/var/lib/postgresql/18/docker and expect a
+      # single mount at /var/lib/postgresql (data lands in a version subdir).
+      # Mounting the old .../data path leaves the volume unused and trips the
+      # image's initdb safety check. See docker-library/postgres#37.
+      - pgdata:/var/lib/postgresql
     healthcheck:
       # pg_isready gates dependents until the server actually accepts connections.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arxiv} -d ${POSTGRES_DB:-arxiv_reader}"]
