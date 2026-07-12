@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -74,17 +75,11 @@ func Load(yamlPath string) (*Config, error) {
 	}
 
 	// 2. .env overrides. godotenv.Load loads .env into process env if present;
-	//    a missing .env is not fatal (real exported env vars still apply).
+	//    a missing .env is not fatal (real exported env vars still apply). Every
+	//    tunable is overridable so a deployment can retune without a rebuild.
 	_ = godotenv.Load()
-	cfg.LLM.APIKey = os.Getenv("LLM_API_KEY") // required; validated below
-	if v := os.Getenv("LLM_PROVIDER"); v != "" {
-		cfg.LLM.Provider = v
-	}
-	if v := os.Getenv("LLM_MODEL"); v != "" {
-		cfg.LLM.Model = v
-	}
-	if v := os.Getenv("OBSIDIAN_VAULT_PATH"); v != "" {
-		cfg.Paths.ObsidianVault = v
+	if err := cfg.applyEnvOverrides(); err != nil {
+		return nil, err
 	}
 
 	// 3. expand ~ BEFORE the absolute-path check (FIX #1): PRD defaults use ~,
@@ -97,6 +92,89 @@ func Load(yamlPath string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// applyEnvOverrides layers environment values on top of the config.yaml
+// defaults so every tunable can change per deployment without a rebuild. Names
+// follow SECTION_FIELD in screaming snake case (e.g. AGENT_FETCH_LIMIT); the
+// pre-existing LLM_*/OBSIDIAN_VAULT_PATH names are kept for compatibility. The
+// API key is override-only (never read from YAML). Malformed numeric values are
+// collected and returned as one fail-fast error rather than silently ignored.
+func (c *Config) applyEnvOverrides() error {
+	c.LLM.APIKey = os.Getenv("LLM_API_KEY") // required; validated below. Override-only.
+
+	var errs []string
+	// LLM
+	envStr("LLM_PROVIDER", &c.LLM.Provider)
+	envStr("LLM_MODEL", &c.LLM.Model)
+	envStr("LLM_BASE_URL", &c.LLM.BaseURL) // custom OpenAI-compatible endpoint/proxy
+	envInt("LLM_MAX_TOKENS", &c.LLM.MaxTokens, &errs)
+	envFloat32("LLM_TEMPERATURE", &c.LLM.Temperature, &errs)
+	envInt("LLM_REQUEST_TIMEOUT_SECONDS", &c.LLM.RequestTimeoutSec, &errs)
+	// Paths
+	envStr("OBSIDIAN_VAULT_PATH", &c.Paths.ObsidianVault)
+	envStr("LOG_FILE", &c.Paths.LogFile)
+	// Agent
+	envStr("AGENT_ARXIV_CATEGORY", &c.Agent.ArxivCategory)
+	envStr("AGENT_ARXIV_BASE_URL", &c.Agent.ArxivBaseURL)
+	envInt("AGENT_FETCH_LIMIT", &c.Agent.FetchLimit, &errs)
+	envInt("AGENT_DISPLAY_LIMIT", &c.Agent.DisplayLimit, &errs)
+	envStr("AGENT_USER_AGENT", &c.Agent.UserAgent)
+	envInt("AGENT_REQUEST_TIMEOUT_SECONDS", &c.Agent.RequestTimeoutSec, &errs)
+	envInt("AGENT_MIN_REQUEST_INTERVAL_SECONDS", &c.Agent.MinRequestIntervalSec, &errs)
+	envInt("AGENT_MAX_RETRIES", &c.Agent.MaxRetries, &errs)
+	envStr("AGENT_ARXIV_HTML_BASE_URL", &c.Agent.ArxivHTMLBaseURL)
+	envInt64("AGENT_MAX_CONTENT_BYTES", &c.Agent.MaxContentBytes, &errs)
+	envInt("AGENT_MAX_REVIEW_ITERATIONS", &c.Agent.MaxReviewIterations, &errs)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid environment override(s):\n  → %s", strings.Join(errs, "\n  → "))
+	}
+	return nil
+}
+
+// envStr overwrites *dst when key is set and non-empty. Empty/unset is a no-op,
+// so a blank env var never clobbers a meaningful YAML default.
+func envStr(key string, dst *string) {
+	if v := os.Getenv(key); v != "" {
+		*dst = v
+	}
+}
+
+// envInt / envInt64 / envFloat32 parse a numeric override; a malformed value
+// appends a keyed message to *errs (fail-fast) instead of falling back to the
+// YAML default, which would silently mask a deployment typo.
+func envInt(key string, dst *int, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid integer", key, v))
+			return
+		}
+		*dst = n
+	}
+}
+
+func envInt64(key string, dst *int64, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid integer", key, v))
+			return
+		}
+		*dst = n
+	}
+}
+
+func envFloat32(key string, dst *float32, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		f, err := strconv.ParseFloat(v, 32)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid number", key, v))
+			return
+		}
+		*dst = float32(f)
+	}
 }
 
 // expandHome replaces a leading ~ (only "~" or "~/…") with $HOME, mirroring
