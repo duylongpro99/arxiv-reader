@@ -2,8 +2,9 @@
 plan: phase-07-run-timeline-tracing
 title: "Phase 7 — Run Timeline Tracing"
 project: ArXiv AI Paper Explainer Agent
-status: pending
+status: complete
 created: 2026-07-12
+completed: 2026-07-12
 owner: long.dao@maritime-ds.com
 source_design: docs/superpowers/specs/2026-07-12-run-timeline-tracing-design.md
 blockedBy: []
@@ -35,12 +36,12 @@ Design source of truth: `docs/superpowers/specs/2026-07-12-run-timeline-tracing-
 
 | Phase | Title | Status | Depends on |
 |-------|-------|--------|-----------|
-| 01 | [Data Store Foundation](phase-01-data-store-foundation.md) — Postgres, compose, migration, `internal/store`, config | pending | — |
-| 02 | [Tracing Core](phase-02-tracing-core.md) — `internal/tracing`: event model, Recorder, ring buffer, broker, scrubber | pending | 01 |
-| 03 | [Orchestrator Instrumentation](phase-03-orchestrator-instrumentation.md) — emit events across the pipeline | pending | 02 |
-| 04 | [Transport — SSE + REST](phase-04-transport-sse-rest.md) — `/runs/:id/events`, `/runs`, `/runs/:id`, Next proxies | pending | 03 |
-| 05 | [Frontend — Timeline + History](phase-05-frontend-timeline-history.md) — `<RunTimeline>`, `/runs` page, hooks | pending | 04 |
-| 06 | [Wiring, E2E & Docs](phase-06-wiring-e2e-docs.md) — integration test, arch/changelog docs, manual E2E | pending | 05 |
+| 01 | [Data Store Foundation](phase-01-data-store-foundation.md) — Postgres, compose, migration, `internal/store`, config | ✅ complete | — |
+| 02 | [Tracing Core](phase-02-tracing-core.md) — `internal/tracing`: event model, Recorder, ring buffer, broker, scrubber | ✅ complete | 01 |
+| 03 | [Orchestrator Instrumentation](phase-03-orchestrator-instrumentation.md) — emit events across the pipeline | ✅ complete | 02 |
+| 04 | [Transport — SSE + REST](phase-04-transport-sse-rest.md) — `/runs/:id/events`, `/runs`, `/runs/:id`, Next proxies | ✅ complete | 03 |
+| 05 | [Frontend — Timeline + History](phase-05-frontend-timeline-history.md) — `<RunTimeline>`, `/runs` page, hooks | ✅ complete | 04 |
+| 06 | [Wiring, E2E & Docs](phase-06-wiring-e2e-docs.md) — integration test, arch/changelog docs, manual E2E | ✅ complete | 05 |
 
 ## Key Dependencies
 

@@ -7,7 +7,7 @@
 
 ## Overview
 - **Priority:** Medium
-- **Status:** pending
+- **Status:** ✅ complete
 - Prove the whole path end-to-end, then bring the project docs up to date and record the manual
   cross-run validation. This is the "make it real and documented" phase — no new product surface.
 

@@ -7,7 +7,7 @@
 
 ## Overview
 - **Priority:** High (foundation for all later phases)
-- **Status:** pending
+- **Status:** ✅ complete
 - Stand up PostgreSQL in Docker, the user-run migration, the `internal/store` repository
   (pgx + plain SQL), and the config surface (`tracing` block + `DATABASE_URL`). Nothing emits
   events yet — this phase only makes durable storage *available* and *optional*.

@@ -7,7 +7,7 @@
 
 ## Overview
 - **Priority:** High
-- **Status:** pending
+- **Status:** ✅ complete
 - Wire the `Tracer` into the `Orchestrator` and emit the full event taxonomy from the existing
   emission points. Tools/agents stay untouched — the orchestrator already sees every input/output
   and every decision, so all `Emit` calls live here.

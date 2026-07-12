@@ -7,7 +7,7 @@
 
 ## Overview
 - **Priority:** High
-- **Status:** pending
+- **Status:** ✅ complete
 - Render the live, ordered timeline during a run via SSE, and a `/runs` history page to browse and
   reopen past runs. Augments (does not remove) the existing `ProgressIndicator`.
 

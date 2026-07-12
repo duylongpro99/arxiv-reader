@@ -7,7 +7,7 @@
 
 ## Overview
 - **Priority:** High
-- **Status:** pending
+- **Status:** ✅ complete
 - Expose the timeline: an SSE stream for live events (with `Last-Event-ID` replay) and two REST
   endpoints for the history list and a single reopened run. Add matching Next.js proxy routes for
   the REST endpoints; the browser connects the SSE stream directly to the backend.

@@ -7,7 +7,7 @@
 
 ## Overview
 - **Priority:** High
-- **Status:** pending
+- **Status:** ✅ complete
 - Build `internal/tracing`: the event model, the `Recorder` (dual-write: in-memory ring buffer +
   async Postgres), the per-run SSE `Broker`, and the secret `scrub`ber. This phase produces the
   seam the orchestrator will call in Phase 03. No orchestrator changes yet.

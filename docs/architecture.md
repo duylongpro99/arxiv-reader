@@ -63,18 +63,20 @@ User Trigger
 │  - Paper selection UI       │         │  - DiscoveryTool                 │
 │  - Progress display         │         │  - LogCheckTool                  │
 │  - Explainer preview        │         │  - PaperContentTool (HTML→MD)    │
-│                             │         │  - ExplainerAgent                │
-│                             │         │  - ReviewerAgent                 │
+│  - Run timeline UI          │         │  - ExplainerAgent                │
+│  - Runs history list        │         │  - ReviewerAgent                 │
 │                             │         │  - VaultWriterTool               │
 │                             │         │  - LLM Client (text-only)        │
+│                             │         │  - RunRecorder (Phase 7)         │
+│                             │         │  - SSE Broker (Phase 7)          │
 └─────────────────────────────┘         └──────────────────────────────────┘
                                                         │
-                                    ┌───────────────────┼───────────────────┐
-                                    │                   │                   │
-                             ┌──────▼─────┐    ┌───────▼──────┐   ┌───────▼──────┐
-                             │ arXiv API  │    │  LLM Provider │   │Obsidian Vault│
-                             │ (external) │    │  (configured) │   │ (local disk) │
-                             └────────────┘    └──────────────┘   └──────────────┘
+                                    ┌───────────────────┼───────────────────┬────────────┐
+                                    │                   │                   │            │
+                             ┌──────▼─────┐    ┌───────▼──────┐   ┌───────▼──────┐  ┌──▼──────────┐
+                             │ arXiv API  │    │  LLM Provider │   │Obsidian Vault│  │ PostgreSQL  │
+                             │ (external) │    │  (configured) │   │ (local disk) │  │ (optional)  │
+                             └────────────┘    └──────────────┘   └──────────────┘  └─────────────┘
 ```
 
 ---
@@ -367,7 +369,58 @@ type CompletionResponse struct {
 
 ---
 
-### 10. Config
+### 10. Run Timeline Tracing (Phase 7)
+
+**Purpose:** Capture, stream, and persist a complete ordered timeline of all pipeline events per run. Enables live monitoring via SSE and historical playback.
+
+**Responsibilities:**
+- **Recorder**: Per-run monotonic event sequence with bounded in-memory ring buffer
+- **Event Broker**: Per-run non-blocking fan-out to multiple SSE subscribers
+- **Secret Scrubber**: Redacts API keys, key-shaped patterns, caps previews (no raw HTML/full markdown)
+- **Event Taxonomy**: Standardized event kinds across discovery, tool calls, LLM decisions, and completion
+- **Persistence**: Async serialization to PostgreSQL with degrade-safe store access
+- **Transport**: Server-Sent Events (SSE) with `Last-Event-ID` replay; REST endpoints for history and cross-restart reload
+
+**Event Taxonomy** (event_type field):
+```
+discovery.started, tool.discovery.completed, tool.logcheck.completed,
+selection.presented, selection.chosen,
+tool.papercontent.started/completed/failed,
+context.warning,
+llm.explainer.started/completed, llm.reviewer.started/completed,
+decision.revise/accept/max_iterations,
+tool.vaultwriter.completed,
+run.completed, run.failed, run.recovered_to_selection
+```
+
+**Interfaces:**
+
+```go
+type Recorder interface {
+    Emit(evt *Event)             // Enqueue event to buffer + async persist
+    Close()                       // Drain buffer, finalize run row
+}
+
+type Event struct {
+    Seq        int          // Monotonic per-run counter (0,1,2…)
+    EventType  string       // e.g. "selection.chosen"
+    Stage      string       // PipelineStage
+    Title      string       // Human one-liner
+    Status     string       // "info" | "success" | "warning" | "error"
+    Summary    JSONB        // Small structured fields (~500-char previews)
+    PayloadFull JSONB       // Nullable; opt-in full trace only
+    DurationMs *int        // Optional duration
+    CreatedAt  time.Time
+}
+```
+
+**Degradation:** Database unavailable → recorder operates in-memory only. Live SSE timeline works; history and cross-restart reload return 503. Pipeline completes normally, never fatal.
+
+**Dependencies:** `github.com/jackc/pgx/v5`, PostgreSQL (optional), config `tracing:` block
+
+---
+
+### 11. Config
 
 **Purpose:** Single source of truth for all runtime configuration.
 
@@ -402,6 +455,11 @@ paths:
 explainer:
   target_words: 2500                # soft target; agent may exceed for complex papers
   follow_up_link_arxiv: true        # attempt to extract arXiv IDs from references
+
+tracing:
+  enabled: true                     # master switch for the Recorder (Phase 7)
+  full_payloads: false              # opt-in: store full prompts/responses/markdown
+  buffer_size: 256                  # per-run in-memory ring capacity
 ```
 
 > **Path resolution:** `.env` value for `OBSIDIAN_VAULT_PATH` takes precedence over `config.yaml`. This keeps `config.yaml` version-control safe while allowing machine-specific paths in `.env`.
@@ -506,6 +564,41 @@ const (
 }
 ```
 
+### RunRecord (PostgreSQL — Phase 7, optional)
+```sql
+CREATE TABLE runs (
+    id            TEXT PRIMARY KEY,          -- existing session id
+    paper_id      TEXT,                      -- null until selection.chosen
+    paper_title   TEXT,
+    stage         TEXT NOT NULL,             -- last known stage
+    status        TEXT NOT NULL,             -- running | complete | failed | recovered
+    input_tokens  INT  NOT NULL DEFAULT 0,
+    output_tokens INT  NOT NULL DEFAULT 0,
+    est_cost_usd  NUMERIC(10,4),
+    review_passed BOOLEAN,
+    started_at    TIMESTAMPTZ NOT NULL,
+    completed_at  TIMESTAMPTZ
+);
+```
+
+### EventRecord (PostgreSQL — Phase 7, optional)
+```sql
+CREATE TABLE run_events (
+    run_id       TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    seq          INT  NOT NULL,             -- monotonic per run
+    event_type   TEXT NOT NULL,
+    stage        TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    status       TEXT NOT NULL,             -- info | success | warning | error
+    summary      JSONB,
+    payload_full JSONB,                     -- nullable; opt-in full trace only
+    duration_ms  INT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, seq)
+);
+CREATE INDEX idx_runs_started_at ON runs (started_at DESC);
+```
+
 ### Obsidian Note (Markdown output)
 ```markdown
 ---
@@ -560,6 +653,10 @@ tags: [ai, paper, explainer]
 | Obsidian Note | Markdown file | Obsidian vault folder | Permanent |
 | Paper Markdown | In-memory `string` | Go backend process (session) | Single run |
 | Config | YAML + `.env` | Project root | Permanent |
+| **Run Timeline (Phase 7)** | **JSONB rows** | **PostgreSQL (optional)** | **Permanent** |
+| **Run Header** | **RunRecord** | **PostgreSQL** | **Permanent** |
+| **Events** | **EventRecords** | **PostgreSQL** | **Permanent** |
+| **Live Events** | **Ring buffer** | **In-memory per run** | **Single run** |
 
 ---
 
@@ -729,11 +826,12 @@ On 404 (recoverable): candidates re-enabled, selection UI re-shown
 |---|---|---|
 | **Go** | 1.26.4 | Single binary, fast startup, excellent concurrency. No runtime to manage locally. |
 | **Google ADK Go** | `google.golang.org/adk` latest | Agent orchestration primitives — tool registration, session management, agent loop. Used for orchestration only, not model binding. |
-| **`net/http`** | stdlib | Expose HTTP endpoints to Next.js. No framework overhead needed for 3 routes. |
+| **`net/http`** | stdlib | Expose HTTP endpoints to Next.js. No framework overhead needed for routes. |
 | **`gopkg.in/yaml.v3`** | latest | Parse YAML config file. |
 | **`godotenv`** | latest | Load `.env` for API keys in local development. |
 | **`air`** | latest | Live reload for Go backend during development. |
 | **`html-to-markdown/v2`** | latest | Pure-Go HTML-to-Markdown conversion (no CGO, no external dependencies). Converts arXiv LaTeXML HTML to clean text. |
+| **`github.com/jackc/pgx/v5`** | latest | PostgreSQL driver (Phase 7); optional for run timeline tracing. |
 
 ### LLM Providers (configurable, text-capable required)
 
@@ -773,6 +871,7 @@ llm:
 | **Local filesystem** | Obsidian vault is a local folder. Direct file write is simplest and most reliable. |
 | **JSON file (processed log)** | Flat list of paper IDs needs no database. Human-readable and manually editable. |
 | **In-memory (session state)** | Transient data — pipeline session and paper Markdown exist only for duration of one run. |
+| **PostgreSQL 17 (Phase 7, optional)** | Run timeline tracing: durable history of events, cross-restart replay, live SSE fan-out. Gracefully degrades if unavailable. Docker Compose supplied. |
 
 ---
 

@@ -55,6 +55,28 @@ curl -s 127.0.0.1:8080/health
 
 Use `127.0.0.1`, not `localhost` — the backend binds the IPv4 loopback only.
 
+## Timeline & history (optional)
+
+Every run streams a live, ordered event timeline. To also keep a **durable
+history** you can reopen after a restart, stand up the local Postgres and apply
+the schema once (migrations are user-run):
+
+```sh
+docker compose up -d db
+psql "$DATABASE_URL" -f backend/migrations/0001_run_timeline.sql
+```
+
+Set `DATABASE_URL` in `.env` (see `.env.example`), or run `make db` then
+`make migrate-print` for the exact commands. Without a database, tracing runs
+**in-memory only** — the live timeline still works, but history and cross-restart
+reload are disabled. The paper pipeline never depends on the database.
+
+During a run, an ordered **live timeline** streams each step (paper selected →
+tool calls → LLM calls → decisions → result) below the progress indicator via
+Server-Sent Events. The **Run history** link (top-right) opens `/runs`, where you
+can browse past runs and reopen any one to replay its full timeline — persisted,
+so it survives a backend restart.
+
 ## Configuration
 
 | Source | Purpose |
