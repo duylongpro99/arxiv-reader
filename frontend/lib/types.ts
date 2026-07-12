@@ -82,3 +82,53 @@ export interface ResultResponse {
 export interface RetryResponse {
   session_id: string;
 }
+
+// --- Phase 7 run-timeline types (mirror the Go DTOs in orchestrator/dto.go) ---
+
+// Drives a timeline row's icon + color.
+export type EventStatus = "info" | "success" | "warning" | "error";
+
+// A run's durable lifecycle status.
+export type RunStatus = "running" | "complete" | "failed" | "recovered";
+
+// TimelineEvent is one ordered event. `type` is the event kind (e.g.
+// "selection.chosen"); `summary`/`payloadFull` are arbitrary structured objects
+// (already scrubbed server-side). Matches the Go EventDTO json tags.
+export interface TimelineEvent {
+  seq: number;
+  type: string;
+  stage: string;
+  title: string;
+  status: EventStatus;
+  summary?: Record<string, unknown>;
+  payloadFull?: Record<string, unknown>;
+  durationMs?: number;
+  createdAt: string; // ISO-8601
+}
+
+// RunSummary is a run's header for the history list + reopen views (Go RunDTO).
+export interface RunSummary {
+  id: string;
+  paperId?: string;
+  paperTitle?: string;
+  stage: string;
+  status: RunStatus;
+  inputTokens: number;
+  outputTokens: number;
+  estCostUsd?: number;
+  reviewPassed?: boolean;
+  startedAt: string; // ISO-8601
+  completedAt?: string; // ISO-8601
+}
+
+// Go RunsListResponse.
+export interface RunsList {
+  runs: RunSummary[];
+  total: number;
+}
+
+// Go RunDetailResponse — a reopened run's header + full timeline.
+export interface RunDetail {
+  run: RunSummary;
+  events: TimelineEvent[];
+}

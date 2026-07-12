@@ -9,11 +9,13 @@ import {
   selectPaper,
   triggerDiscovery,
 } from "@/lib/api";
+import { useEventSource } from "@/lib/use-event-source";
 import { CandidateList } from "./candidate-list";
 import { ContextWarningBanner } from "./context-warning";
 import { ErrorBanner } from "./error-banner";
 import { ProgressIndicator } from "./progress-indicator";
 import { ResultPanel } from "./result-panel";
+import { RunTimeline } from "./run-timeline";
 import { TriggerButton } from "./trigger-button";
 
 // DiscoveryPanel owns the discovery + selection flow: trigger -> poll -> pick ->
@@ -66,6 +68,11 @@ export function DiscoveryPanel() {
     },
     onError: () => trigger.mutate(),
   });
+
+  // Live run timeline (Phase 7): SSE stream straight from the backend, running
+  // alongside the existing status poll. Purely additive — the poll still drives
+  // the stage UI; the timeline tells the full story.
+  const { events, done, error: sseError } = useEventSource(sessionId);
 
   const { data: status } = useQuery({
     queryKey: ["status", sessionId],
@@ -127,6 +134,11 @@ export function DiscoveryPanel() {
 
       {sessionId && status && status.stage !== "failed" && (
         <ProgressIndicator status={status} />
+      )}
+
+      {/* Live, ordered event timeline for the current run (Phase 7). */}
+      {sessionId && events.length > 0 && (
+        <RunTimeline events={events} live={!done} error={sseError && !done} />
       )}
 
       {/* Non-blocking over-limit advisory (F4): the pipeline keeps running. */}
