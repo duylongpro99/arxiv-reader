@@ -1,17 +1,19 @@
 # config.yaml — committed defaults. Per-machine secrets/paths live in .env.
 # NOTE: yaml.v3 does NOT expand ${VARS}. The LLM API key comes ONLY from .env
 # (LLM_API_KEY) and MUST NOT appear here.
+# Every value below can be overridden by an env var (SECTION_FIELD, e.g.
+# AGENT_FETCH_LIMIT) so a deployment retunes without a rebuild — see .env.example.
 
 llm:
-  provider: anthropic          # anthropic | openai | gemini  (override: LLM_PROVIDER)
-  model: claude-sonnet-4-6     # provider-valid model string  (override: LLM_MODEL)
+  provider: openai           # anthropic | openai | gemini  (override: LLM_PROVIDER)
+  model: gcli/grok-4.5     # provider-valid model string  (override: LLM_MODEL)
   max_tokens: 4096             # per-completion output cap (> 0)
   temperature: 0.3             # sampling temperature (0..2)
   request_timeout_seconds: 120 # LLM calls are slow — larger budget than arXiv fetch
-  base_url: ""                 # optional custom endpoint/proxy; "" = provider default
+  base_url: "http://localhost:20128/v1"                 # optional custom endpoint/proxy; "" = provider default (override: LLM_BASE_URL)
 
 paths:
-  obsidian_vault: ~/obsidian/arxiv-papers    # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
+  obsidian_vault: ~/obsidian/cris/arxiv    # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
   log_file: ~/.arxiv-agent/processed.json    # ~ expanded to $HOME at load; JSON content, .json extension
 
 # Phase 2 discovery pipeline. arXiv params live here so tuning stays out of code
@@ -28,3 +30,11 @@ agent:
   arxiv_html_base_url: https://arxiv.org/html   # LaTeXML HTML rendering base (Phase 3)
   max_content_bytes: 52428800        # 50MB cap on fetched HTML (io.LimitReader OOM guard)
   max_review_iterations: 2           # Phase 5 critic→revision rounds/paper (0 disables reviewer; ~200k tok/paper at 2)
+
+# Phase 7 run-timeline tracing. Additive + optional: with no DATABASE_URL (see
+# .env / .env.example) tracing degrades to in-memory only — live SSE still works,
+# history + cross-restart reload are disabled. Never breaks the paper pipeline.
+tracing:
+  enabled: true          # master switch for the Recorder (override: TRACING_ENABLED)
+  full_payloads: false   # opt-in: persist full prompts/responses/markdown (override: TRACING_FULL_PAYLOADS)
+  buffer_size: 256       # per-run in-memory ring capacity feeding SSE replay; > 0 when enabled
