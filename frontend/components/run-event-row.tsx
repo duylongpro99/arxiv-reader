@@ -2,14 +2,26 @@
 
 import { useState } from "react";
 import type { EventStatus, TimelineEvent } from "@/lib/types";
+import {
+  AlertTriangleIcon,
+  CheckCircleIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  DotIcon,
+  XIcon,
+} from "./icons";
 
-// Per-status icon + color. Icons are decorative (aria-hidden); the status is
-// conveyed in text via the row title, so screen readers are not left out.
-const STATUS_STYLE: Record<EventStatus, { icon: string; className: string }> = {
-  info: { icon: "●", className: "text-blue-500 dark:text-blue-400" },
-  success: { icon: "✓", className: "text-green-600 dark:text-green-400" },
-  warning: { icon: "▲", className: "text-amber-600 dark:text-amber-400" },
-  error: { icon: "✕", className: "text-red-600 dark:text-red-400" },
+// Per-status glyph + semantic color token. Icons are decorative (aria-hidden);
+// the status is conveyed in the row title text, so screen readers aren't left out
+// and color is never the sole signal.
+const STATUS_STYLE: Record<
+  EventStatus,
+  { Icon: (p: { className?: string }) => React.ReactNode; color: string }
+> = {
+  info: { Icon: DotIcon, color: "text-info" },
+  success: { Icon: CheckCircleIcon, color: "text-ok" },
+  warning: { Icon: AlertTriangleIcon, color: "text-warn" },
+  error: { Icon: XIcon, color: "text-err" },
 };
 
 // formatDuration renders durationMs compactly: 620ms, 1.2s, 1m47s.
@@ -36,42 +48,57 @@ function hasDetail(evt: TimelineEvent): boolean {
   );
 }
 
-export function RunEventRow({ event }: { event: TimelineEvent }) {
+// `active` marks the currently-running (last live) row so it gets the accent glow.
+export function RunEventRow({
+  event,
+  active = false,
+}: {
+  event: TimelineEvent;
+  active?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const style = STATUS_STYLE[event.status] ?? STATUS_STYLE.info;
   const expandable = hasDetail(event);
+  const { Icon } = style;
 
   return (
-    <li className="border-b border-gray-100 py-2 last:border-0 dark:border-gray-800">
-      <div className="flex items-baseline gap-3">
-        <span className={`select-none font-mono text-sm ${style.className}`} aria-hidden>
-          {style.icon}
-        </span>
-        <div className="min-w-0 flex-1">
-          {expandable ? (
-            <button
-              type="button"
-              onClick={() => setOpen((o) => !o)}
-              aria-expanded={open}
-              className="text-left text-sm text-gray-800 hover:underline dark:text-gray-100"
-            >
-              {event.title}
-              <span className="ml-1 text-xs text-gray-400" aria-hidden>
-                {open ? "▾" : "▸"}
-              </span>
-            </button>
-          ) : (
-            <span className="text-sm text-gray-800 dark:text-gray-100">{event.title}</span>
-          )}
-          {open && expandable && <EventDetail event={event} />}
-        </div>
-        <span className="shrink-0 font-mono text-xs text-gray-400">
-          {event.durationMs != null && (
-            <span className="mr-2">{formatDuration(event.durationMs)}</span>
-          )}
-          {formatClock(event.createdAt)}
-        </span>
+    <li className="ev-in relative flex gap-3 pb-4 last:pb-0">
+      {/* Rail glyph — sits on the connector line drawn by the parent <ol>. */}
+      <span
+        className={`relative z-10 mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-full border border-line bg-surface ${style.color} ${
+          active ? "run-glow border-accent" : ""
+        }`}
+      >
+        <Icon className="h-3.5 w-3.5" />
+      </span>
+
+      <div className="min-w-0 flex-1 pt-0.5">
+        {expandable ? (
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            className="flex cursor-pointer items-center gap-1 text-left text-sm text-ink transition-colors hover:text-accent"
+          >
+            {event.title}
+            {open ? (
+              <ChevronDownIcon className="h-3.5 w-3.5 text-muted" />
+            ) : (
+              <ChevronRightIcon className="h-3.5 w-3.5 text-muted" />
+            )}
+          </button>
+        ) : (
+          <span className="text-sm text-ink">{event.title}</span>
+        )}
+        {open && expandable && <EventDetail event={event} />}
       </div>
+
+      <span className="shrink-0 pt-0.5 text-right font-mono text-xs text-muted tabular-nums">
+        {event.durationMs != null && (
+          <span className="mr-2 text-accent">{formatDuration(event.durationMs)}</span>
+        )}
+        {formatClock(event.createdAt)}
+      </span>
     </li>
   );
 }
@@ -89,15 +116,15 @@ function EventDetail({ event }: { event: TimelineEvent }) {
 
 function DetailBlock({ label, data }: { label: string; data: Record<string, unknown> }) {
   return (
-    <div className="rounded-md bg-gray-50 p-2 dark:bg-gray-800/60">
-      <p className="mb-1 text-xs font-medium text-gray-500 dark:text-gray-400">{label}</p>
+    <div className="rounded-md border border-line bg-card p-2.5">
+      <p className="mb-1.5 font-mono text-[11px] font-medium uppercase tracking-wide text-muted">
+        {label}
+      </p>
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         {Object.entries(data).map(([k, v]) => (
           <div key={k} className="col-span-2 grid grid-cols-subgrid">
-            <dt className="font-mono text-gray-500 dark:text-gray-400">{k}</dt>
-            <dd className="break-words font-mono text-gray-700 dark:text-gray-300">
-              {formatValue(v)}
-            </dd>
+            <dt className="font-mono text-muted">{k}</dt>
+            <dd className="break-words font-mono text-ink/85">{formatValue(v)}</dd>
           </div>
         ))}
       </dl>

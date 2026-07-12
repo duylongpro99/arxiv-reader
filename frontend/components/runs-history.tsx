@@ -6,10 +6,10 @@ import { HistoryUnavailableError, useRuns } from "@/lib/use-runs";
 
 // Outcome badge color per run status.
 const STATUS_BADGE: Record<RunStatus, string> = {
-  complete: "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300",
-  failed: "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300",
-  running: "bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300",
-  recovered: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
+  complete: "border border-ok/30 bg-ok-bg text-ok",
+  failed: "border border-err/30 bg-err-bg text-err",
+  running: "border border-accent/30 bg-accent-bg text-accent",
+  recovered: "border border-warn/30 bg-warn-bg text-warn",
 };
 
 function formatDate(iso: string): string {
@@ -22,24 +22,28 @@ export function RunsHistory() {
   const { data, isLoading, error } = useRuns();
 
   if (isLoading) {
-    return <p className="text-sm text-gray-500">Loading run history…</p>;
+    return <p className="font-mono text-sm text-muted">Loading run history…</p>;
   }
   if (error instanceof HistoryUnavailableError) {
     return (
-      <p className="rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+      <p className="rounded-xl border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
         {error.message}
       </p>
     );
   }
   if (error) {
     return (
-      <p className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-800 dark:bg-red-950 dark:text-red-200">
+      <p className="rounded-xl border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
         Could not load run history. Is the backend running?
       </p>
     );
   }
   if (!data || data.runs.length === 0) {
-    return <p className="text-sm text-gray-500">No runs yet. Trigger a discovery to get started.</p>;
+    return (
+      <p className="rounded-xl border border-dashed border-line px-4 py-8 text-center text-sm text-muted">
+        No runs yet. Trigger a discovery to get started.
+      </p>
+    );
   }
 
   return (
@@ -58,21 +62,21 @@ function RunRow({ run }: { run: RunSummary }) {
   return (
     <Link
       href={`/runs/${run.id}`}
-      className="flex items-center justify-between gap-4 rounded-lg border border-gray-200 bg-white px-4 py-3 hover:border-gray-300 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:hover:bg-gray-800"
+      className="group flex items-center justify-between gap-4 rounded-xl border border-line bg-surface px-4 py-3 transition-all hover:border-accent hover:shadow-sm"
     >
       <div className="min-w-0">
-        <p className="truncate text-sm font-medium text-gray-800 dark:text-gray-100">
+        <p className="truncate text-sm font-medium text-ink group-hover:text-accent">
           {run.paperTitle || run.paperId || "(no paper selected)"}
         </p>
-        <p className="text-xs text-gray-400">{formatDate(run.startedAt)}</p>
+        <p className="mt-0.5 font-mono text-xs text-muted">{formatDate(run.startedAt)}</p>
       </div>
       <div className="flex shrink-0 items-center gap-3">
         {run.estCostUsd != null && (
-          <span className="font-mono text-xs text-gray-500 dark:text-gray-400">
+          <span className="font-mono text-xs text-muted tabular-nums">
             ~${run.estCostUsd.toFixed(2)}
           </span>
         )}
-        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${badge}`}>
+        <span className={`rounded-full px-2.5 py-0.5 font-mono text-xs font-medium ${badge}`}>
           {run.status}
         </span>
       </div>

@@ -1,26 +1,127 @@
 @import "tailwindcss";
 
+/*
+ * Semantic token layer. Every color decision lives here as a CSS custom property
+ * and switches under prefers-color-scheme, so components reference semantic
+ * utilities (bg-surface, text-ink, text-accent, …) instead of raw hex or
+ * hand-written dark: pairs. Light and dark are designed as true equals.
+ */
+
+/* LIGHT — calm warm-paper reader + crisp instrument */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --base: #fbfbfa;              /* app background (slightly warm) */
+  --surface: #ffffff;           /* raised panels, cards */
+  --card: #f5f5f4;              /* inset blocks, code, detail wells */
+  --line: #e7e5e4;             /* hairline borders/dividers */
+  --ink: #1a1a19;              /* primary text */
+  --muted: #6b6b68;            /* secondary text/meta */
+
+  --accent: #4f46e5;           /* links, selected, focus ring (indigo-600) */
+  --accent-solid: #4f46e5;     /* solid primary button bg */
+  --accent-solid-hover: #4338ca;
+  --on-accent: #ffffff;        /* text on solid accent */
+  --accent-bg: #eef2ff;        /* tinted accent surface */
+
+  /* Trace / status semantics (also used by the run timeline) */
+  --ok: #15803d;   --ok-bg: #f0fdf4;
+  --warn: #b45309; --warn-bg: #fffbeb;
+  --err: #b91c1c;  --err-bg: #fef2f2;
+  --info: #2563eb;
+  --tool: #0891b2;
 }
 
+/* DARK (default when the OS asks for it) — near-black instrument */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --base: #0a0a0b;
+    --surface: #111214;
+    --card: #16181b;
+    --line: #26282c;
+    --ink: #ececec;
+    --muted: #9ba1a8;
+
+    --accent: #a5b0ff;           /* lighter for contrast on dark */
+    --accent-solid: #4f46e5;
+    --accent-solid-hover: #6366f1;
+    --on-accent: #ffffff;
+    --accent-bg: rgba(129, 140, 248, 0.1);
+
+    --ok: #34d399;   --ok-bg: rgba(52, 211, 153, 0.09);
+    --warn: #fbbf24; --warn-bg: rgba(251, 191, 36, 0.09);
+    --err: #f87171;  --err-bg: rgba(248, 113, 113, 0.09);
+    --info: #60a5fa;
+    --tool: #22d3ee;
+  }
+}
+
+/* Expose tokens as Tailwind color/font utilities. `inline` keeps them as var()
+ * references so they stay reactive to the media query above. */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-base: var(--base);
+  --color-surface: var(--surface);
+  --color-card: var(--card);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-solid: var(--accent-solid);
+  --color-accent-solid-hover: var(--accent-solid-hover);
+  --color-on-accent: var(--on-accent);
+  --color-accent-bg: var(--accent-bg);
+  --color-ok: var(--ok);
+  --color-ok-bg: var(--ok-bg);
+  --color-warn: var(--warn);
+  --color-warn-bg: var(--warn-bg);
+  --color-err: var(--err);
+  --color-err-bg: var(--err-bg);
+  --color-info: var(--info);
+  --color-tool: var(--tool);
+
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+body {
+  background: var(--base);
+  color: var(--ink);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  /* Subtle instrument texture: a faint radial wash, invisible but for depth. */
+  background-image: radial-gradient(
+    120% 80% at 50% -10%,
+    color-mix(in srgb, var(--accent) 6%, transparent),
+    transparent 60%
+  );
+  background-attachment: fixed;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* Consistent, accessible keyboard focus in the accent color everywhere. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Timeline row entrance — plays once when a row mounts (live or history). */
+@keyframes ev-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.ev-in { animation: ev-in 240ms ease-out both; }
+
+/* Soft glow ring for the active/running trace row. */
+@keyframes run-glow {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 35%, transparent); }
+  50%      { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 12%, transparent); }
+}
+.run-glow { animation: run-glow 1.8s ease-in-out infinite; }
+
+/* Honor reduced-motion: no entrance, no pulse, no glow, no transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

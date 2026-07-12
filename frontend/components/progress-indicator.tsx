@@ -1,6 +1,7 @@
 "use client";
 
 import type { PipelineStatus } from "@/lib/types";
+import { SpinnerIcon } from "./icons";
 
 // STAGE_LABEL maps a static pipeline stage to a user-facing message. Filtering the
 // local log is instantaneous, so there is no separate "Filtering…" stage — the
@@ -50,14 +51,13 @@ export function ProgressIndicator({ status }: { status: PipelineStatus }) {
   // stages (awaiting a pick, and complete) show none.
   const showSpinner = status.stage !== "selection" && status.stage !== "complete";
   return (
-    <div className="flex items-center gap-3 text-sm text-gray-600 dark:text-gray-300">
-      {showSpinner && (
-        <span
-          className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600"
-          aria-hidden
-        />
+    <div className="flex items-center gap-2.5 rounded-lg border border-line bg-surface px-4 py-2.5 text-sm text-ink">
+      {showSpinner ? (
+        <SpinnerIcon className="h-4 w-4 shrink-0 animate-spin text-accent" />
+      ) : (
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok" aria-hidden />
       )}
-      <span>{label}</span>
+      <span className="font-mono text-[13px]">{label}</span>
     </div>
   );
 }

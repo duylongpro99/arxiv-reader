@@ -1,6 +1,7 @@
 "use client";
 
 import type { ResultResponse } from "@/lib/types";
+import { CheckCircleIcon } from "./icons";
 import { MarkdownPreview } from "./markdown-preview";
 
 // ResultPanel is the terminal success view: a banner with the vault path, the
@@ -8,10 +9,12 @@ import { MarkdownPreview } from "./markdown-preview";
 // when the pipeline stage is "complete".
 export function ResultPanel({ result }: { result: ResultResponse }) {
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-5">
       <SuccessBanner vaultFile={result.vaultFile} />
       <TokenUsage result={result} />
-      <div className="rounded-lg border border-gray-200 bg-white p-5 dark:border-gray-700 dark:bg-gray-900">
+      {/* Reader surface: distinct from the instrument chrome — calm, high
+          contrast, generous measure. */}
+      <div className="rounded-xl border border-line bg-surface p-6 sm:p-8">
         <MarkdownPreview content={result.content} />
       </div>
     </div>
@@ -20,15 +23,13 @@ export function ResultPanel({ result }: { result: ResultResponse }) {
 
 function SuccessBanner({ vaultFile }: { vaultFile: string }) {
   return (
-    <div className="rounded-lg border border-green-300 bg-green-50 p-4 dark:border-green-800 dark:bg-green-950">
-      <div className="flex items-center gap-2 font-semibold text-green-800 dark:text-green-300">
-        <span aria-hidden>✓</span>
+    <div className="rounded-xl border border-ok/30 bg-ok-bg p-4">
+      <div className="flex items-center gap-2 font-semibold text-ok">
+        <CheckCircleIcon className="h-5 w-5 shrink-0" />
         <span>Explainer saved to your vault</span>
       </div>
-      <p className="mt-1 break-all font-mono text-xs text-green-700 dark:text-green-400">
-        {vaultFile}
-      </p>
-      <p className="mt-2 text-xs text-green-700 dark:text-green-400">
+      <p className="mt-2 break-all font-mono text-xs text-ink/80">{vaultFile}</p>
+      <p className="mt-1.5 text-xs text-muted">
         Open it in Obsidian to read the full note.
       </p>
     </div>
@@ -42,19 +43,19 @@ function TokenUsage({ result }: { result: ResultResponse }) {
   const showCost =
     result.costKnown && typeof result.estimatedCostUSD === "number";
   return (
-    <div className="text-sm text-gray-600 dark:text-gray-400">
-      Token usage:{" "}
-      <span className="font-mono font-medium text-gray-800 dark:text-gray-200">
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted">
+      <span>Token usage:</span>
+      <span className="font-mono font-medium text-ink tabular-nums">
         {result.tokensUsed.toLocaleString()}
       </span>
       {showCost && (
         <>
-          {" · "}
-          <span className="font-mono font-medium text-gray-800 dark:text-gray-200">
+          <span aria-hidden>·</span>
+          <span className="font-mono font-medium text-ink tabular-nums">
             ~${result.estimatedCostUSD!.toFixed(3)}
-          </span>{" "}
-          estimated{" "}
-          <span className="text-xs text-gray-500 dark:text-gray-500">
+          </span>
+          <span>estimated</span>
+          <span className="text-xs text-muted/80">
             (approximate — check your provider dashboard)
           </span>
         </>

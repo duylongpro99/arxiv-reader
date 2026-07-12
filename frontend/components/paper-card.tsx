@@ -1,6 +1,7 @@
 "use client";
 
 import type { Paper } from "@/lib/types";
+import { CheckIcon } from "./icons";
 
 // abstractSnippet trims the abstract to the first 300 chars + ellipsis (PRD F4).
 function abstractSnippet(abstract: string): string {
@@ -33,32 +34,43 @@ export function PaperCard({
   selected?: boolean;
 }) {
   return (
-    <article className="rounded-xl border border-gray-200 p-5 dark:border-gray-700">
+    <article
+      className={`group rounded-xl border bg-surface p-5 transition-all ${
+        selected
+          ? "border-accent ring-1 ring-accent"
+          : disabled
+            ? "border-line opacity-55"
+            : "border-line hover:border-accent hover:shadow-sm"
+      }`}
+    >
       <div className="mb-2 flex items-start justify-between gap-4">
-        <h3 className="text-lg font-semibold leading-snug">{paper.title}</h3>
-        <span className="shrink-0 rounded-md bg-gray-100 px-2 py-1 font-mono text-xs text-gray-600 dark:bg-gray-800 dark:text-gray-300">
+        <h3 className="text-base font-semibold leading-snug text-ink">
+          {paper.title}
+        </h3>
+        <span className="shrink-0 rounded-md bg-card px-2 py-1 font-mono text-xs text-muted">
           {paper.id}
         </span>
       </div>
-      <p className="mb-3 text-sm text-gray-500 dark:text-gray-400">
-        {paper.authors.join(", ")}
-      </p>
-      <p className="mb-4 text-sm leading-relaxed text-gray-700 dark:text-gray-300">
+      <p className="mb-3 text-sm text-muted">{paper.authors.join(", ")}</p>
+      <p className="mb-4 text-sm leading-relaxed text-ink/85">
         {abstractSnippet(paper.abstract)}
       </p>
       <div className="flex items-center justify-between">
-        <time className="text-xs text-gray-400">{formatDate(paper.published)}</time>
+        <time className="font-mono text-xs text-muted">
+          {formatDate(paper.published)}
+        </time>
         <button
           onClick={() => onSelect?.(paper.id)}
           disabled={disabled || selected}
           className={
             selected
-              ? "rounded-md border border-blue-600 bg-blue-600 px-3 py-1.5 text-sm text-white"
+              ? "inline-flex items-center gap-1.5 rounded-md bg-accent-solid px-3 py-1.5 text-sm font-medium text-on-accent"
               : disabled
-                ? "cursor-not-allowed rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-400 dark:border-gray-600"
-                : "rounded-md border border-blue-600 px-3 py-1.5 text-sm text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950"
+                ? "cursor-not-allowed rounded-md border border-line px-3 py-1.5 text-sm text-muted"
+                : "cursor-pointer rounded-md border border-accent px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:bg-accent-bg"
           }
         >
+          {selected && <CheckIcon className="h-4 w-4" />}
           {selected ? "Selected" : "Select"}
         </button>
       </div>

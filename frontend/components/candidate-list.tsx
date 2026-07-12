@@ -19,12 +19,12 @@ export function CandidateList({
   return (
     <section className="flex flex-col gap-4">
       {notice && (
-        <p className="rounded-lg bg-amber-50 px-4 py-2 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+        <p className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn">
           {notice}
         </p>
       )}
       {candidates.length === 0 ? (
-        <p className="text-sm text-gray-500">
+        <p className="rounded-xl border border-dashed border-line px-4 py-8 text-center text-sm text-muted">
           No new papers right now. Try again later.
         </p>
       ) : (

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { RunTimeline } from "@/components/run-timeline";
+import { ArrowLeftIcon } from "@/components/icons";
 import type { RunSummary, TimelineEvent } from "@/lib/types";
 import { HistoryUnavailableError, useRun } from "@/lib/use-runs";
 
@@ -14,25 +15,38 @@ export default function RunDetailPage() {
   const { data, isLoading, error } = useRun(id);
 
   return (
-    <main className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-12">
-      <header className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Run detail</h1>
+    <main className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 pb-16">
+      <header className="sticky top-0 z-20 -mx-6 flex items-center justify-between gap-4 border-b border-line bg-base/80 px-6 py-4 backdrop-blur">
+        <Link href="/" className="flex items-center gap-2.5">
+          <span
+            className="grid h-6 w-6 place-items-center rounded-md bg-accent-solid text-[11px] font-bold text-on-accent"
+            aria-hidden
+          >
+            aX
+          </span>
+          <span className="font-mono text-sm font-medium tracking-tight text-ink">
+            arxiv<span className="text-muted">/</span>explainer
+          </span>
+        </Link>
         <Link
           href="/runs"
-          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
+          className="flex shrink-0 items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-xs font-medium text-muted transition-colors hover:border-accent hover:text-ink"
         >
-          ← All runs
+          <ArrowLeftIcon className="h-3.5 w-3.5" />
+          All runs
         </Link>
       </header>
 
-      {isLoading && <p className="text-sm text-gray-500">Loading run…</p>}
+      <h1 className="text-2xl font-semibold tracking-tight text-ink">Run detail</h1>
+
+      {isLoading && <p className="font-mono text-sm text-muted">Loading run…</p>}
       {error instanceof HistoryUnavailableError && (
-        <p className="rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+        <p className="rounded-xl border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
           {error.message}
         </p>
       )}
       {error && !(error instanceof HistoryUnavailableError) && (
-        <p className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-800 dark:bg-red-950 dark:text-red-200">
+        <p className="rounded-xl border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error.message}
         </p>
       )}
@@ -58,11 +72,11 @@ function RunHeaderPanel({ run, events }: { run: RunSummary; events: TimelineEven
   const path = vaultPath(events);
   const totalTokens = run.inputTokens + run.outputTokens;
   return (
-    <div className="rounded-lg border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900">
-      <p className="text-base font-semibold text-gray-800 dark:text-gray-100">
+    <div className="rounded-xl border border-line bg-surface p-5">
+      <p className="text-base font-semibold text-ink">
         {run.paperTitle || run.paperId || "(no paper selected)"}
       </p>
-      <dl className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1 text-sm text-gray-600 dark:text-gray-400 sm:grid-cols-3">
+      <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
         <Stat label="Status" value={run.status} />
         <Stat label="Tokens" value={totalTokens.toLocaleString()} />
         {run.estCostUsd != null && <Stat label="Est. cost" value={`~$${run.estCostUsd.toFixed(3)}`} />}
@@ -71,7 +85,7 @@ function RunHeaderPanel({ run, events }: { run: RunSummary; events: TimelineEven
         )}
       </dl>
       {path && (
-        <p className="mt-3 break-all font-mono text-xs text-gray-500 dark:text-gray-400">
+        <p className="mt-4 break-all border-t border-line pt-3 font-mono text-xs text-muted">
           Saved to: {path}
         </p>
       )}
@@ -82,8 +96,8 @@ function RunHeaderPanel({ run, events }: { run: RunSummary; events: TimelineEven
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div>
-      <dt className="text-xs text-gray-400">{label}</dt>
-      <dd className="font-medium text-gray-700 dark:text-gray-200">{value}</dd>
+      <dt className="font-mono text-[11px] uppercase tracking-wide text-muted">{label}</dt>
+      <dd className="mt-0.5 font-mono text-sm font-medium text-ink tabular-nums">{value}</dd>
     </div>
   );
 }
