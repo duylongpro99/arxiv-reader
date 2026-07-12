@@ -6,16 +6,25 @@ import (
 )
 
 func TestScrubRedactsLiteralAndPatterns(t *testing.T) {
+	// Provider-key-shaped strings are ASSEMBLED at runtime, never written as
+	// literals: a literal `AIza…`/`sk-…` value trips GitHub secret scanning even
+	// though it's fake. The assembled runtime values still match the scrubber's
+	// patterns (that's what this test asserts).
+	openaiKey := "sk-" + strings.Repeat("a", 24)            // sk-[…]{16,}
+	anthropicKey := "sk-ant-" + strings.Repeat("b", 24)     // sk-ant-[…]{16,}
+	googleKey := "AIza" + strings.Repeat("c", 32)           // AIza[…]{20,}
+	bearerToken := "Bearer " + strings.Repeat("d", 40)      // bearer\s+[…]{16,}
+
 	s := newScrubber("super-secret-api-key-value")
 	in := map[string]any{
-		"literal": "the key is super-secret-api-key-value here",
-		"openai":  "Authorization uses sk-abcdefghijklmnop1234567890",
-		"anthropic": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
-		"google":  "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456",
-		"bearer":  "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
-		"kv":      "api_key=abc123def456ghi789",
-		"safe":    "this is a normal summary line",
-		"count":   42,
+		"literal":   "the key is super-secret-api-key-value here",
+		"openai":    "Authorization uses " + openaiKey,
+		"anthropic": anthropicKey,
+		"google":    googleKey,
+		"bearer":    bearerToken,
+		"kv":        "api_key=abc123def456ghi789",
+		"safe":      "this is a normal summary line",
+		"count":     42,
 	}
 	out := s.scrubMap(in)
 	for _, k := range []string{"literal", "openai", "anthropic", "google", "bearer", "kv"} {
@@ -51,9 +60,10 @@ func TestScrubRedactsBeforeTruncating(t *testing.T) {
 	// A secret sitting past previewCap must still be redacted — truncation must
 	// not be an escape hatch. Redaction runs first, so the tail secret is gone.
 	s := newScrubber()
-	str := strings.Repeat("a", previewCap+10) + " sk-abcdefghijklmnop1234567890"
+	secret := "sk-" + strings.Repeat("z", 24) // assembled, not a literal (scanner-safe)
+	str := strings.Repeat("a", previewCap+10) + " " + secret
 	got := s.scrubString(str)
-	if strings.Contains(got, "sk-abcdefghijklmnop1234567890") {
+	if strings.Contains(got, secret) {
 		t.Error("secret past the preview cap leaked through truncation")
 	}
 }
