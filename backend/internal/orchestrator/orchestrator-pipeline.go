@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
+	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
 // systemPromptTokenAllowance is a rough, conservative allowance (in tokens) for
@@ -38,8 +41,13 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 		}
 	}()
 
+	// Timeline: discovery began (covers both a fresh run and a discovery retry).
+	o.rec(session).Emit(tev(tracing.KindDiscoveryStarted, tracing.StatusInfo, models.StageDiscovery,
+		fmt.Sprintf("Discovery triggered (%s)", o.cfg.Agent.ArxivCategory)))
+
 	// Surface arXiv retry attempts as a progress counter (F5). On success we reset
 	// it to 0 below so the "Connecting to arXiv (retry n/3)…" label disappears.
+	fetchStart := time.Now()
 	papers, err := o.disco.FetchPapers(ctx, func(attempt int) {
 		session.SetArxivRetryCount(attempt)
 	})
@@ -52,6 +60,12 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 	}
 	session.SetArxivRetryCount(0) // fetch succeeded — clear any retry label
 
+	fetched := tev(tracing.KindToolDiscoveryCompleted, tracing.StatusSuccess, models.StageDiscovery,
+		fmt.Sprintf("Fetched %d papers from arXiv", len(papers)))
+	fetched.Summary = map[string]any{"count": len(papers), "category": o.cfg.Agent.ArxivCategory}
+	fetched.DurationMS = tracing.MS(time.Since(fetchStart))
+	o.rec(session).Emit(fetched)
+
 	unprocessed, err := o.logCheck.FilterUnprocessed(papers)
 	if err != nil {
 		msg, recoverable, action := describeError(err)
@@ -60,6 +74,11 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 		o.logFailure(session, err)
 		return
 	}
+	// filtered = already-processed papers dropped by the dedup log.
+	logcheck := tev(tracing.KindToolLogcheckCompleted, tracing.StatusInfo, models.StageDiscovery,
+		fmt.Sprintf("%d new after filtering %d processed", len(unprocessed), len(papers)-len(unprocessed)))
+	logcheck.Summary = map[string]any{"candidates": len(unprocessed), "filtered": len(papers) - len(unprocessed)}
+	o.rec(session).Emit(logcheck)
 
 	// Cap to the display limit; note when we have fewer than requested.
 	limit := o.cfg.Agent.DisplayLimit
@@ -73,6 +92,15 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 	}
 
 	session.Complete(candidates, notice)
+
+	presented := tev(tracing.KindSelectionPresented, tracing.StatusInfo, models.StageSelection,
+		fmt.Sprintf("%d candidate(s) shown", len(candidates)))
+	presented.Summary = map[string]any{"count": len(candidates)}
+	if notice != "" {
+		presented.Summary["notice"] = notice
+	}
+	o.rec(session).Emit(presented)
+
 	slog.Info("discovery complete",
 		"session_id", session.SessionID,
 		"stage", string(models.StageSelection),
@@ -107,13 +135,23 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 
 	// --- Segment 1: extraction (skipped on resume when markdown is cached). ---
 	if s.Markdown() == "" {
+		o.rec(s).Emit(withSummary(
+			tev(tracing.KindToolPaperContentStarted, tracing.StatusInfo, models.StageExtracting, "Fetching paper HTML…"),
+			map[string]any{"arxivId": paperID}))
+		extractStart := time.Now()
 		md, err := o.content.FetchMarkdown(ctx, paperID)
 		if err != nil {
 			if errors.Is(err, tools.ErrPaperHTMLNotFound) {
+				// 404 re-pick: NOT a run failure — the run continues after the user
+				// selects another paper, so this event is non-terminal.
 				s.RecoverToSelection("Paper HTML not available on arXiv. Please select another paper.")
+				o.rec(s).Emit(tev(tracing.KindRunRecoveredToSelection, tracing.StatusWarning, models.StageSelection,
+					"Paper HTML unavailable — pick another paper"))
 				slog.Warn("paper html not found", "session_id", s.SessionID, "paper_id", paperID)
 				return
 			}
+			o.rec(s).Emit(tev(tracing.KindToolPaperContentFailed, tracing.StatusError, models.StageExtracting,
+				"Could not fetch or convert paper HTML"))
 			msg, recoverable, action := describeError(err)
 			s.Fail(msg, recoverable)
 			s.SetErrorAction(action)
@@ -121,6 +159,13 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 			return
 		}
 		s.SetMarkdown(md)
+		// Summary carries the SIZE + a short preview only — never raw HTML, never
+		// the full markdown body (invariant: design §8). The scrubber caps it too.
+		done := tev(tracing.KindToolPaperContentCompleted, tracing.StatusSuccess, models.StageExtracting,
+			fmt.Sprintf("Fetched HTML → %s Markdown", byteSize(len(md))))
+		done.Summary = map[string]any{"arxivId": paperID, "markdownBytes": len(md), "preview": preview(md, 200)}
+		done.DurationMS = tracing.MS(time.Since(extractStart))
+		o.rec(s).Emit(done)
 		slog.Info("markdown stored", "session_id", s.SessionID, "paper_id", paperID, "markdown_bytes", len(md))
 	}
 	md := s.Markdown()
@@ -182,6 +227,10 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 		return
 	}
 	s.SetVaultFile(path)
+	o.rec(s).Emit(withSummary(
+		tev(tracing.KindToolVaultWriterCompleted, tracing.StatusSuccess, models.StageWriting,
+			fmt.Sprintf("Saved to vault: %s", filepath.Base(path))),
+		map[string]any{"path": path}))
 	s.SetStage(models.StageComplete)
 
 	// A full-run summary: token split, estimated cost, and the review outcome, so
@@ -200,6 +249,20 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 		"review_iterations", reviewIterations, "review_passed", reviewPassed,
 		"total_duration_ms", time.Since(s.StartedAt()).Milliseconds(),
 	)
+
+	// Timeline: the run's closing beat, then finalize + close the recorder.
+	completed := tev(tracing.KindRunCompleted, tracing.StatusSuccess, models.StageComplete,
+		runCompletedTitle(s.TokensUsed(), cost, costKnown, time.Since(s.StartedAt())))
+	completed.Summary = map[string]any{
+		"totalTokens": s.TokensUsed(), "inputTokens": s.InputTokens(), "outputTokens": s.OutputTokens(),
+		"reviewIterations": reviewIterations, "reviewPassed": reviewPassed, "costKnown": costKnown,
+	}
+	if costKnown {
+		completed.Summary["estCostUsd"] = cost
+	}
+	completed.DurationMS = tracing.MS(time.Since(s.StartedAt()))
+	o.rec(s).Emit(completed)
+	o.finalizeRun(s, "complete", true)
 }
 
 // checkContextWindow attaches a non-blocking ContextWarning to the session when
@@ -222,6 +285,10 @@ func (o *Orchestrator) checkContextWindow(s *models.PipelineSession, md string) 
 			Model:           o.cfg.LLM.Model,
 			Suggestion:      "Consider switching to Gemini (gemini-2.0-flash) for a larger context window.",
 		})
+		warn := tev(tracing.KindContextWarning, tracing.StatusWarning, models.StageGenerating,
+			fmt.Sprintf("Prompt ~%d tokens may exceed %s limit (%d)", est, o.cfg.LLM.Model, limit))
+		warn.Summary = map[string]any{"estimatedTokens": est, "modelLimit": limit, "model": o.cfg.LLM.Model}
+		o.rec(s).Emit(warn)
 	}
 }
 
@@ -237,12 +304,15 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 	for iteration := 1; ; iteration++ {
 		s.SetIteration(iteration)
 		// First pass is a fresh generation; later passes revise using the note.
-		if iteration == 1 {
-			s.SetStage(models.StageGenerating)
-		} else {
-			s.SetStage(models.StageRevising)
+		genStage, genKind, genTitle := models.StageGenerating, tracing.KindLLMExplainerStarted, fmt.Sprintf("Generating explainer (pass %d)…", iteration)
+		if iteration > 1 {
+			genStage, genTitle = models.StageRevising, fmt.Sprintf("Revising explainer (pass %d)…", iteration)
 		}
+		s.SetStage(genStage)
+		o.rec(s).Emit(withSummary(tev(genKind, tracing.StatusInfo, genStage, genTitle),
+			map[string]any{"iteration": iteration}))
 
+		genStart := time.Now()
 		ex, err := o.explainer.Generate(ctx, agents.ExplainerInput{
 			MarkdownText: md, PaperMeta: *paper, RevisionNote: revisionNote,
 		})
@@ -272,11 +342,25 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 		s.AddTokens(ex.InputTokens + ex.OutputTokens)
 		s.AddIO(ex.InputTokens, ex.OutputTokens) // split accounting for cost estimation
 
+		genDone := tev(tracing.KindLLMExplainerCompleted, tracing.StatusSuccess, genStage,
+			fmt.Sprintf("Explainer generated · %s in / %s out", compactCount(ex.InputTokens), compactCount(ex.OutputTokens)))
+		genDone.Summary = map[string]any{
+			"iteration": iteration, "inputTokens": ex.InputTokens, "outputTokens": ex.OutputTokens,
+			"preview": preview(ex.Content, 200),
+		}
+		genDone.DurationMS = tracing.MS(time.Since(genStart))
+		o.rec(s).Emit(genDone)
+
 		if maxIter == 0 {
 			break // reviewer disabled → Phase-4 path; verdict stays nil
 		}
 
 		s.SetStage(models.StageReviewing)
+		o.rec(s).Emit(withSummary(
+			tev(tracing.KindLLMReviewerStarted, tracing.StatusInfo, models.StageReviewing,
+				fmt.Sprintf("Reviewing explainer (pass %d)…", iteration)),
+			map[string]any{"iteration": iteration}))
+		reviewStart := time.Now()
 		verdict, err := o.reviewer.Review(ctx, ex, *paper, iteration)
 		if errors.Is(err, agents.ErrReviewParse) {
 			// Decision 2: malformed reviewer JSON stops the loop and saves the
@@ -286,6 +370,11 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 			s.SetVerdict(&verdict)
 			s.AddTokens(verdict.TokensUsed)
 			s.AddIO(verdict.InputTokens, verdict.OutputTokens)
+			rc := tev(tracing.KindLLMReviewerCompleted, tracing.StatusWarning, models.StageReviewing,
+				"Reviewer response unparseable — accepting current draft")
+			rc.Summary = map[string]any{"iteration": iteration, "pass": false, "parseError": true}
+			rc.DurationMS = tracing.MS(time.Since(reviewStart))
+			o.rec(s).Emit(rc)
 			slog.Warn("reviewer json parse failed; stopping loop", "session_id", s.SessionID, "iteration", iteration)
 			break
 		}
@@ -303,18 +392,56 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 		s.AddTokens(verdict.TokensUsed)
 		s.AddIO(verdict.InputTokens, verdict.OutputTokens)
 
+		// Reviewer verdict: PASS is success, a FAIL is a warning (not an error —
+		// the loop handles it). feedbackKeys names the flagged sections without
+		// shipping the (potentially long) feedback text into the summary.
+		verdictStatus := tracing.StatusWarning
+		outcome := "FAIL"
 		if verdict.Pass {
+			verdictStatus, outcome = tracing.StatusSuccess, "PASS"
+		}
+		rc := tev(tracing.KindLLMReviewerCompleted, verdictStatus, models.StageReviewing,
+			fmt.Sprintf("Reviewer: %s score %.2f", outcome, verdict.Score))
+		rc.Summary = map[string]any{
+			"iteration": iteration, "pass": verdict.Pass, "score": verdict.Score,
+			"feedbackKeys": feedbackKeys(verdict.Feedback),
+		}
+		rc.DurationMS = tracing.MS(time.Since(reviewStart))
+		o.rec(s).Emit(rc)
+
+		if verdict.Pass {
+			o.rec(s).Emit(tev(tracing.KindDecisionAccept, tracing.StatusSuccess, models.StageReviewing, "Explainer accepted"))
 			slog.Info("reviewer approved explainer", "session_id", s.SessionID, "iteration", iteration, "score", verdict.Score)
 			break
 		}
 		if iteration >= maxIter {
+			o.rec(s).Emit(withSummary(
+				tev(tracing.KindDecisionMaxIterations, tracing.StatusWarning, models.StageReviewing,
+					fmt.Sprintf("Max iterations reached — saving best draft (score %.2f)", verdict.Score)),
+				map[string]any{"finalScore": verdict.Score, "maxIterations": maxIter}))
 			slog.Warn("max review iterations reached without approval", "session_id", s.SessionID, "final_score", verdict.Score)
 			break
 		}
 		// Not passed and iterations remain: build the note for the next revision.
+		o.rec(s).Emit(withSummary(
+			tev(tracing.KindDecisionRevise, tracing.StatusInfo, models.StageReviewing,
+				fmt.Sprintf("Revising — %d section(s) flagged", len(verdict.Feedback))),
+			map[string]any{"flagged": len(verdict.Feedback)}))
 		revisionNote = agents.FormatRevisionNote(verdict)
 	}
 	return true // explainer stored on the session; vault write happens in runPipeline
+}
+
+// feedbackKeys returns the section slugs a reviewer flagged, sorted for a stable
+// timeline. Only the KEYS ship in the summary — the feedback text can be long
+// and is not needed for the at-a-glance story.
+func feedbackKeys(feedback map[string]string) []string {
+	keys := make([]string, 0, len(feedback))
+	for k := range feedback {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // newSession creates a session with a unique, dependency-free random ID.
@@ -352,4 +479,17 @@ func (o *Orchestrator) logFailure(session *models.PipelineSession, cause error, 
 	}
 	args = append(args, extra...)
 	slog.Error("pipeline failed", args...)
+
+	// Timeline: the run's failure beat. Centralized here because every Fail path
+	// funnels through logFailure, so one emit covers discovery, extraction,
+	// generation, review, and vault failures. A RECOVERABLE failure keeps the
+	// recorder open (a retry resumes the same run); a non-recoverable one closes it.
+	failed := tev(tracing.KindRunFailed, tracing.StatusError, session.FailedStage(), snap.Error)
+	failed.Summary = map[string]any{
+		"action":      session.ErrorAction(),
+		"recoverable": snap.Recoverable,
+		"cause":       cause.Error(),
+	}
+	o.rec(session).Emit(failed)
+	o.finalizeRun(session, "failed", !snap.Recoverable)
 }

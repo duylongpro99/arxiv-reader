@@ -1,0 +1,36 @@
+# docker-compose.yml — local Postgres for Run Timeline Tracing (Phase 7).
+#
+# Tracing is ADDITIVE and OPTIONAL: the paper pipeline never depends on this DB.
+# If you skip it, the backend runs with in-memory tracing only (live timeline
+# works; history + cross-restart reload are disabled — see README "Timeline & history").
+#
+# Bring it up:   docker compose up -d db
+# Apply schema:  psql "$DATABASE_URL" -f backend/migrations/0001_run_timeline.sql
+#                (migrations are USER-run — the app never migrates on boot.)
+#
+# Credentials default to arxiv/arxiv for local dev; override via a .env in the
+# repo root (POSTGRES_USER / POSTGRES_PASSWORD) if you prefer. The DSN the
+# backend reads is DATABASE_URL (also in .env) — see .env.example.
+
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: arxiv-reader-db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-arxiv_reader}
+      POSTGRES_USER: ${POSTGRES_USER:-arxiv}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arxiv}
+    ports:
+      # Bound to loopback only — this is a single-user local tool, never exposed.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready gates dependents until the server actually accepts connections.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arxiv} -d ${POSTGRES_DB:-arxiv_reader}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

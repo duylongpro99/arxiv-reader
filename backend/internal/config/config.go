@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -12,9 +13,25 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
-	LLM   LLMConfig   `yaml:"llm"`
-	Paths PathsConfig `yaml:"paths"`
-	Agent AgentConfig `yaml:"agent"`
+	LLM     LLMConfig     `yaml:"llm"`
+	Paths   PathsConfig   `yaml:"paths"`
+	Agent   AgentConfig   `yaml:"agent"`
+	Tracing TracingConfig `yaml:"tracing"`
+	// DatabaseURL is the Postgres DSN for durable run-timeline history. Read from
+	// .env ONLY (like the API key; yaml:"-") so a secret never lands in the
+	// committed config.yaml. Empty is VALID: tracing then degrades to in-memory
+	// only (live SSE still works; history/reload disabled) — never fatal.
+	DatabaseURL string `yaml:"-"`
+}
+
+// TracingConfig holds the Phase 7 run-timeline knobs. Enabled is the master
+// switch for the Recorder; FullPayloads opts into storing full prompts/
+// responses/markdown (off by default — summaries + previews only); BufferSize
+// is the per-run in-memory ring capacity feeding SSE replay.
+type TracingConfig struct {
+	Enabled      bool `yaml:"enabled"`
+	FullPayloads bool `yaml:"full_payloads"`
+	BufferSize   int  `yaml:"buffer_size"` // > 0 when Enabled
 }
 
 type LLMConfig struct {
@@ -74,17 +91,11 @@ func Load(yamlPath string) (*Config, error) {
 	}
 
 	// 2. .env overrides. godotenv.Load loads .env into process env if present;
-	//    a missing .env is not fatal (real exported env vars still apply).
+	//    a missing .env is not fatal (real exported env vars still apply). Every
+	//    tunable is overridable so a deployment can retune without a rebuild.
 	_ = godotenv.Load()
-	cfg.LLM.APIKey = os.Getenv("LLM_API_KEY") // required; validated below
-	if v := os.Getenv("LLM_PROVIDER"); v != "" {
-		cfg.LLM.Provider = v
-	}
-	if v := os.Getenv("LLM_MODEL"); v != "" {
-		cfg.LLM.Model = v
-	}
-	if v := os.Getenv("OBSIDIAN_VAULT_PATH"); v != "" {
-		cfg.Paths.ObsidianVault = v
+	if err := cfg.applyEnvOverrides(); err != nil {
+		return nil, err
 	}
 
 	// 3. expand ~ BEFORE the absolute-path check (FIX #1): PRD defaults use ~,
@@ -97,6 +108,109 @@ func Load(yamlPath string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// applyEnvOverrides layers environment values on top of the config.yaml
+// defaults so every tunable can change per deployment without a rebuild. Names
+// follow SECTION_FIELD in screaming snake case (e.g. AGENT_FETCH_LIMIT); the
+// pre-existing LLM_*/OBSIDIAN_VAULT_PATH names are kept for compatibility. The
+// API key is override-only (never read from YAML). Malformed numeric values are
+// collected and returned as one fail-fast error rather than silently ignored.
+func (c *Config) applyEnvOverrides() error {
+	c.LLM.APIKey = os.Getenv("LLM_API_KEY") // required; validated below. Override-only.
+
+	var errs []string
+	// LLM
+	envStr("LLM_PROVIDER", &c.LLM.Provider)
+	envStr("LLM_MODEL", &c.LLM.Model)
+	envStr("LLM_BASE_URL", &c.LLM.BaseURL) // custom OpenAI-compatible endpoint/proxy
+	envInt("LLM_MAX_TOKENS", &c.LLM.MaxTokens, &errs)
+	envFloat32("LLM_TEMPERATURE", &c.LLM.Temperature, &errs)
+	envInt("LLM_REQUEST_TIMEOUT_SECONDS", &c.LLM.RequestTimeoutSec, &errs)
+	// Paths
+	envStr("OBSIDIAN_VAULT_PATH", &c.Paths.ObsidianVault)
+	envStr("LOG_FILE", &c.Paths.LogFile)
+	// Agent
+	envStr("AGENT_ARXIV_CATEGORY", &c.Agent.ArxivCategory)
+	envStr("AGENT_ARXIV_BASE_URL", &c.Agent.ArxivBaseURL)
+	envInt("AGENT_FETCH_LIMIT", &c.Agent.FetchLimit, &errs)
+	envInt("AGENT_DISPLAY_LIMIT", &c.Agent.DisplayLimit, &errs)
+	envStr("AGENT_USER_AGENT", &c.Agent.UserAgent)
+	envInt("AGENT_REQUEST_TIMEOUT_SECONDS", &c.Agent.RequestTimeoutSec, &errs)
+	envInt("AGENT_MIN_REQUEST_INTERVAL_SECONDS", &c.Agent.MinRequestIntervalSec, &errs)
+	envInt("AGENT_MAX_RETRIES", &c.Agent.MaxRetries, &errs)
+	envStr("AGENT_ARXIV_HTML_BASE_URL", &c.Agent.ArxivHTMLBaseURL)
+	envInt64("AGENT_MAX_CONTENT_BYTES", &c.Agent.MaxContentBytes, &errs)
+	envInt("AGENT_MAX_REVIEW_ITERATIONS", &c.Agent.MaxReviewIterations, &errs)
+	// Tracing + DB. DATABASE_URL is override-only (never from YAML), mirroring the
+	// API key: a DSN can carry a password, so it stays out of the committed file.
+	envStr("DATABASE_URL", &c.DatabaseURL)
+	envBool("TRACING_ENABLED", &c.Tracing.Enabled, &errs)
+	envBool("TRACING_FULL_PAYLOADS", &c.Tracing.FullPayloads, &errs)
+	envInt("TRACING_BUFFER_SIZE", &c.Tracing.BufferSize, &errs)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("invalid environment override(s):\n  → %s", strings.Join(errs, "\n  → "))
+	}
+	return nil
+}
+
+// envStr overwrites *dst when key is set and non-empty. Empty/unset is a no-op,
+// so a blank env var never clobbers a meaningful YAML default.
+func envStr(key string, dst *string) {
+	if v := os.Getenv(key); v != "" {
+		*dst = v
+	}
+}
+
+// envInt / envInt64 / envFloat32 parse a numeric override; a malformed value
+// appends a keyed message to *errs (fail-fast) instead of falling back to the
+// YAML default, which would silently mask a deployment typo.
+func envInt(key string, dst *int, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid integer", key, v))
+			return
+		}
+		*dst = n
+	}
+}
+
+func envInt64(key string, dst *int64, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid integer", key, v))
+			return
+		}
+		*dst = n
+	}
+}
+
+func envFloat32(key string, dst *float32, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		f, err := strconv.ParseFloat(v, 32)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid number", key, v))
+			return
+		}
+		*dst = float32(f)
+	}
+}
+
+// envBool parses a boolean override (1/t/true/0/f/false, case-insensitive per
+// strconv.ParseBool); a malformed value fails fast like the numeric parsers
+// rather than silently defaulting.
+func envBool(key string, dst *bool, errs *[]string) {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("%s=%q is not a valid boolean (use true/false)", key, v))
+			return
+		}
+		*dst = b
+	}
 }
 
 // expandHome replaces a leading ~ (only "~" or "~/…") with $HOME, mirroring
@@ -142,6 +256,12 @@ func (c *Config) validate() error {
 	}
 	if !filepath.IsAbs(c.Paths.LogFile) {
 		return fmt.Errorf("paths.log_file must be an absolute path, got %q.\n  → Set paths.log_file in config.yaml", c.Paths.LogFile)
+	}
+	// Tracing: buffer_size must be positive when enabled (it sizes the per-run
+	// ring buffer). DatabaseURL is intentionally NOT required — an empty DSN is
+	// the documented in-memory-only degrade path, never a validation error.
+	if c.Tracing.Enabled && c.Tracing.BufferSize <= 0 {
+		return fmt.Errorf("tracing.buffer_size must be > 0 when tracing is enabled, got %d.\n  → Set tracing.buffer_size in config.yaml", c.Tracing.BufferSize)
 	}
 	return c.Agent.validate()
 }

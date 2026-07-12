@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -88,6 +90,91 @@ func validConfig() *Config {
 		Paths: PathsConfig{ObsidianVault: "/tmp/vault", LogFile: "/tmp/log.json"},
 	}
 }
+
+// TestLoadEnvOverrides verifies the .env-style overrides in Load() win over the
+// values parsed from config.yaml. base_url is the newest override, so it gets a
+// dedicated assertion alongside provider/model. t.Setenv restores env + isolates
+// the test; the temp config.yaml keeps base_url unset so we prove the override,
+// not the YAML value, is what lands.
+func TestLoadEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, []byte(minimalYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("LLM_API_KEY", "test-key")
+	t.Setenv("LLM_PROVIDER", "openai")
+	t.Setenv("LLM_MODEL", "gpt-4o-mini")
+	t.Setenv("LLM_BASE_URL", "https://proxy.example/v1")
+	t.Setenv("LLM_MAX_TOKENS", "2048")             // int override
+	t.Setenv("AGENT_FETCH_LIMIT", "42")            // int override in another section
+	t.Setenv("AGENT_MAX_CONTENT_BYTES", "1048576") // int64 override
+
+	cfg, err := Load(yamlPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LLM.Provider != "openai" {
+		t.Errorf("provider = %q, want openai", cfg.LLM.Provider)
+	}
+	if cfg.LLM.Model != "gpt-4o-mini" {
+		t.Errorf("model = %q, want gpt-4o-mini", cfg.LLM.Model)
+	}
+	if cfg.LLM.BaseURL != "https://proxy.example/v1" {
+		t.Errorf("base_url = %q, want the LLM_BASE_URL override", cfg.LLM.BaseURL)
+	}
+	if cfg.LLM.MaxTokens != 2048 {
+		t.Errorf("max_tokens = %d, want 2048", cfg.LLM.MaxTokens)
+	}
+	if cfg.Agent.FetchLimit != 42 {
+		t.Errorf("fetch_limit = %d, want 42", cfg.Agent.FetchLimit)
+	}
+	if cfg.Agent.MaxContentBytes != 1048576 {
+		t.Errorf("max_content_bytes = %d, want 1048576", cfg.Agent.MaxContentBytes)
+	}
+}
+
+// TestLoadEnvOverrideMalformed proves a non-numeric numeric override is a hard
+// startup error (fail-fast) instead of silently falling back to the YAML value.
+func TestLoadEnvOverrideMalformed(t *testing.T) {
+	dir := t.TempDir()
+	yamlPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(yamlPath, []byte(minimalYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_API_KEY", "test-key")
+	t.Setenv("LLM_MAX_TOKENS", "not-a-number")
+
+	_, err := Load(yamlPath)
+	if err == nil || !strings.Contains(err.Error(), "LLM_MAX_TOKENS") {
+		t.Fatalf("expected LLM_MAX_TOKENS parse error, got %v", err)
+	}
+}
+
+// minimalYAML is a valid config.yaml body shared by the Load tests.
+const minimalYAML = `llm:
+  provider: anthropic
+  model: claude-sonnet-4-6
+  max_tokens: 4096
+  temperature: 0.3
+  request_timeout_seconds: 120
+  base_url: ""
+paths:
+  obsidian_vault: /tmp/vault
+  log_file: /tmp/log.json
+agent:
+  arxiv_category: cs.AI
+  arxiv_base_url: https://export.arxiv.org/api/query
+  fetch_limit: 20
+  display_limit: 5
+  user_agent: arxiv-explainer-agent/1.0
+  request_timeout_seconds: 10
+  min_request_interval_seconds: 3
+  max_retries: 3
+  arxiv_html_base_url: https://arxiv.org/html
+  max_content_bytes: 52428800
+`
 
 func TestLLMConfigValidate(t *testing.T) {
 	tests := []struct {

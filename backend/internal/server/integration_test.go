@@ -110,8 +110,10 @@ func setup(t *testing.T, feed string, logContent string) testEnv {
 }
 
 // setupWith is setup with a caller-controlled paper-HTML handler (e.g. to force
-// a 404 for the re-pick path).
-func setupWith(t *testing.T, feed, logContent string, htmlHandler http.HandlerFunc) testEnv {
+// a 404 for the re-pick path). Optional tweaks mutate the config before the
+// handler is built — used by the timeline E2E to enable tracing. Existing
+// callers pass none, so their behavior is unchanged (tracing disabled).
+func setupWith(t *testing.T, feed, logContent string, htmlHandler http.HandlerFunc, tweaks ...func(*config.Config)) testEnv {
 	t.Helper()
 
 	arxiv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -154,6 +156,10 @@ func setupWith(t *testing.T, feed, logContent string, htmlHandler http.HandlerFu
 			MinRequestIntervalSec: 1,
 			MaxRetries:            2,
 		},
+	}
+
+	for _, tweak := range tweaks {
+		tweak(cfg)
 	}
 
 	handler, err := server.Handler(cfg)

@@ -6,6 +6,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -14,7 +15,9 @@ import (
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
+	"github.com/maritime-ds/arxiv-reader/internal/store"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
+	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
 // PaperFetcher and Unprocessor are the narrow tool contracts the orchestrator
@@ -63,6 +66,12 @@ type Orchestrator struct {
 	explainer Explainer    // Phase 4: LLM re-teaching generation
 	reviewer  Reviewer     // Phase 5: independent critic (revision loop)
 	vault     VaultWriter  // Phase 4: atomic Obsidian vault write
+	// Phase 7 run-timeline tracing. tracer is always non-nil after New (it just
+	// skips the DB when unavailable); store backs the history read endpoints
+	// (Phase 04) and is nil when Postgres is unreachable. Both are additive —
+	// the pipeline never depends on them.
+	tracer *tracing.Tracer
+	store  RunReader // history reads (Phase 04); nil when Postgres is unavailable
 }
 
 // New wires the orchestrator with the real tools built from config. It can fail:
@@ -79,7 +88,28 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		return nil, err
 	}
 	logCheck := tools.NewLogCheckTool(&cfg.Paths)
-	return &Orchestrator{
+
+	// Open the durable history store — best-effort. An empty/unreachable
+	// DATABASE_URL degrades to in-memory-only tracing and is NEVER fatal: store
+	// failure must not stop the server (mirrors the config fail-fast philosophy
+	// only for genuinely required config, which the DB is not). The error is
+	// DSN-free by construction (store.Open never echoes the password).
+	var st *store.Store
+	var ev tracing.EventWriter
+	var rw tracing.RunWriter
+	if cfg.Tracing.Enabled {
+		opened, serr := store.Open(context.Background(), cfg.DatabaseURL)
+		if serr != nil {
+			slog.Warn("run history disabled — durable store unavailable (live timeline still works)",
+				"reason", serr.Error())
+		} else {
+			st, ev, rw = opened, opened, opened
+		}
+	}
+	tracer := tracing.New(cfg.Tracing.Enabled, ev, rw,
+		cfg.Tracing.FullPayloads, cfg.Tracing.BufferSize, cfg.LLM.APIKey, cfg.DatabaseURL)
+
+	o := &Orchestrator{
 		cfg:       cfg,
 		disco:     tools.NewDiscoveryTool(&cfg.Agent),
 		logCheck:  logCheck,
@@ -87,7 +117,14 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		explainer: agents.New(client, cfg),
 		reviewer:  agents.NewReviewer(client, cfg), // shares the explainer's LLM client
 		vault:     tools.NewVaultWriterTool(cfg, logCheck),
-	}, nil
+		tracer:    tracer,
+	}
+	// Assign the reader ONLY when the DB opened, so a nil *store.Store never
+	// becomes a non-nil RunReader interface (which would panic on first call).
+	if st != nil {
+		o.store = st
+	}
+	return o, nil
 }
 
 // HandleDiscover creates a session, kicks off discovery in the background, and
@@ -97,6 +134,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 func (o *Orchestrator) HandleDiscover(w http.ResponseWriter, r *http.Request) {
 	session := o.newSession()
 	o.sessions.Store(session.SessionID, session)
+	o.rec(session) // create the recorder + run-header row at run start
 
 	slog.Info("discovery started", "session_id", session.SessionID)
 
@@ -151,6 +189,15 @@ func (o *Orchestrator) HandleProcess(w http.ResponseWriter, r *http.Request) {
 	s.SetSelectedPaper(selected)
 	s.SetStage(models.StageExtracting)
 	slog.Info("process requested", "session_id", s.SessionID, "paper_id", selected.ID)
+
+	// Timeline: record WHAT the user selected (the ★ story beat) and stamp the
+	// paper onto the run-header row. Both best-effort (nil-safe).
+	chosen := tev(tracing.KindSelectionChosen, tracing.StatusSuccess, models.StageSelection,
+		fmt.Sprintf("Selected %q (%s)", selected.Title, selected.ID))
+	chosen.Summary = map[string]any{"paperId": selected.ID, "title": selected.Title}
+	o.rec(s).Emit(chosen)
+	o.rec(s).SetPaper(selected.ID, selected.Title)
+
 	writeJSON(w, http.StatusOK, ProcessResponse{SessionID: s.SessionID})
 
 	// Detach from the request context (cancelled once this handler returns) so

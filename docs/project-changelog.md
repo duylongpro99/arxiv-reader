@@ -5,6 +5,134 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
+## [Phase 7] — 2026-07-12
+
+Run Timeline Tracing: Live and persistent event timeline per run. Users can monitor
+pipeline progress in real-time via Server-Sent Events, review complete histories
+afterward via REST, and resume queries across backend restarts (with Postgres).
+All tracing is additive and optional; pipelines work without the database.
+
+### Added
+
+#### Backend
+- **RunStore & EventStore** (`internal/store/`) — pgx/v5 Postgres access layer
+  - `Open(dsn)` with graceful degrade (returns ErrStoreUnavailable if DB unreachable)
+  - `CreateRun/UpdateRunPaper/FinalizeRun/GetRun/ListRuns` for run records
+  - `AppendEvent/ListEvents` for the ordered event timeline
+  - Model structs (RunRecord, EventRecord) mirror the schema exactly
+
+- **RunRecorder** (`internal/tracing/recorder.go`) — per-run event capture
+  - Monotonic sequence counter (0,1,2…) per run
+  - Bounded in-memory ring buffer (configurable size, default 256 events)
+  - Async single-writer persistence (batch flushes to Postgres)
+  - Degrade-safe: operates in-memory if store unavailable
+
+- **SSE Broker** (`internal/tracing/broker.go`) — non-blocking per-run fan-out
+  - Per-run subscriber map for live client connections
+  - Last-Event-ID support for client reconnect/resume from sequence N
+  - Closes on `run.completed` or `run.failed` event
+
+- **Event Taxonomy** (`internal/tracing/event.go`)
+  - Standardized EventKind constants (discovery.started, selection.chosen, tool.*, llm.*, decision.*, run.*)
+  - Event struct with seq, event_type, stage, title, status, summary (JSONB), payload_full (optional)
+
+- **Secret Scrubber** (`internal/tracing/scrub.go`) — redacts sensitive data
+  - Redacts API keys and key-shaped patterns from summaries
+  - Caps text previews to prevent huge payloads
+  - Never stores raw HTML or full markdown (size + preview only)
+
+- **Orchestrator Instrumentation** (`internal/orchestrator/tracing.go`)
+  - Recorder created at orchestrator startup with degrade-safe store.Open
+  - Emission on every decision point: discovery.started through run.completed/failed
+  - Recoverable failures keep recorder open; only completion/non-recoverable close it
+
+- **Transport Endpoints** (`internal/server/`)
+  - `GET /runs/{id}/events` — SSE stream with Last-Event-ID resume
+  - `GET /runs` — paginated list of runs (newest first)
+  - `GET /runs/{id}` — single run's header + full timeline
+  - Handles client disconnect cleanly; orphaned runs receive synthetic terminal event
+
+#### Frontend
+- **RunTimeline component** (`components/run-timeline.tsx`) — renders ordered event list
+  - Per-event row with status icon (info/success/warning/error) and relative timestamp
+  - Expandable rows for LLM/tool events (summary preview; full payload if trace-on)
+  - Live update via SSE; falls back to REST on completion
+
+- **RunEventRow component** (`components/run-event-row.tsx`) — individual event formatting
+
+- **RunsHistory component** (`components/runs-history.tsx`) — list of past runs
+  - Title, date, outcome badge, cost; click to reopen individual run
+
+- **useEventSource hook** (`lib/use-event-source.ts`) — SSE client with Last-Event-ID
+  - Auto-reconnect on disconnect; resumes from last known sequence
+
+- **useRuns hook** (`lib/use-runs.ts`) — TanStack Query for history list
+
+- **Pages** (`app/runs/page.tsx`, `app/runs/[id]/page.tsx`)
+  - `/runs` — history list
+  - `/runs/[id]` — timeline + result panel for individual run
+
+- **Navigation** — link to runs history on home page, live timeline mounted in discovery-panel
+
+- **CORS** — allows both `http://localhost:3000` and `http://127.0.0.1:3000`
+
+#### Infra
+- **docker-compose.yml** — postgres:17-alpine service with healthcheck
+  - Named volume pgdata for persistence
+  - Credentials default to arxiv/arxiv (override via .env)
+  - Port bound to 127.0.0.1:5432 only (local tool, never exposed)
+
+- **Migration** (`backend/migrations/0001_run_timeline.sql`)
+  - USER-RUN migration (agent never generates/executes; user applies manually)
+  - `runs` table: id (PK), paper_id, title, stage, status, token counts, cost, review_passed, timestamps
+  - `run_events` table: (run_id, seq) composite PK, event_type, stage, title, status, summary (JSONB), payload_full (optional), duration_ms
+  - Index on runs.started_at DESC for efficient history queries
+  - Safe to re-run: all objects use IF NOT EXISTS
+
+- **Config** (`config.yaml` + `.env` example)
+  - `tracing: { enabled, full_payloads, buffer_size }`
+  - `DATABASE_URL` from `.env` (documented default in `.env.example`)
+
+#### Docs
+- `docs/superpowers/specs/2026-07-12-run-timeline-tracing-design.md` — approved brainstorm spec
+
+### Changed
+
+- **Orchestrator.New()** — creates Recorder with degrade-safe store.Open
+- **Pipeline flow** — emits events at discovery, selection, extraction, generation, review, vault write, completion
+- **Frontend discovery-panel** — now includes live timeline during run
+
+### Known Limitations
+
+- **Retention/pruning:** No automatic cleanup of old runs (can be added later if table grows)
+- **Auth:** No access control on `/runs` endpoints (local single-user tool, bound to 127.0.0.1)
+- **Multi-user:** No tenant separation (out of scope)
+
+### Dependencies Added
+
+**Backend:**
+- `github.com/jackc/pgx/v5` — PostgreSQL driver
+
+**Frontend:**
+- No new dependencies (SSE is browser-native)
+
+### Test Coverage
+
+- Store: runs/events CRUD against test Postgres (or in-memory fake)
+- Recorder: ordering, seq monotonicity, buffer wraparound
+- Broker: per-run fan-out, client disconnect handling
+- Orchestrator: full event sequence for pass, revise, 404-repick, failure scenarios
+- SSE: replay-from-Last-Event-ID, orphaned run terminal event
+
+### Migration Guide
+
+1. **Optional:** Bring up Postgres: `docker compose up -d db`
+2. **Optional:** Apply schema: `psql "$DATABASE_URL" -f backend/migrations/0001_run_timeline.sql`
+3. **No code changes required** — recorder degrades gracefully if DB unavailable
+4. **Frontend:** New `/runs` history page and timeline UI automatically enabled
+
+---
+
 ## [Phase 6] — 2026-07-05
 
 Polish & hardening of the HTML→Markdown product. All changes are additive and

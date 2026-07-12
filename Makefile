@@ -1,4 +1,4 @@
-.PHONY: dev check-tools install
+.PHONY: dev check-tools install db migrate-print
 
 check-tools:
 	@command -v go  >/dev/null 2>&1 || { echo "ERROR: 'go' not found. Install Go 1.23+ from https://go.dev/dl/ and retry."; exit 1; }
@@ -19,3 +19,14 @@ dev: check-tools install
 		while kill -0 $$be 2>/dev/null && kill -0 $$fe 2>/dev/null; do sleep 1; done; \
 		echo "A service exited — shutting down the other..."; \
 		kill 0
+
+# make db: start the local Postgres for run-timeline history (Phase 7). Optional —
+# without it the app runs with in-memory-only tracing.
+db:
+	docker compose up -d db
+
+# make migrate-print: PRINT the migration command for you to run yourself. Per the
+# no-migrations rule, the Makefile never applies migrations — you do.
+migrate-print:
+	@echo 'Run this yourself once (after `make db`), with DATABASE_URL set in .env:'
+	@echo '  psql "$$DATABASE_URL" -f backend/migrations/0001_run_timeline.sql'

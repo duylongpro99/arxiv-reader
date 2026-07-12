@@ -5,7 +5,7 @@
 
 ## Overview
 
-The project is organized into six sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-05**, Phase 5 is complete. The system can discover papers, extract content, generate rich explainers, review them for quality, revise iteratively, and write them to Obsidian.
+The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-12**, Phase 7 is complete. The system can discover papers, extract content, generate and review explainers, write them to Obsidian, and provide a complete live and persistent timeline of every run.
 
 | Phase | Focus | Status | Completion |
 |---|---|---|---|
@@ -14,7 +14,8 @@ The project is organized into six sequential phases, each delivering a complete,
 | **3** | HTML Extraction & LLM Client | ✅ Complete | Phase 3 PR merged |
 | **4** | Explainer & Vault Write | ✅ Complete | 2026-07-05 |
 | **5** | Reviewer & Revision Loop | ✅ Complete | 2026-07-05 |
-| **6** | Polish & Hardening | ⏳ Planned | Q3–Q4 2026 |
+| **6** | Polish & Hardening | ✅ Complete | 2026-07-05 |
+| **7** | Run Timeline Tracing | ✅ Complete | 2026-07-12 |
 
 ---
 
@@ -218,6 +219,79 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 
 ---
 
+## Phase 7 — Run Timeline Tracing
+**Status:** ✅ Complete (2026-07-12)
+
+**Delivered:**
+- **RunStore & EventStore** — pgx/v5 Postgres access layer for durable timeline
+  - Graceful degrade: ErrStoreUnavailable if DB unavailable; pipeline continues
+  - Tables: `runs` (per-session header), `run_events` (ordered timeline per run)
+  
+- **RunRecorder** — per-run monotonic event sequencer with bounded ring buffer
+  - In-memory buffer (configurable, default 256 events)
+  - Async single-writer persistent flush to Postgres
+  - Degrade-safe: works in-memory if store unavailable
+
+- **SSE Broker** — non-blocking per-run fan-out to live clients
+  - Last-Event-ID resume support for reconnecting clients
+  - Closes on run completion/failure
+
+- **Event Taxonomy** — standardized event kinds across all pipeline stages
+  - discovery.started, tool.discovery.completed, selection.chosen, llm.reviewer.completed, etc.
+  - status: info/success/warning/error; summary (JSONB); optional payload_full
+
+- **Secret Scrubber** — redacts API keys, caps previews, no raw HTML/markdown
+
+- **Orchestrator Instrumentation** — emits events at every decision point
+  - Created at startup with degrade-safe store.Open
+  - Only completion/non-recoverable failure closes recorder
+
+- **Transport Endpoints**
+  - `GET /runs/{id}/events` — SSE stream with Last-Event-ID replay
+  - `GET /runs` — paginated history list (newest first)
+  - `GET /runs/{id}` — single run header + full timeline
+
+- **Frontend Components**
+  - `/runs` history page with list of all runs
+  - `/runs/[id]` individual run detail with live timeline (SSE) or loaded history
+  - RunTimeline, RunEventRow, RunsHistory components
+  - useEventSource hook for SSE client with auto-reconnect
+  - useRuns hook for history list with TanStack Query
+  - Live timeline mounted in discovery-panel during active run
+  - Navigation link from home page to runs history
+
+- **Infra & Config**
+  - `docker-compose.yml` — postgres:17-alpine with healthcheck and named volume
+  - `backend/migrations/0001_run_timeline.sql` — USER-RUN migration (safe to re-run)
+  - `tracing: { enabled, full_payloads, buffer_size }` config block
+  - `DATABASE_URL` from `.env` (documented in `.env.example`)
+
+**Key Architecture Points:**
+- **Additive & Optional:** Tracing never blocks the paper pipeline; works in-memory if DB unavailable
+- **Dual-Write:** Events go to ring buffer (live SSE) + async Postgres persist (durable history)
+- **Degrade Guarantee:** No DATABASE_URL or Postgres down → live SSE works; history returns 503
+- **Event Lifecycle:** Each event has seq (resume key), timestamp, stage, and optional full payload (opt-in)
+
+**Dependencies:**
+- Phase 6 complete (pipeline stable)
+- New: `github.com/jackc/pgx/v5` (Go driver)
+- New: postgres:17-alpine (Docker, optional)
+
+**Test Coverage:**
+- Store: CRUD operations against test Postgres
+- Recorder: seq ordering, buffer wraparound, async persistence
+- Broker: per-run fan-out, subscriber cleanup, client disconnect
+- Orchestrator: full event sequence for pass/revise/404/failure scenarios
+- SSE: replay-from-Last-Event-ID, orphaned run terminal event synthesis
+
+**Migration Guide:**
+1. Optional: `docker compose up -d db` to start Postgres
+2. Optional: `psql "$DATABASE_URL" -f backend/migrations/0001_run_timeline.sql` to apply schema
+3. No code changes required — recorder degrades if DB unavailable
+4. Frontend: new `/runs` history page and live timeline UI automatically enabled
+
+---
+
 ## Key Milestones
 
 | Milestone | Date | Achieved |
@@ -229,6 +303,9 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 | User can trigger → select → receive note | 2026-07-05 | ✅ Yes |
 | Phase 5 reviewer & revision loop | 2026-07-05 | ✅ Yes |
 | Full pipeline with quality review | 2026-07-05 | ✅ Yes |
+| Phase 6 polish & hardening | 2026-07-05 | ✅ Yes |
+| Phase 7 run timeline tracing (live & persistent) | 2026-07-12 | ✅ Yes |
+| User can browse and reopen past runs | 2026-07-12 | ✅ Yes |
 
 ---
 
