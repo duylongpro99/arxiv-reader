@@ -84,6 +84,15 @@ func (a *ExplainerAgent) Generate(ctx context.Context, in ExplainerInput) (model
 		InputTokens:  resp.InputTokens,
 		OutputTokens: resp.OutputTokens,
 		CreatedAt:    time.Now().UTC(),
+		// Trace captures the prompts the reviewer/UI can replay. req.UserPrompt
+		// deliberately excludes the paper body — DocumentText rides as its own
+		// CompletionRequest field and providers (e.g. gemini.go) prepend it to a
+		// LOCAL variable at call time, never mutating req.UserPrompt itself.
+		Trace: &models.LLMTrace{
+			SystemPrompt: req.SystemPrompt,
+			UserPrompt:   req.UserPrompt,
+			RawResponse:  resp.Content,
+		},
 	}
 
 	slog.Info("explainer generation complete",
