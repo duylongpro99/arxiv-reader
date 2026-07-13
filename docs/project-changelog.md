@@ -5,6 +5,78 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
+## [Phase 8] — 2026-07-13
+
+Full agent reasoning trace + history content replay + arXiv pagination. Three independent improvements shipped together: explainer/reviewer PayloadFull now populated with full prompts and responses for observability; history detail view includes the persisted markdown note with live reasoning timeline; arXiv discovery supports offset-based pagination within a session.
+
+### Added
+
+#### Backend
+- **PayloadFull Enrichment** — explainer & reviewer decision events now include full content
+  - Event.PayloadFull populated for llm.explainer.completed, llm.reviewer.completed, decision.* events
+  - Explainer: {systemPrompt, userPrompt, response}
+  - ReviewerAgent: same fields + decision events with {decision, onPass, flaggedSections, narrative}
+  - Config tracing.full_payloads enables opt-in capture; default false (Phase 7 unchanged)
+  - Secret scrubber preserves distinct payloadCap (100000 chars) and previewCap (500 chars) to avoid truncation
+
+- **History Content Re-Show** — GET /runs/{id}/content endpoint
+  - Reads persisted Obsidian .md note from disk (path from tool.vaultwriter.completed event)
+  - Path traversal guarded by tools.ValidateWithinVault (now exported)
+  - Returns {available: true, content: markdown} on success
+  - Returns {available: false} HTTP 200 if file missing (graceful degradation)
+  - Enables replay of note + timeline in history detail view
+
+- **arXiv Pagination** — offset-based pagination within a session
+  - DiscoveryTool.FetchPapersFrom(start int) offset parameter
+  - Session model gains ConsumeNextStart (cursor) and AppendCandidates() method
+  - POST /discover/{sessionId}/more extends same session's candidates
+  - Guarded to StageSelection (returns 409 if not in selection stage)
+  - Frontend accumulates candidates across calls, dedup by paper ID
+
+#### Frontend
+- **History Content Panel** — renders persisted note markdown + live timeline
+  - New GET /api/runs/{id}/content proxy route
+  - RunDetailView shows {available} check, renders if available
+  - Markdown + timeline side-by-side in history detail
+
+- **Load More UI** — pagination button in discovery candidates
+  - POST /api/discover/{sessionId}/more triggers backend
+  - Appends new candidates (dedups by ID client-side)
+  - Preserves user's existing candidate list
+
+#### Config
+- tracing.full_payloads: boolean (default false) — opt-in full prompt/response capture
+- Secret scrubber now uses distinct payloadCap (100000) vs previewCap (500)
+
+### Changed
+
+- **Event.PayloadFull** — now populated for explainer/reviewer calls when tracing.full_payloads=true
+- **Session.Candidates** — can be appended via AppendCandidates() during StageSelection
+- **DiscoveryTool.FetchPapersFrom** — new offset parameter (Phase 2 was implicit start=0)
+
+### Architecture Points
+
+- **No schema changes:** Reuses existing run_events.payload_full JSONB column (Phase 7)
+- **Pagination cursor:** Session.ConsumeNextStart tracks arXiv API offset for next "load more"
+- **Vault path lookup:** tool.vaultwriter.completed event's Summary.path field locates .md file
+- **Graceful degradation:** Missing vault file returns {available:false} (history page can still show timeline)
+
+### Migration Guide
+
+1. **Enable full payloads (optional):** `tracing.full_payloads: true` in config.yaml
+2. **No database changes:** Existing payload_full column holds new data
+3. **Frontend:** History detail automatically renders content if GET /runs/{id}/content succeeds
+4. **Pagination:** Opt-in via UI "Load more" button during StageSelection
+
+### Backward Compatibility
+
+- tracing.full_payloads defaults false; Phase 7 behavior unchanged without config edit
+- GET /runs/{id}/content safe if vault file missing (returns {available:false})
+- POST /discover/{sessionId}/more guarded to StageSelection; returns 409 if misused
+- Session.ConsumeNextStart new field but optional (populated by pagination flow)
+
+---
+
 ## [Phase 7] — 2026-07-12
 
 Run Timeline Tracing: Live and persistent event timeline per run. Users can monitor

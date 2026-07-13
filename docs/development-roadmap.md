@@ -5,7 +5,7 @@
 
 ## Overview
 
-The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-12**, Phase 7 is complete. The system can discover papers, extract content, generate and review explainers, write them to Obsidian, and provide a complete live and persistent timeline of every run.
+The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-13**, Phase 8 is complete. The system can discover papers with pagination, extract content, generate and review explainers, write them to Obsidian, provide a complete live and persistent timeline of every run, and replay run history with full reasoning traces.
 
 | Phase | Focus | Status | Completion |
 |---|---|---|---|
@@ -16,6 +16,7 @@ The project is organized into sequential phases, each delivering a complete, wor
 | **5** | Reviewer & Revision Loop | ✅ Complete | 2026-07-05 |
 | **6** | Polish & Hardening | ✅ Complete | 2026-07-05 |
 | **7** | Run Timeline Tracing | ✅ Complete | 2026-07-12 |
+| **8** | Full Reasoning Trace + Pagination | ✅ Complete | 2026-07-13 |
 
 ---
 
@@ -292,6 +293,47 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 
 ---
 
+## Phase 8 — Full Reasoning Trace + History Replay + arXiv Pagination
+**Status:** ✅ Complete (2026-07-13)
+
+**Delivered:**
+- **PayloadFull Enrichment** — explainer/reviewer events now include full prompt+response (Phase 7 was opt-in summary only)
+  - config `tracing.full_payloads` switch (default false; Phase 7 unchanged without edit)
+  - Distinct caps: summary ~500 chars, payload_full ~100k chars (avoid truncation)
+  - Explainer events: {systemPrompt, userPrompt, response}
+  - Reviewer events: same + decision events with {decision, onPass, flaggedSections, narrative}
+
+- **History Content Re-Show** — GET /runs/{id}/content endpoint
+  - Reads persisted Obsidian .md from vault path (sourced from tool.vaultwriter.completed event)
+  - Path traversal guarded by exported tools.ValidateWithinVault
+  - Graceful degradation: returns {available: false} if file missing (HTTP 200)
+  - Frontend history detail renders note markdown + timeline together
+
+- **arXiv Pagination** — offset-based "Load more" within a session
+  - DiscoveryTool.FetchPapersFrom(start int) offset parameter
+  - POST /discover/{sessionId}/more extends candidates during StageSelection
+  - Session tracks ConsumeNextStart cursor for next offset
+  - Guarded: returns 409 if not in selection stage
+  - Frontend accumulates candidates, dedup by ID
+
+**Key Files:**
+- Backend: tracing/scrub.go (distinct caps), run events for PayloadFull content, discovery.go (FetchPapersFrom)
+- Endpoints: GET /runs/{id}/content, POST /discover/{sessionId}/more
+- Frontend: GET /api/runs/{id}/content route, "Load more" button, history content panel
+
+**Architecture Notes:**
+- No new database schema: reuses run_events.payload_full JSONB from Phase 7
+- Session.ConsumeNextStart new field for pagination cursor
+- VaultFile field in PipelineSession enables content lookup
+
+**Test Coverage:**
+- PayloadFull scrubbing with distinct caps
+- Missing vault file returns {available: false} gracefully
+- Pagination cursor tracking and offset accumulation
+- Dedup logic in frontend candidate merge
+
+---
+
 ## Key Milestones
 
 | Milestone | Date | Achieved |
@@ -306,6 +348,9 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 | Phase 6 polish & hardening | 2026-07-05 | ✅ Yes |
 | Phase 7 run timeline tracing (live & persistent) | 2026-07-12 | ✅ Yes |
 | User can browse and reopen past runs | 2026-07-12 | ✅ Yes |
+| Phase 8 full reasoning trace + content replay + pagination | 2026-07-13 | ✅ Yes |
+| History detail shows note markdown + live timeline | 2026-07-13 | ✅ Yes |
+| Discovery supports "Load more" pagination | 2026-07-13 | ✅ Yes |
 
 ---
 
