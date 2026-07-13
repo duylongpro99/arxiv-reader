@@ -75,18 +75,30 @@ type arxivLink struct {
 	Type string `xml:"type,attr"`
 }
 
-// FetchPapers queries arXiv (newest first) and returns up to cfg.FetchLimit
-// papers. It retries transient failures (429/5xx) with exponential backoff and
-// aborts promptly if ctx is cancelled. An empty-but-well-formed feed returns an
-// empty slice with no error — "no papers right now" is not a failure.
+// FetchPapers queries arXiv (newest first) for the FIRST page (start=0) and
+// returns up to cfg.FetchLimit papers. It delegates to FetchPapersFrom so the
+// one existing caller (orchestrator-pipeline.go's runDiscovery) needs no change
+// while Feature C (pagination) is added — see FetchPapersFrom.
 //
 // onRetry (optional; pass nil when not needed) is invoked with the attempt
 // number on each transient retry, letting the caller surface a progress counter
 // (F5) WITHOUT this tool depending on the session. It keeps DiscoveryTool
 // decoupled — the callback is the only seam.
 func (t *DiscoveryTool) FetchPapers(ctx context.Context, onRetry func(attempt int)) ([]models.Paper, error) {
-	start := time.Now()
-	reqURL := t.buildQueryURL()
+	return t.FetchPapersFrom(ctx, 0, onRetry)
+}
+
+// FetchPapersFrom queries arXiv (newest first) starting at the given offset and
+// returns up to cfg.FetchLimit papers. It retries transient failures (429/5xx)
+// with exponential backoff and aborts promptly if ctx is cancelled. An
+// empty-but-well-formed feed returns an empty slice with no error — "no papers
+// right now" is not a failure.
+//
+// start lets a caller page through older results (Feature C: "load more" via
+// session extension) without this tool knowing anything about sessions.
+func (t *DiscoveryTool) FetchPapersFrom(ctx context.Context, start int, onRetry func(attempt int)) ([]models.Paper, error) {
+	fetchStart := time.Now()
+	reqURL := t.buildQueryURL(start)
 
 	body, err := t.fetchWithRetry(ctx, reqURL, onRetry)
 	if err != nil {
@@ -107,21 +119,23 @@ func (t *DiscoveryTool) FetchPapers(ctx context.Context, onRetry func(attempt in
 
 	slog.Info("arxiv fetch complete",
 		"component", "discovery",
+		"start", start,
 		"count", len(papers),
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", time.Since(fetchStart).Milliseconds(),
 	)
 	return papers, nil
 }
 
-// buildQueryURL assembles the arXiv query. The category comes from config, never
-// user input (PRD §7), so there is no injection surface.
-func (t *DiscoveryTool) buildQueryURL() string {
+// buildQueryURL assembles the arXiv query at the given start offset. The
+// category comes from config, never user input (PRD §7), so there is no
+// injection surface.
+func (t *DiscoveryTool) buildQueryURL(start int) string {
 	q := url.Values{}
 	q.Set("search_query", "cat:"+t.cfg.ArxivCategory)
 	q.Set("sortBy", "submittedDate")
 	q.Set("sortOrder", "descending")
 	q.Set("max_results", fmt.Sprintf("%d", t.cfg.FetchLimit))
-	q.Set("start", "0")
+	q.Set("start", fmt.Sprintf("%d", start))
 	return t.cfg.ArxivBaseURL + "?" + q.Encode()
 }
 

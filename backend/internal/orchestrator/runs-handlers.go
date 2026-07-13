@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/store"
+	"github.com/maritime-ds/arxiv-reader/internal/tools"
+	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
 // This file holds the Phase 7 read/stream endpoints: the live SSE timeline and
@@ -209,6 +213,81 @@ func (o *Orchestrator) HandleRun(w http.ResponseWriter, r *http.Request) {
 		dtos = append(dtos, eventDTOFromRecord(e))
 	}
 	writeJSON(w, http.StatusOK, RunDetailResponse{Run: runDTOFromRecord(run), Events: dtos})
+}
+
+// HandleRunContent serves the persisted Obsidian note for a past run (Feature
+// B: History content). The vault path is not a first-class column — it lives
+// only in the run's tool.vaultwriter.completed event (Summary["path"], set at
+// orchestrator-pipeline.go's vault-write step) — so this reads the full
+// timeline and picks it out. A missing event (run never reached the writing
+// stage) or a vault file that no longer exists on disk is NOT an error: the
+// run simply has no content to show right now (available:false, HTTP 200).
+func (o *Orchestrator) HandleRunContent(w http.ResponseWriter, r *http.Request) {
+	if o.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "run history is unavailable (no database configured)"})
+		return
+	}
+	id := r.PathValue("id")
+	ctx, cancel := context.WithTimeout(r.Context(), dbReadTimeout)
+	defer cancel()
+
+	events, err := o.store.ListEvents(ctx, id, -1)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot read run"})
+		return
+	}
+
+	path, ok := vaultPathFromEvents(events)
+	if !ok {
+		writeJSON(w, http.StatusOK, RunContentDTO{Available: false})
+		return
+	}
+
+	// Path-traversal guard: never read outside the configured Obsidian vault.
+	// Defense in depth — this path always originates from our own vault write,
+	// but a corrupted/forged event row must not turn this into an arbitrary file
+	// read. Shares tools.ValidateWithinVault with the write side so the read and
+	// write halves of the trust boundary can never drift apart.
+	if err := tools.ValidateWithinVault(o.cfg.Paths.ObsidianVault, path); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid vault path"})
+		return
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The note was moved/deleted outside the app — not a server error.
+			writeJSON(w, http.StatusOK, RunContentDTO{Path: path, Available: false})
+			return
+		}
+		// Generic message only — never echo the OS error (may embed the path) or
+		// file content into the response/logs (CLAUDE.md: no raw content in logs).
+		slog.Error("run content read failed", "run_id", id)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot read note"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, RunContentDTO{Path: path, Available: true, Markdown: string(content)})
+}
+
+// vaultPathFromEvents scans a run's persisted timeline for the
+// tool.vaultwriter.completed event and extracts its recorded path. ok=false
+// when no such event exists (run never reached the writing stage) or its
+// summary is malformed/empty.
+func vaultPathFromEvents(events []store.EventRecord) (path string, ok bool) {
+	for _, e := range events {
+		if e.EventType != string(tracing.KindToolVaultWriterCompleted) {
+			continue
+		}
+		var summary struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(e.Summary, &summary); err != nil || summary.Path == "" {
+			return "", false
+		}
+		return summary.Path, true
+	}
+	return "", false
 }
 
 // queryInt reads a non-negative integer query param, falling back to def on

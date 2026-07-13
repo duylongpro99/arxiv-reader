@@ -28,6 +28,16 @@ const systemPromptTokenAllowance = 900
 // This file holds the detached background goroutines (discovery + extraction)
 // and their shared helpers, kept separate from the HTTP surface in orchestrator.go.
 
+// withPayload attaches an opt-in full payload (prompts/response) to an event,
+// mirroring withSummary (tracing.go) for one-line emit call sites. The
+// recorder drops PayloadFull entirely unless Tracing.FullPayloads is on
+// (tracing/recorder.go), so callers can attach it unconditionally — no need to
+// branch on config here.
+func withPayload(e tracing.Event, kv map[string]any) tracing.Event {
+	e.PayloadFull = kv
+	return e
+}
+
 // runDiscovery executes the pipeline and records the result on the session.
 func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.PipelineSession) {
 	// This goroutine is fully detached from the request lifecycle, so an
@@ -349,6 +359,13 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 			"preview": preview(ex.Content, 200),
 		}
 		genDone.DurationMS = tracing.MS(time.Since(genStart))
+		if ex.Trace != nil {
+			genDone = withPayload(genDone, map[string]any{
+				"systemPrompt": ex.Trace.SystemPrompt,
+				"userPrompt":   ex.Trace.UserPrompt,
+				"response":     ex.Trace.RawResponse,
+			})
+		}
 		o.rec(s).Emit(genDone)
 
 		if maxIter == 0 {
@@ -372,8 +389,23 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 			s.AddIO(verdict.InputTokens, verdict.OutputTokens)
 			rc := tev(tracing.KindLLMReviewerCompleted, tracing.StatusWarning, models.StageReviewing,
 				"Reviewer response unparseable — accepting current draft")
-			rc.Summary = map[string]any{"iteration": iteration, "pass": false, "parseError": true}
+			// Include a human-readable decision so the timeline shows a plain-English
+			// row for this exit, matching the accept/revise/max-iterations branches
+			// (the frontend renders `narrative` for any event that carries it).
+			rc.Summary = map[string]any{
+				"iteration": iteration, "pass": false, "parseError": true,
+				"decision":  "stopped_unparseable",
+				"onPass":    iteration,
+				"narrative": fmt.Sprintf("Stopped on pass %d — reviewer output was unparseable; kept the current draft unreviewed", iteration),
+			}
 			rc.DurationMS = tracing.MS(time.Since(reviewStart))
+			if verdict.Trace != nil {
+				rc = withPayload(rc, map[string]any{
+					"systemPrompt": verdict.Trace.SystemPrompt,
+					"userPrompt":   verdict.Trace.UserPrompt,
+					"response":     verdict.Trace.RawResponse,
+				})
+			}
 			o.rec(s).Emit(rc)
 			slog.Warn("reviewer json parse failed; stopping loop", "session_id", s.SessionID, "iteration", iteration)
 			break
@@ -407,26 +439,56 @@ func (o *Orchestrator) runGenerateReview(ctx context.Context, s *models.Pipeline
 			"feedbackKeys": feedbackKeys(verdict.Feedback),
 		}
 		rc.DurationMS = tracing.MS(time.Since(reviewStart))
+		if verdict.Trace != nil {
+			rc = withPayload(rc, map[string]any{
+				"systemPrompt": verdict.Trace.SystemPrompt,
+				"userPrompt":   verdict.Trace.UserPrompt,
+				"response":     verdict.Trace.RawResponse,
+			})
+		}
 		o.rec(s).Emit(rc)
 
 		if verdict.Pass {
-			o.rec(s).Emit(tev(tracing.KindDecisionAccept, tracing.StatusSuccess, models.StageReviewing, "Explainer accepted"))
+			// Human-readable decision summary (decision/onPass/narrative) so the
+			// frontend timeline can render a plain-English sentence instead of a
+			// bare "reviewIterations 1" key/value pair.
+			o.rec(s).Emit(withSummary(
+				tev(tracing.KindDecisionAccept, tracing.StatusSuccess, models.StageReviewing, "Explainer accepted"),
+				map[string]any{
+					"decision":  "accepted",
+					"onPass":    iteration,
+					"narrative": fmt.Sprintf("Accepted on pass %d — reviewer found no blocking issues", iteration),
+				}))
 			slog.Info("reviewer approved explainer", "session_id", s.SessionID, "iteration", iteration, "score", verdict.Score)
 			break
 		}
 		if iteration >= maxIter {
+			sections := feedbackKeys(verdict.Feedback)
 			o.rec(s).Emit(withSummary(
 				tev(tracing.KindDecisionMaxIterations, tracing.StatusWarning, models.StageReviewing,
 					fmt.Sprintf("Max iterations reached — saving best draft (score %.2f)", verdict.Score)),
-				map[string]any{"finalScore": verdict.Score, "maxIterations": maxIter}))
+				map[string]any{
+					"decision":        "max_iterations",
+					"finalScore":      verdict.Score,
+					"maxIterations":   maxIter,
+					"flaggedSections": sections,
+					"narrative": fmt.Sprintf("Stopped after %d passes (max reached); last review still flagged: %s",
+						maxIter, sectionsOrNone(sections)),
+				}))
 			slog.Warn("max review iterations reached without approval", "session_id", s.SessionID, "final_score", verdict.Score)
 			break
 		}
 		// Not passed and iterations remain: build the note for the next revision.
+		sections := feedbackKeys(verdict.Feedback)
 		o.rec(s).Emit(withSummary(
 			tev(tracing.KindDecisionRevise, tracing.StatusInfo, models.StageReviewing,
 				fmt.Sprintf("Revising — %d section(s) flagged", len(verdict.Feedback))),
-			map[string]any{"flagged": len(verdict.Feedback)}))
+			map[string]any{
+				"decision":        "revise",
+				"flagged":         len(verdict.Feedback),
+				"flaggedSections": sections,
+				"narrative":       fmt.Sprintf("Revised: %s flagged", sectionsOrNone(sections)),
+			}))
 		revisionNote = agents.FormatRevisionNote(verdict)
 	}
 	return true // explainer stored on the session; vault write happens in runPipeline
@@ -442,6 +504,16 @@ func feedbackKeys(feedback map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// sectionsOrNone renders flagged section slugs as a comma-separated narrative
+// clause. Falls back to a readable phrase for the edge case of a not-passed
+// verdict carrying no feedback (reviewer said fail but gave no section notes).
+func sectionsOrNone(sections []string) string {
+	if len(sections) == 0 {
+		return "no specific section"
+	}
+	return strings.Join(sections, ", ")
 }
 
 // newSession creates a session with a unique, dependency-free random ID.

@@ -29,6 +29,15 @@ type PaperFetcher interface {
 	FetchPapers(ctx context.Context, onRetry func(attempt int)) ([]models.Paper, error)
 }
 
+// PageFetcher is the narrow, consumer-side contract for Feature C (arXiv
+// pagination via session extension): fetching an arbitrary page by start
+// offset. Kept as its OWN interface (rather than adding a method to
+// PaperFetcher) so the existing PaperFetcher fakes used by orchestrator_test.go
+// keep compiling unchanged — this is strictly additive.
+type PageFetcher interface {
+	FetchPapersFrom(ctx context.Context, start int, onRetry func(attempt int)) ([]models.Paper, error)
+}
+
 type Unprocessor interface {
 	FilterUnprocessed(papers []models.Paper) ([]models.Paper, error)
 }
@@ -61,6 +70,7 @@ type Orchestrator struct {
 	sessions  sync.Map // sessionID -> *models.PipelineSession
 	cfg       *config.Config
 	disco     PaperFetcher
+	discoMore PageFetcher // Feature C: pagination — same concrete tool as disco, narrower interface
 	logCheck  Unprocessor
 	content   PaperContent // Phase 3: HTML → Markdown extraction
 	explainer Explainer    // Phase 4: LLM re-teaching generation
@@ -109,9 +119,15 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	tracer := tracing.New(cfg.Tracing.Enabled, ev, rw,
 		cfg.Tracing.FullPayloads, cfg.Tracing.BufferSize, cfg.LLM.APIKey, cfg.DatabaseURL)
 
+	// One concrete DiscoveryTool instance backs both the PaperFetcher (first
+	// page, used by runDiscovery) and PageFetcher (arbitrary page, used by
+	// HandleDiscoverMore) roles — it implements both methods; only the narrower
+	// interface each caller depends on differs.
+	disco := tools.NewDiscoveryTool(&cfg.Agent)
 	o := &Orchestrator{
 		cfg:       cfg,
-		disco:     tools.NewDiscoveryTool(&cfg.Agent),
+		disco:     disco,
+		discoMore: disco,
 		logCheck:  logCheck,
 		content:   tools.NewPaperContentTool(&cfg.Agent),
 		explainer: agents.New(client, cfg),
@@ -326,4 +342,70 @@ func (o *Orchestrator) HandleResult(w http.ResponseWriter, r *http.Request) {
 		EstimatedCostUSD: cost,
 		CostKnown:        known,
 	})
+}
+
+// HandleDiscoverMore extends an EXISTING discovery session with the next page
+// of arXiv results (Feature C). Pagination is deliberately tied to the session
+// rather than a decoupled browse endpoint: HandleProcess only accepts a
+// paper_id that is already present in the session's own Candidates, so a
+// separate/stateless "browse more" endpoint would produce papers /process
+// could never select. Synchronous (unlike HandleDiscover) because a single
+// arXiv page fetch is fast enough to return inline — no polling needed.
+func (o *Orchestrator) HandleDiscoverMore(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sessionId")
+	v, ok := o.sessions.Load(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	s := v.(*models.PipelineSession)
+
+	// Only paginate while candidates are ready and awaiting a pick. Discovery
+	// runs in a detached goroutine and finalizes with Complete(), which REPLACES
+	// the candidate slice — so a /more that lands before discovery completes would
+	// fetch a page, AppendCandidates it, and then have it silently overwritten
+	// (wasted arXiv call + a desynced cursor). Guard before consuming the cursor
+	// so a rejected call never advances nextStart.
+	if s.Snapshot().Stage != models.StageSelection {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "discovery not ready for pagination"})
+		return
+	}
+
+	// Claim the next page under the session's own lock (ConsumeNextStart) so two
+	// concurrent /more calls on the same session can never re-fetch or skip a
+	// page — see the method doc for why a plain get-then-set would race here.
+	fetchLimit := o.cfg.Agent.FetchLimit
+	start := s.ConsumeNextStart(fetchLimit)
+
+	papers, err := o.discoMore.FetchPapersFrom(r.Context(), start, nil)
+	if err != nil {
+		msg, _, _ := describeError(err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
+		return
+	}
+
+	unprocessed, err := o.logCheck.FilterUnprocessed(papers)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "cannot filter processed papers"})
+		return
+	}
+	s.AppendCandidates(unprocessed)
+
+	// hasMore is a heuristic on the RAW page (before dedup filtering): a
+	// full-sized page suggests arXiv likely has more beyond it; a short page
+	// means we hit the end of the feed.
+	hasMore := len(papers) == fetchLimit
+
+	slog.Info("discover more",
+		"session_id", id, "start", start, "fetched", len(papers), "new", len(unprocessed))
+
+	// Timeline: record the extra fetch so history reflects it (optional per the
+	// plan; reuses the existing discovery-completed kind rather than adding a
+	// new EventKind constant, which lives in a file owned by a parallel phase).
+	more := tev(tracing.KindToolDiscoveryCompleted, tracing.StatusSuccess, models.StageSelection,
+		fmt.Sprintf("Fetched %d more papers from arXiv (%d new)", len(papers), len(unprocessed)))
+	more.Summary = map[string]any{"start": start, "count": len(papers), "new": len(unprocessed)}
+	o.rec(s).Emit(more)
+
+	writeJSON(w, http.StatusOK, DiscoverMoreDTO{Candidates: unprocessed, HasMore: hasMore})
 }

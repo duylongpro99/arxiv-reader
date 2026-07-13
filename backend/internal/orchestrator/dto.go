@@ -119,6 +119,28 @@ type RunDetailResponse struct {
 	Events []EventDTO `json:"events"`
 }
 
+// RunContentDTO serves the persisted Obsidian note for a past run (Feature B:
+// GET /runs/{id}/content). Available=false (Path/Markdown omitted, or Path set
+// but Markdown empty) means there is nothing to show — the run never reached
+// the vault-write stage, or the note file no longer exists on disk. Both are
+// normal, non-error states (HTTP 200), never a 500.
+type RunContentDTO struct {
+	Path      string `json:"path,omitempty"`
+	Available bool   `json:"available"`
+	Markdown  string `json:"markdown,omitempty"`
+}
+
+// DiscoverMoreDTO is the appended page of arXiv candidates returned by
+// POST /discover/{sessionId}/more (Feature C: pagination via session
+// extension). Candidates reuses models.Paper — the same shape
+// StatusResponse.Candidates already uses — so the frontend's existing
+// candidate rendering works unchanged. HasMore is a heuristic: true when the
+// raw arXiv page (before dedup filtering) was full-sized.
+type DiscoverMoreDTO struct {
+	Candidates []models.Paper `json:"candidates"`
+	HasMore    bool           `json:"hasMore"`
+}
+
 // eventDTOFromEvent maps a live tracing.Event to the wire shape, marshalling the
 // (already-scrubbed) summary/payload maps to JSON.
 func eventDTOFromEvent(e tracing.Event) EventDTO {

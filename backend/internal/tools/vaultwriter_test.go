@@ -119,13 +119,13 @@ func TestWriteToVaultRenameFailureCleansTmp(t *testing.T) {
 
 func TestValidateWithinBaseRejectsTraversal(t *testing.T) {
 	base := "/home/u/vault"
-	if err := validateWithinBase(base, "/home/u/vault/AI Papers/note.md"); err != nil {
+	if err := ValidateWithinVault(base, "/home/u/vault/AI Papers/note.md"); err != nil {
 		t.Fatalf("legitimate child rejected: %v", err)
 	}
-	if err := validateWithinBase(base, "/home/u/vault2/note.md"); err == nil {
+	if err := ValidateWithinVault(base, "/home/u/vault2/note.md"); err == nil {
 		t.Fatal("sibling /vault2 must be rejected (prefix false-match)")
 	}
-	if err := validateWithinBase(base, "/home/u/vault/../etc/passwd"); err == nil {
+	if err := ValidateWithinVault(base, "/home/u/vault/../etc/passwd"); err == nil {
 		t.Fatal("traversal must be rejected")
 	}
 }

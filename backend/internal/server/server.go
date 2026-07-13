@@ -26,6 +26,7 @@ func Handler(cfg *config.Config) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler) // method-based routing (Go 1.22+)
 	mux.HandleFunc("POST /discover", orch.HandleDiscover)
+	mux.HandleFunc("POST /discover/{sessionId}/more", orch.HandleDiscoverMore)
 	mux.HandleFunc("POST /process", orch.HandleProcess)
 	mux.HandleFunc("POST /retry/{sessionId}", orch.HandleRetry)
 	mux.HandleFunc("GET /status/{sessionId}", orch.HandleStatus)
@@ -35,6 +36,7 @@ func Handler(cfg *config.Config) (http.Handler, error) {
 	mux.HandleFunc("GET /runs", orch.HandleRunsList)
 	mux.HandleFunc("GET /runs/{id}", orch.HandleRun)
 	mux.HandleFunc("GET /runs/{id}/events", orch.HandleRunEvents)
+	mux.HandleFunc("GET /runs/{id}/content", orch.HandleRunContent)
 
 	return corsMiddleware(mux), nil
 }
