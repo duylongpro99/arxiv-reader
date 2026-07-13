@@ -2,9 +2,11 @@
 // never the Go backend directly — the backend address stays server-side.
 
 import type {
+  DiscoverMoreResult,
   PipelineStatus,
   ResultResponse,
   RetryResponse,
+  RunContent,
   SelectResponse,
   TriggerResponse,
 } from "./types";
@@ -78,6 +80,45 @@ export async function fetchResult(sessionId: string): Promise<ResultResponse> {
   );
   if (!res.ok) {
     throw new Error(`Failed to fetch result (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// getRunContent retrieves a past run's generated note markdown via the
+// /api/runs/:id/content proxy. `available:false` is still a 200 (no note to
+// show, not an error); non-OK responses (e.g. 503 when history is unavailable)
+// throw with the HTTP status attached so callers can special-case it, mirroring
+// how useRun/useRuns detect the 503 "history disabled" case.
+export async function getRunContent(id: string): Promise<RunContent> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(id)}/content`);
+  if (!res.ok) {
+    const err = new Error(`Failed to fetch run content (HTTP ${res.status})`) as Error & {
+      status?: number;
+    };
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+// fetchMoreCandidates asks the backend for the next page of candidate papers for
+// an existing discovery session ("load more" on the candidate list). The call is
+// synchronous — the response already contains the new page, no polling needed.
+// Throws on a non-OK response (e.g. 404 when the session expired).
+export async function fetchMoreCandidates(
+  sessionId: string,
+): Promise<DiscoverMoreResult> {
+  const res = await fetch(
+    `/api/discover/${encodeURIComponent(sessionId)}/more`,
+    { method: "POST" },
+  );
+  if (!res.ok) {
+    // 404 is the contract's "session expired/evicted" case — give an actionable
+    // message rather than a bare HTTP code the user can't act on.
+    if (res.status === 404) {
+      throw new Error("This search session expired — start a new search to load more.");
+    }
+    throw new Error(`Failed to load more papers (HTTP ${res.status})`);
   }
   return res.json();
 }
