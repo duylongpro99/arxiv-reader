@@ -120,11 +120,13 @@ GET  /api/preview        → fetches final generated content
 
 **Interface:**
 ```
-POST /discover           → triggers DiscoveryTool + LogCheckTool
-POST /process            → triggers full pipeline for selected paper ID
-GET  /status/:sessionId  → returns current pipeline stage + progress
-GET  /result/:sessionId  → returns final explainer content
-GET  /health             → sanity check endpoint
+POST /discover                    → triggers DiscoveryTool + LogCheckTool (start=0)
+POST /discover/:sessionId/more     → appends more candidates to existing session (offset pagination)
+POST /process                     → triggers full pipeline for selected paper ID
+GET  /status/:sessionId           → returns current pipeline stage + progress
+GET  /result/:sessionId           → returns final explainer content
+GET  /runs/:id/content            → returns persisted Obsidian .md note (Phase 8)
+GET  /health                      → sanity check endpoint
 ```
 
 **Dependencies:** All tools and sub-agents, LLM Client, Config
@@ -152,7 +154,8 @@ type Paper struct {
     Published time.Time
 }
 
-func FetchPapers(ctx context.Context, limit int) ([]Paper, error)
+func FetchPapers(ctx context.Context, limit int) ([]Paper, error)         // start=0, implicit
+func FetchPapersFrom(ctx context.Context, start int, limit int) ([]Paper, error) // Phase 8: offset pagination
 ```
 
 **Dependencies:** arXiv API (external HTTP)
@@ -407,12 +410,17 @@ type Event struct {
     Stage      string       // PipelineStage
     Title      string       // Human one-liner
     Status     string       // "info" | "success" | "warning" | "error"
-    Summary    JSONB        // Small structured fields (~500-char previews)
-    PayloadFull JSONB       // Nullable; opt-in full trace only
+    Summary    JSONB        // Small structured fields (~500-char previews, capped)
+    PayloadFull JSONB       // Nullable; opt-in full trace only (Phase 8+)
+                           // For llm.explainer.completed: {systemPrompt, userPrompt, response}
+                           // For llm.reviewer.completed: {systemPrompt, userPrompt, response}
+                           // For decision.*: {decision, onPass, flaggedSections, narrative}
     DurationMs *int        // Optional duration
     CreatedAt  time.Time
 }
 ```
+
+**PayloadFull Population (Phase 8):** When config `tracing.full_payloads = true`, PayloadFull is populated for explainer/reviewer LLM calls and decision events. Secret scrubber redacts API keys from both Summary (previewCap: 500 chars) and PayloadFull (payloadCap: 100,000 chars) independently, preventing truncation of full payloads.
 
 **Degradation:** Database unavailable → recorder operates in-memory only. Live SSE timeline works; history and cross-restart reload return 503. Pipeline completes normally, never fatal.
 
@@ -458,8 +466,9 @@ explainer:
 
 tracing:
   enabled: true                     # master switch for the Recorder (Phase 7)
-  full_payloads: false              # opt-in: store full prompts/responses/markdown
+  full_payloads: false              # Phase 8: opt-in full prompts/responses for explainer/reviewer events
   buffer_size: 256                  # per-run in-memory ring capacity
+  # Secret scrubber caps: summary ~500 chars, payload_full ~100k chars (distinct to avoid truncation)
 ```
 
 > **Path resolution:** `.env` value for `OBSIDIAN_VAULT_PATH` takes precedence over `config.yaml`. This keeps `config.yaml` version-control safe while allowing machine-specific paths in `.env`.
@@ -518,23 +527,30 @@ type ReviewVerdict struct {
 ### PipelineSession
 ```go
 type PipelineSession struct {
-    SessionID   string
-    Stage       PipelineStage
-    Iteration   int               // Phase 5: current reviewer/revision loop iteration (incremented each round)
-    Candidates  []Paper           // frontend-visible: candidates for selection
-    Notice      string            // optional user-facing message
-    Error       string            // error message if stage = "failed"
-    Recoverable bool              // whether error is transient (can retry)
+    SessionID      string
+    Stage          PipelineStage
+    Iteration      int               // Phase 5: current reviewer/revision loop iteration (incremented each round)
+    Candidates     []Paper           // frontend-visible: candidates for selection (Phase 8: append via AppendCandidates)
+    nextStart      int               // Phase 8: arXiv offset cursor for next pagination page; claimed+advanced atomically via ConsumeNextStart(step)
+    Notice         string            // optional user-facing message
+    Error          string            // error message if stage = "failed"
+    Recoverable    bool              // whether error is transient (can retry)
     
     // Server-only (excluded from Snapshot, never sent to frontend)
-    SelectedPaper *Paper          // paper user selected
-    MarkdownText  string          // extracted HTML→Markdown from PaperContentTool
-    Explainer     *ExplainerOutput    // Phase 4+5: current explainer (updated each iteration)
-    Verdict       *ReviewVerdict      // Phase 5: review result from last iteration (nil if reviewer disabled or not yet reviewed)
+    SelectedPaper *Paper            // paper user selected
+    MarkdownText  string            // extracted HTML→Markdown from PaperContentTool
+    Explainer     *ExplainerOutput  // Phase 4+5: current explainer (updated each iteration)
+    Verdict       *ReviewVerdict    // Phase 5: review result from last iteration (nil if reviewer disabled or not yet reviewed)
+    // Note: the written note path is NOT stored on the session. GET /runs/{id}/content
+    // recovers it from the persisted tool.vaultwriter.completed event's Summary["path"].
     
     StartedAt     time.Time
     CompletedAt   *time.Time
 }
+
+// Phase 8: AppendCandidates(newCandidates []Paper) appends to Candidates during StageSelection
+// (safe concurrent access via session mutex)
+```
 
 type PipelineStage string
 const (
@@ -581,7 +597,7 @@ CREATE TABLE runs (
 );
 ```
 
-### EventRecord (PostgreSQL — Phase 7, optional)
+### EventRecord (PostgreSQL — Phase 7+, optional)
 ```sql
 CREATE TABLE run_events (
     run_id       TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -591,7 +607,8 @@ CREATE TABLE run_events (
     title        TEXT NOT NULL,
     status       TEXT NOT NULL,             -- info | success | warning | error
     summary      JSONB,
-    payload_full JSONB,                     -- nullable; opt-in full trace only
+    payload_full JSONB,                     -- Phase 8: opt-in via tracing.full_payloads config
+                                           -- Populated for llm.explainer.completed, llm.reviewer.completed, decision.* events
     duration_ms  INT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, seq)
@@ -974,12 +991,18 @@ Content: DocumentText as inline text part
 **Communication:** HTTP on localhost only. CORS restricted to `localhost:3000`.
 
 ```
-POST   localhost:8080/discover         → { session_id, candidates: [Paper] }
-POST   localhost:8080/process          → { session_id } (async processing begins)
-GET    localhost:8080/status/:id       → { stage, iteration, error }
-GET    localhost:8080/result/:id       → { content, vault_file_path }
-GET    localhost:8080/health           → { status: "ok" }
+POST   localhost:8080/discover                 → { session_id, candidates: [Paper] }
+POST   localhost:8080/discover/:sessionId/more → { candidates: [Paper] } (Phase 8: offset pagination)
+POST   localhost:8080/process                  → { session_id } (async processing begins)
+GET    localhost:8080/status/:id               → { stage, iteration, error }
+GET    localhost:8080/result/:id               → { content, vault_file_path }
+GET    localhost:8080/runs/:id/content         → { available: bool, content?: string } (Phase 8)
+GET    localhost:8080/health                   → { status: "ok" }
 ```
+
+**Phase 8 Endpoints:**
+- `POST /discover/:sessionId/more` — appends additional arXiv candidates to existing session during StageSelection; returns 409 if not in selection stage
+- `GET /runs/:id/content` — fetches persisted Obsidian note markdown from disk; returns {available: false} gracefully if file missing (vault write failed or file deleted)
 
 ---
 
