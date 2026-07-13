@@ -72,6 +72,13 @@ type PipelineSession struct {
 	outputTokens    int
 	arxivRetryCount int
 	contextWarning  *ContextWarning
+	// nextStart is the Feature C (arXiv pagination) cursor: the arXiv `start`
+	// offset the NEXT /discover/{id}/more call should fetch from. Zero means "no
+	// page has been fetched via /more yet" — the first discovery page already
+	// consumed arXiv offsets [0, FetchLimit), so ConsumeNextStart treats a zero
+	// cursor as "use FetchLimit" rather than needing runDiscovery (owned by a
+	// parallel phase) to initialize it explicitly.
+	nextStart int
 }
 
 // SessionSnapshot is an immutable, mutex-free copy of a session's observable
@@ -408,4 +415,34 @@ func (s *PipelineSession) ContextWarning() *ContextWarning {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.contextWarning
+}
+
+// --- Feature C: arXiv pagination via session extension ---
+
+// ConsumeNextStart atomically returns the arXiv `start` offset to fetch next
+// and advances the cursor by step (the configured FetchLimit) under a single
+// lock, so two concurrent /more calls on the same session can never re-fetch
+// or skip a page (a plain get-then-set from the handler would race across the
+// network call in between). A zero cursor means "first /more call" — the
+// initial discovery page already consumed [0, step), so the next page starts
+// at step.
+func (s *PipelineSession) ConsumeNextStart(step int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	start := s.nextStart
+	if start == 0 {
+		start = step
+	}
+	s.nextStart = start + step
+	return start
+}
+
+// AppendCandidates extends the session's candidate list with a newly fetched
+// page (Feature C), keeping /status and /process consistent with the larger
+// set — a subsequent /process can select any appended paper because it now
+// lives in the same Candidates slice /status already reports.
+func (s *PipelineSession) AppendCandidates(papers []Paper) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.candidates = append(s.candidates, papers...)
 }

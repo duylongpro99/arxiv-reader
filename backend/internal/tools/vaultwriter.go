@@ -45,7 +45,7 @@ func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerO
 
 	// Defense-in-depth: even though slugify strips separators, verify the final
 	// path stays within the configured vault base before touching the disk.
-	if err := validateWithinBase(t.cfg.Paths.ObsidianVault, finalPath); err != nil {
+	if err := ValidateWithinVault(t.cfg.Paths.ObsidianVault, finalPath); err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
@@ -77,15 +77,17 @@ func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerO
 	return finalPath, nil
 }
 
-// validateWithinBase rejects a target path that escapes the configured vault
+// ValidateWithinVault rejects a target path that escapes the configured vault
 // base (e.g. via a "../" injected through a crafted title or arXiv ID). It
 // compares cleaned paths with a separator-aware prefix so "/vault2" is not
-// mistaken for a child of "/vault".
-func validateWithinBase(base, target string) error {
+// mistaken for a child of "/vault". Exported so both the write side (VaultWriter)
+// and the read side (run-content handler) share ONE trust boundary — a single
+// place to harden, avoiding asymmetric-guard drift.
+func ValidateWithinVault(base, target string) error {
 	cleanBase := filepath.Clean(base)
 	cleanTarget := filepath.Clean(target)
 	if cleanTarget == cleanBase {
-		return fmt.Errorf("refusing to write vault base itself: %q", cleanTarget)
+		return fmt.Errorf("refusing to access vault base itself: %q", cleanTarget)
 	}
 	prefix := cleanBase + string(os.PathSeparator)
 	if !strings.HasPrefix(cleanTarget, prefix) {
