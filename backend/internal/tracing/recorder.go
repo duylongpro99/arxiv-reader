@@ -107,7 +107,7 @@ func (r *Recorder) Emit(evt Event) {
 	// Scrub BOTH channels of leakage before the event is buffered/streamed/stored.
 	evt.Summary = r.scrub.scrubMap(evt.Summary)
 	if r.cfg.fullPayloads {
-		evt.PayloadFull = r.scrub.scrubMap(evt.PayloadFull)
+		evt.PayloadFull = r.scrub.scrubMapFull(evt.PayloadFull)
 	} else {
 		evt.PayloadFull = nil // opt-in only
 	}

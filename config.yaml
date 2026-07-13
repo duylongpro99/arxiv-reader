@@ -36,5 +36,5 @@ agent:
 # history + cross-restart reload are disabled. Never breaks the paper pipeline.
 tracing:
   enabled: true          # master switch for the Recorder (override: TRACING_ENABLED)
-  full_payloads: false   # opt-in: persist full prompts/responses/markdown (override: TRACING_FULL_PAYLOADS)
+  full_payloads: true    # opt-in: persist full prompts/responses/markdown (override: TRACING_FULL_PAYLOADS)
   buffer_size: 256       # per-run in-memory ring capacity feeding SSE replay; > 0 when enabled

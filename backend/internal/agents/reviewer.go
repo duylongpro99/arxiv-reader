@@ -81,6 +81,13 @@ func (a *ReviewerAgent) Review(ctx context.Context, ex models.ExplainerOutput, p
 			InputTokens:  resp.InputTokens,
 			OutputTokens: resp.OutputTokens,
 			CreatedAt:    time.Now().UTC(),
+			// The LLM call itself succeeded (only the JSON parse failed), so the
+			// prompt/response trio is still real and worth surfacing for debugging.
+			Trace: &models.LLMTrace{
+				SystemPrompt: req.SystemPrompt,
+				UserPrompt:   req.UserPrompt,
+				RawResponse:  resp.Content,
+			},
 		}
 		return v, fmt.Errorf("%w: %v", ErrReviewParse, err)
 	}
@@ -103,6 +110,13 @@ func (a *ReviewerAgent) Review(ctx context.Context, ex models.ExplainerOutput, p
 		InputTokens:  resp.InputTokens,
 		OutputTokens: resp.OutputTokens,
 		CreatedAt:    time.Now().UTC(),
+		// req.UserPrompt excludes the source paper (DocumentText is intentionally
+		// left empty on this request — see the comment on req above, T3).
+		Trace: &models.LLMTrace{
+			SystemPrompt: req.SystemPrompt,
+			UserPrompt:   req.UserPrompt,
+			RawResponse:  resp.Content,
+		},
 	}
 
 	slog.Info("review complete",

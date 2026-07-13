@@ -56,6 +56,23 @@ func TestScrubTruncatesLongStrings(t *testing.T) {
 	}
 }
 
+func TestScrubMapFullPreservesLongPayloadButStillRedacts(t *testing.T) {
+	// PayloadFull carries whole prompts/responses. A string that the summary cap
+	// would truncate must survive intact under the payload cap...
+	s := newScrubber()
+	long := strings.Repeat("x", previewCap+5_000) // well past previewCap, under payloadCap
+	out := s.scrubMapFull(map[string]any{"response": long})
+	if got := out["response"].(string); len([]rune(got)) != len([]rune(long)) {
+		t.Errorf("payload string was truncated: got %d runes, want %d", len([]rune(got)), len([]rune(long)))
+	}
+	// ...while secret redaction still applies under the larger cap.
+	secret := "sk-" + strings.Repeat("z", 24) // assembled, scanner-safe
+	out2 := s.scrubMapFull(map[string]any{"prompt": "lead " + secret + " tail"})
+	if strings.Contains(out2["prompt"].(string), secret) {
+		t.Error("secret leaked through scrubMapFull")
+	}
+}
+
 func TestScrubRedactsBeforeTruncating(t *testing.T) {
 	// A secret sitting past previewCap must still be redacted — truncation must
 	// not be an escape hatch. Redaction runs first, so the tail secret is gone.

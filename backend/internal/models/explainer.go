@@ -19,4 +19,8 @@ type ExplainerOutput struct {
 	InputTokens  int
 	OutputTokens int
 	CreatedAt    time.Time
+	// Trace is the captured system/user prompt + raw response for this LLM
+	// call (Phase 7 reasoning-trace feature). Pointer + omitempty: nil when
+	// tracing didn't populate it (e.g. a future caller that bypasses Generate).
+	Trace *LLMTrace `json:"trace,omitempty"`
 }

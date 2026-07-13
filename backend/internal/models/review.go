@@ -20,4 +20,9 @@ type ReviewVerdict struct {
 	InputTokens  int
 	OutputTokens int
 	CreatedAt    time.Time
+	// Trace is the captured system/user prompt + raw response for this review
+	// call (Phase 7 reasoning-trace feature). Pointer + omitempty: nil when a
+	// caller doesn't populate it (e.g. the parse-failure verdict below, which
+	// still carries token counts but has no successfully-parsed prompt to show).
+	Trace *LLMTrace `json:"trace,omitempty"`
 }
