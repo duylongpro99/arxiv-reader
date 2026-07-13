@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { RunTimeline } from "@/components/run-timeline";
+import { ResultPanel } from "@/components/result-panel";
 import { ArrowLeftIcon } from "@/components/icons";
-import type { RunSummary, TimelineEvent } from "@/lib/types";
-import { HistoryUnavailableError, useRun } from "@/lib/use-runs";
+import type { RunContent, RunSummary, TimelineEvent } from "@/lib/types";
+import { HistoryUnavailableError, useRun, useRunContent } from "@/lib/use-runs";
 
 // /runs/[id] — reopen one past run: its header summary + full persisted timeline.
 // A client component so it can reuse the same hooks/components as the live view.
@@ -13,6 +14,13 @@ export default function RunDetailPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id ?? null;
   const { data, isLoading, error } = useRun(id);
+  // Separate query for the generated note (Feature B): it can fail/degrade
+  // independently of the run header + timeline above.
+  const {
+    data: content,
+    isLoading: contentLoading,
+    error: contentError,
+  } = useRunContent(id);
 
   return (
     <main className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 pb-16">
@@ -55,10 +63,64 @@ export default function RunDetailPage() {
         <>
           <RunHeaderPanel run={data.run} events={data.events} />
           <RunTimeline events={data.events} />
+          <GeneratedNoteSection
+            loading={contentLoading}
+            content={content}
+            error={contentError}
+          />
         </>
       )}
     </main>
   );
+}
+
+// GeneratedNoteSection re-shows the persisted note (Feature B) alongside the
+// reasoning timeline above, so a reopened run reads as "what happened" +
+// "what it produced". `available:false` (vault file moved/deleted) renders a
+// clean empty state instead of crashing or showing a blank panel; the 503
+// "history disabled" case is already surfaced by the run-header query above,
+// so it is suppressed here to avoid a duplicate banner.
+function GeneratedNoteSection({
+  loading,
+  content,
+  error,
+}: {
+  loading: boolean;
+  content?: RunContent;
+  error: unknown;
+}) {
+  if (loading) {
+    return <p className="font-mono text-sm text-muted">Loading note…</p>;
+  }
+  if (error instanceof HistoryUnavailableError) {
+    return null;
+  }
+  if (error) {
+    return (
+      <p className="rounded-xl border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
+        Could not load the generated note.
+      </p>
+    );
+  }
+  if (!content || !content.available) {
+    // Backend returns available:false for two distinct cases: a `path` is present
+    // when a note WAS written but its file is now gone (moved/deleted); no `path`
+    // means the run never reached the writing stage (failed/in-progress) — so it
+    // never had a note to lose. Distinguish them to avoid implying data loss.
+    return (
+      <div className="rounded-xl border border-dashed border-line px-4 py-8 text-center text-sm text-muted">
+        {content?.path ? (
+          <>
+            <p>Note file moved or unavailable.</p>
+            <p className="mt-2 break-all font-mono text-xs">{content.path}</p>
+          </>
+        ) : (
+          <p>No note was generated for this run.</p>
+        )}
+      </div>
+    );
+  }
+  return <ResultPanel markdown={content.markdown ?? ""} />;
 }
 
 // vaultPath extracts the saved note path from the vaultwriter event, if present.

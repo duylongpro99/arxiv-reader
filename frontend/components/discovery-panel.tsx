@@ -160,6 +160,7 @@ export function DiscoveryPanel() {
           notice={status.notice}
           selectedId={selectedId}
           onSelect={(id) => select.mutate(id)}
+          sessionId={sessionId}
         />
       )}
 

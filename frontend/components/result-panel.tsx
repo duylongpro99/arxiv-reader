@@ -4,18 +4,30 @@ import type { ResultResponse } from "@/lib/types";
 import { CheckCircleIcon } from "./icons";
 import { MarkdownPreview } from "./markdown-preview";
 
-// ResultPanel is the terminal success view: a banner with the vault path, the
-// token usage, and a rendered Markdown preview of the generated note. Shown only
-// when the pipeline stage is "complete".
-export function ResultPanel({ result }: { result: ResultResponse }) {
+// ResultPanel renders the generated note. Two shapes:
+// - `{ result }` (the live pipeline's terminal success view): banner with the
+//   vault path, token usage, plus the rendered Markdown.
+// - `{ markdown }` (a past run's re-shown note, e.g. history detail): just the
+//   rendered Markdown, no banner/token stats (the run-detail header already
+//   shows those from `RunSummary`).
+type ResultPanelProps =
+  | { result: ResultResponse; markdown?: undefined }
+  | { result?: undefined; markdown: string };
+
+export function ResultPanel(props: ResultPanelProps) {
+  const content = props.result ? props.result.content : props.markdown;
   return (
     <div className="flex flex-col gap-5">
-      <SuccessBanner vaultFile={result.vaultFile} />
-      <TokenUsage result={result} />
+      {props.result && (
+        <>
+          <SuccessBanner vaultFile={props.result.vaultFile} />
+          <TokenUsage result={props.result} />
+        </>
+      )}
       {/* Reader surface: distinct from the instrument chrome — calm, high
           contrast, generous measure. */}
       <div className="rounded-xl border border-line bg-surface p-6 sm:p-8">
-        <MarkdownPreview content={result.content} />
+        <MarkdownPreview content={content} />
       </div>
     </div>
   );
