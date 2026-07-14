@@ -42,6 +42,14 @@ const (
 	KindRunCompleted              EventKind = "run.completed"
 	KindRunFailed                 EventKind = "run.failed"
 	KindRunRecoveredToSelection   EventKind = "run.recovered_to_selection"
+
+	// Phase 8 channel-publishing events. Unlike the pipeline kinds above, these
+	// are emitted onto a run's timeline AFTER the run itself is complete (the
+	// live recorder is gone), so they are written directly via the store rather
+	// than through a Recorder — see orchestrator.emitPublicationEvent.
+	KindPublicationDraftGenerated EventKind = "publication.draft.generated"
+	KindPublicationPublished      EventKind = "publication.published"
+	KindPublicationFailed         EventKind = "publication.failed"
 )
 
 // IsTerminal reports whether this kind ends the run's SSE stream. A recovery

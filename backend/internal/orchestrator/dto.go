@@ -1,12 +1,17 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
+	"os"
+	"regexp"
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/store"
+	"github.com/maritime-ds/arxiv-reader/internal/tools"
 	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
@@ -190,4 +195,149 @@ func marshalMap(m map[string]any) json.RawMessage {
 		return nil
 	}
 	return b
+}
+
+// --- Phase 10 channel-publishing DTOs (mirrored in frontend/lib/types.ts) ---
+
+// ChannelDTO is one enabled, resolvable channel returned by GET /channels.
+type ChannelDTO struct {
+	ID       string `json:"id"`
+	Category string `json:"category"`
+}
+
+// ChannelsResponse lists every enabled channel that resolved successfully.
+// Channels that fail to construct (e.g. missing API key) are silently omitted
+// rather than 500ing the whole list — see HandleChannels.
+type ChannelsResponse struct {
+	Channels []ChannelDTO `json:"channels"`
+}
+
+// CreatePublicationsRequest is the body of POST /runs/{id}/publications: the
+// set of channel ids to draft content for.
+type CreatePublicationsRequest struct {
+	Channels []string `json:"channels"`
+}
+
+// PatchPublicationRequest is the body of PATCH /publications/{pid}. All
+// fields are optional pointers so a partial edit (e.g. only Approve) leaves
+// the other fields untouched by the caller's intent — HandlePatchPublication
+// still resolves a full row before writing.
+type PatchPublicationRequest struct {
+	Title   *string `json:"title,omitempty"`
+	Content *string `json:"content,omitempty"`
+	Approve *bool   `json:"approve,omitempty"`
+}
+
+// PublicationDTO is one (run, channel) publish draft/attempt — the wire shape
+// for a store.PublicationRecord with nullable columns dereferenced to their
+// omitted/zero form (mirrors runDTOFromRecord's pointer-deref convention).
+type PublicationDTO struct {
+	ID          string     `json:"id"`
+	RunID       string     `json:"runId"`
+	ChannelID   string     `json:"channelId"`
+	Category    string     `json:"category"`
+	Status      string     `json:"status"`
+	Title       string     `json:"title,omitempty"`
+	Content     string     `json:"content,omitempty"`
+	ExternalURL string     `json:"externalUrl,omitempty"`
+	ExternalID  string     `json:"externalId,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	PublishedAt *time.Time `json:"publishedAt,omitempty"`
+}
+
+// PublicationsResponse lists drafts for a run (GET/POST /runs/{id}/publications).
+// SkippedChannels is additive (omitempty — never breaks a client parsing only
+// Publications): it surfaces channel ids from a create-request that failed to
+// resolve (e.g. a channel not yet implemented, or misconfigured), each paired
+// with the reason, so the UI can show why fewer drafts came back than requested.
+type PublicationsResponse struct {
+	Publications    []PublicationDTO `json:"publications"`
+	SkippedChannels []string         `json:"skippedChannels,omitempty"`
+}
+
+// publicationDTOFromRecord maps a persisted publication row to the wire shape.
+func publicationDTOFromRecord(p store.PublicationRecord) PublicationDTO {
+	dto := PublicationDTO{
+		ID: p.ID, RunID: p.RunID, ChannelID: p.ChannelID,
+		Category: p.Category, Status: p.Status,
+		Content: p.AdaptedContent, CreatedAt: p.CreatedAt, PublishedAt: p.PublishedAt,
+	}
+	if p.Title != nil {
+		dto.Title = *p.Title
+	}
+	if p.ExternalURL != nil {
+		dto.ExternalURL = *p.ExternalURL
+	}
+	if p.ExternalID != nil {
+		dto.ExternalID = *p.ExternalID
+	}
+	if p.Error != nil {
+		dto.Error = *p.Error
+	}
+	return dto
+}
+
+// derefOr returns the dereferenced string, or "" for a nil pointer — used to
+// flatten the store's nullable columns onto plain domain values.
+func derefOr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// httpError pairs a status with a client-safe message, used by readRunMarkdown
+// so its caller can writeJSON without a type switch on sentinel errors.
+type httpError struct {
+	status  int
+	message string
+}
+
+func (e *httpError) Error() string { return e.message }
+
+// readRunMarkdown reuses HandleRunContent's exact lookup path (timeline scan →
+// vaultPathFromEvents → ValidateWithinVault → read) to fetch the Obsidian note
+// a run produced, so publishing can never diverge from what /content serves.
+// A missing event or missing file is a 422 (nothing to publish yet), never a
+// 500 — this mirrors HandleRunContent treating both as normal, non-error states.
+func (o *Orchestrator) readRunMarkdown(ctx context.Context, runID string) (string, *httpError) {
+	events, err := o.publications.ListEvents(ctx, runID, -1)
+	if err != nil {
+		return "", &httpError{http.StatusInternalServerError, "cannot read run"}
+	}
+	path, ok := vaultPathFromEvents(events)
+	if !ok {
+		return "", &httpError{http.StatusUnprocessableEntity, "run has no generated note to publish"}
+	}
+	// Path-traversal guard: never read outside the configured Obsidian vault —
+	// see HandleRunContent's identical check for the full rationale.
+	if verr := tools.ValidateWithinVault(o.cfg.Paths.ObsidianVault, path); verr != nil {
+		return "", &httpError{http.StatusBadRequest, "invalid vault path"}
+	}
+	content, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return "", &httpError{http.StatusUnprocessableEntity, "run has no generated note to publish"}
+		}
+		slog.Error("publish content read failed", "run_id", runID)
+		return "", &httpError{http.StatusInternalServerError, "cannot read note"}
+	}
+	return string(content), nil
+}
+
+// secretLike matches common credential shapes in a channel error message
+// (e.g. a dev.to/X API key or bearer token echoed by a client library's error
+// string). This is a defence-in-depth backstop, deliberately separate from
+// tracing's internal scrubber (which is keyed to the LLM API key literal and
+// unexported): channel errors originate from third-party HTTP clients whose
+// error text is never trusted verbatim before it reaches a response body or
+// the durable `publications.error` column.
+var secretLike = regexp.MustCompile(`(?i)(bearer\s+[A-Za-z0-9._\-]{16,}|sk-[A-Za-z0-9_\-]{16,}|(api[_-]?key|token|secret)\s*[:=]\s*\S+)`)
+
+// scrubErr redacts anything secret-shaped from a channel error before it is
+// stored (MarkFailed) or returned to the client — publish failures must be
+// visible and actionable, but never leak a credential.
+func scrubErr(msg string) string {
+	return secretLike.ReplaceAllString(msg, "[REDACTED]")
 }

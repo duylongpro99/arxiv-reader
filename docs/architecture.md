@@ -65,19 +65,27 @@ User Trigger (picks resource + parameters)
 │  - Explainer preview        │         │  - LogCheckTool                  │
 │  - Run timeline UI          │         │  - ExplainerAgent (UNCHANGED)    │
 │  - Runs history list        │         │  - ReviewerAgent (UNCHANGED)     │
-│                             │         │  - VaultWriterTool               │
+│  - Publish UI (Phase 9)     │         │  - VaultWriterTool               │
 │                             │         │  - LLM Client (text-only)        │
 │                             │         │  - RunRecorder (Phase 7)         │
 │                             │         │  - SSE Broker (Phase 7)          │
+│                             │         │  - Repurposer Agent (Phase 9)    │
+│                             │         │  - Channel Registry (Phase 9)    │
+│                             │         │    - dev.to channel (longform)   │
+│                             │         │    - X channel (brief)           │
 └─────────────────────────────┘         └──────────────────────────────────┘
                                                         │
-                                    ┌───────────────────┼───────────────────┬────────────┐
-                                    │                   │                   │            │
-                             ┌──────▼────────────┐    ┌───────▼──────┐   ┌───────▼──────┐  ┌──▼──────────┐
-                             │ Resource APIs      │    │  LLM Provider │   │Obsidian Vault│  │ PostgreSQL  │
-                             │(declared in YAML) │    │  (configured) │   │ (local disk) │  │ (optional)  │
-                             └────────────────────┘    └──────────────┘   └──────────────┘  └─────────────┘
+                        ┌───────────────────┬──────────┼────────────┬────────────┬──────────────┐
+                        │                   │          │            │            │              │
+                 ┌──────▼────────────┐ ┌────▼─────┐ ┌──▼───────────┐ ┌──▼──────┐ ┌──▼─────────┐ ┌──▼──────────┐
+                 │ Resource APIs      │ │ LLM      │ │Obsidian      │ │dev.to   │ │ X/Twitter  │ │ PostgreSQL  │
+                 │(declared in YAML) │ │Provider  │ │Vault         │ │API      │ │ API        │ │ (optional;  │
+                 │                    │ │(config)  │ │(local disk)  │ │(ext)    │ │ (ext)      │ │ publishing  │
+                 └────────────────────┘ └──────────┘ └──────────────┘ └─────────┘ └────────────┘ │ requires)   │
+                                                                                                   └─────────────┘
 ```
+
+**Publishing Requirement:** The publishing feature (Channels, Repurposer, Publications store) requires PostgreSQL. Publishing endpoints return 503 with a clear message when the database is unavailable; the rest of the pipeline is unaffected.
 
 ---
 
@@ -458,7 +466,125 @@ type CompletionResponse struct {
 
 ---
 
-### 10. Run Timeline Tracing (Phase 7)
+### 10. Channel Registry + Channels (Phase 9)
+
+**Purpose:** Decouple channel implementations (dev.to, X) from content generation. Each channel owns all platform mechanics — the Repurposer agent never knows channels exist.
+
+**Responsibilities:**
+- Define the `Channel` interface: `ID()`, `Category()`, `Validate(content)`, `Publish(ctx, content)`
+- Implement self-registration pattern (mirrors `llm.LLMClient` provider pattern)
+- Provide `Category` taxonomy: `longform` (dev.to), `digest` (reserved RSS), `brief` (X)
+- Expose `NewChannel(id, cfg)` factory for config-driven initialization
+- Prevent import cycles: channels import no channel packages; channels register via `init()`
+
+**Channel Implementations:**
+
+- **dev.to** (`internal/channels/devto`): Publishes `longform` content via dev.to API (API key from `.env` → `DEVTO_API_KEY`)
+- **X (Twitter)** (`internal/channels/x`): Publishes `brief` content via X API; mechanically chunks ≤280-char tweets with `(i/N)` numbering; OAuth2 flow with user-context token + refresh (env: `X_CLIENT_ID`, `X_CLIENT_SECRET`, `X_REFRESH_TOKEN`)
+
+**Interface:**
+```go
+type Category string // "longform" | "digest" | "brief"
+
+type GeneratedContent struct {
+    Category  Category
+    Title     string
+    Body      string  // platform-agnostic markdown/plain text
+    PaperMeta Paper
+    Tags      []string
+}
+
+type PublishResult struct {
+    ExternalURL string  // live post URL
+    ExternalID  string  // platform post ID
+}
+
+type Channel interface {
+    ID() string
+    Category() Category
+    Validate(c GeneratedContent) error
+    Publish(ctx, c GeneratedContent) (PublishResult, error)
+}
+```
+
+**Registry:**
+- `channels.Register(id, factory)` called from each channel's `init()`
+- Blank imports in `cmd/server/main.go` wire channels: `_ "internal/channels/devto"`, `_ "internal/channels/x"`
+- `NewChannel(id, cfg)` looks up factory; returns descriptive error if unregistered
+
+**Dependencies:** Config (channel list + per-category target words), LLMClient (Repurposer only), channel-specific secrets from `.env`
+
+---
+
+### 11. Repurposer Agent (Phase 9)
+
+**Purpose:** Generate platform-agnostic content from an explainer, parametrized only by `Category`. Single-shot (human reviews, not another LLM pass).
+
+**Responsibilities:**
+- Accept a run's explainer Markdown + target category (no channel knowledge)
+- Select category-specific prompt template
+- Emit `GeneratedContent` (markdown/plain text body, never pre-chunked)
+- Fail gracefully if category invalid (defense-in-depth)
+
+**Interface:**
+```go
+type RepurposeInput struct {
+    Raw       string           // full explainer markdown
+    Category  channels.Category
+    PaperMeta models.Paper
+}
+
+func (a *Repurposer) Generate(ctx, in RepurposeInput) (GeneratedContent, error)
+```
+
+**Key Design:**
+- Only sees `Category`, never a channel ID
+- One LLM call per unique category (if two channels share a category, agent runs once)
+- Default target word counts (1200 longform, 500 digest, 120 brief) used if config omits category
+- Reuses shared LLMClient (same as ExplainerAgent)
+
+**Dependencies:** LLMClient, Config (category target words), channels.Category type
+
+---
+
+### 12. Publications Store (Phase 9)
+
+**Purpose:** Durable, idempotent publication record — tracks draft→approved→published state per (run, channel) pair.
+
+**Schema** (`backend/migrations/0002_publications.sql`):
+```sql
+CREATE TABLE publications (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    channel_id      TEXT NOT NULL,             -- "devto", "x"
+    category        TEXT NOT NULL,             -- longform, digest, brief
+    status          TEXT NOT NULL,             -- draft | approved | published | failed
+    adapted_content TEXT NOT NULL,             -- editable markdown body
+    title           TEXT,                      -- null until edited
+    external_url    TEXT,                      -- null until published
+    external_id     TEXT,                      -- null until published
+    error           TEXT,                      -- null unless failed
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at    TIMESTAMPTZ,               -- null until published
+    UNIQUE (run_id, channel_id)                -- idempotency guard
+);
+```
+
+**Access Layer** (`internal/store/publications.go`):
+- `CreatePublication`: INSERT with ON CONFLICT (run_id, channel_id) DO NOTHING (idempotent drafts)
+- `ListPublicationsByRun`: All drafts for a run (stable creation order)
+- `GetPublication`: Single draft by ID
+- `UpdatePublicationContent`: Human edit to title/body/status (pre-publish)
+- `ClaimForPublish`: Atomic draft→publishing transition (guards concurrent double-publish)
+- `MarkPublished`: Finalize with external_url/id/timestamp
+
+**Idempotency:** UNIQUE (run_id, channel_id) prevents duplicate publication rows; ClaimForPublish prevents concurrent publish attempts on the same row.
+
+**Lifecycle:** draft (initial) → approved (user edits + approves) → publishing (transient, atomic claim) → published/failed (final)
+
+---
+
+### 13. Run Timeline Tracing (Phase 7)
 
 **Purpose:** Capture, stream, and persist a complete ordered timeline of all pipeline events per run. Enables live monitoring via SSE and historical playback.
 
@@ -555,7 +681,24 @@ tracing:
   full_payloads: false              # Phase 8: opt-in full prompts/responses for explainer/reviewer events
   buffer_size: 256                  # per-run in-memory ring capacity
   # Secret scrubber caps: summary ~500 chars, payload_full ~100k chars (distinct to avoid truncation)
+
+publishing:                           # Phase 9: optional, empty block disables feature
+  channels: ["devto", "x"]            # enabled channel ids
+  categories:
+    longform: { target_words: 1200 }  # soft target length for Repurposer (dev.to)
+    digest:   { target_words: 500 }   # reserved for future RSS channel
+    brief:    { target_words: 120 }   # soft target for X tweets
 ```
+
+**Channel Secrets** (from `.env`, never in config.yaml):
+```
+DEVTO_API_KEY=<your-dev.to-api-key>
+X_CLIENT_ID=<your-x-oauth-client-id>
+X_CLIENT_SECRET=<your-x-oauth-client-secret>
+X_REFRESH_TOKEN=<your-x-user-refresh-token>
+```
+
+See `docs/channel-x-oauth-setup.md` for X OAuth setup instructions.
 
 > **Path resolution:** `.env` value for `OBSIDIAN_VAULT_PATH` takes precedence over `config.yaml`. This keeps `config.yaml` version-control safe while allowing machine-specific paths in `.env`.
 
@@ -894,6 +1037,78 @@ Orchestrator → PipelineSession { stage: "complete" }
 Next.js renders success + Markdown preview + vault file path
 ```
 
+### Flow 4 — Select Run + Adapt Per Category + Review/Edit + Publish (Phase 9)
+
+```
+User opens Publish UI for a completed run
+    │
+    ▼
+Next.js → POST /runs/:id/publications
+    { selectedChannelIDs: ["devto", "x"] }
+    │
+    ▼
+Orchestrator.HandleCreatePublications
+    → Load run's explainer markdown from vault (via tool.vaultwriter.completed event path)
+    → Group channels by category (both "devto"+"x" → unique categories: longform, brief)
+    → For each unique category: call Repurposer.Generate(markdown, category)
+    → For each channel: create PublicationRecord(draft, adapted_content)
+    → Store all drafts in publications table (ON CONFLICT: idempotent if already drafted)
+    │
+    ▼
+Repurposer Agent (single-shot, per category)
+    → Receives explainer markdown + category (never channel ID)
+    → Selects category-specific prompt template (longform uses high-detail, brief uses punchy)
+    → LLM call: GeneratedContent { title, body, category, paper_meta }
+    → Return platform-agnostic markdown/text (X channel owns mechanical chunking, not agent)
+    │
+    ▼
+Next.js renders Publish panel
+    → List draft per channel with preview (thread preview for X, markdown for dev.to)
+    → Form for human edit: title + body + category
+    → "Approve" button (transitions status draft → approved)
+    │
+    ▼
+User reviews, optionally edits title/body, approves
+    │
+    ▼
+Next.js → PATCH /publications/:pid { title, adapted_content, status: "approved" }
+    │
+    ▼
+Orchestrator.HandlePatchPublication
+    → UpdatePublicationContent(approved_title, approved_body)
+    → Validate per Channel.Validate(content) (char limits, etc.)
+    │
+    ▼
+User clicks "Publish" button for a channel
+    │
+    ▼
+Next.js → POST /publications/:pid/publish
+    │
+    ▼
+Orchestrator.HandlePublish
+    → ClaimForPublish() — atomic draft/approved → publishing transition
+    → If already published: return 409 (idempotency)
+    → If claimed successfully: call Channel.Publish(GeneratedContent)
+    → Channel handles platform mechanics:
+      - dev.to: POST to /articles API; returns external URL/ID
+      - X: (1) fetch current OAuth tokens from store, (2) mechanically chunk body into ≤280-char tweets,
+            (3) POST each tweet; link replies; return thread URL
+    → MarkPublished(external_url, external_id, timestamp)
+    → Emit event: publication.published
+    │
+    ▼
+Next.js displays success with live external URL
+    └─→ User can click through to live post
+```
+
+**Status Lifecycle:** draft (initial repurposer output) → approved (user edits + confirms) → publishing (transient, claim guards double-publish) → published (final, external_url set) OR failed (error set)
+
+**Event Taxonomy:** `publication.draft.generated`, `publication.approved`, `publication.published`, `publication.failed` (persisted to run's timeline as best-effort)
+
+**Idempotency:** UNIQUE (run_id, channel_id) + ClaimForPublish atomic transition prevents double-posting to a live channel.
+
+**DB Requirement:** Publications feature is disabled when PostgreSQL unavailable; all endpoints return 503 with clear message. Other pipeline paths unaffected.
+
 ### Progress Polling
 
 ```
@@ -962,10 +1177,12 @@ llm:
 
 ### External APIs
 
-| API | Cost | Rate Limit | Notes |
-|---|---|---|---|
-| **arXiv API** | Free, no auth required | 1 request per 3 seconds, single connection | Our usage (one trigger = one query) is well within limits |
-| **LLM Provider API** | Pay-per-token | Provider-specific | Configured via `.env` |
+| API | Cost | Rate Limit | Auth | Notes |
+|---|---|---|---|---|
+| **arXiv API** | Free | 1 request per 3 seconds | None | Our usage (one trigger = one query) is well within limits |
+| **LLM Provider API** | Pay-per-token | Provider-specific | API Key | Configured via `.env` |
+| **dev.to API** (Phase 9) | Free | 100 req/min | API Key (`DEVTO_API_KEY`) | Publishes longform articles; returns post URL + ID |
+| **X API** (Phase 9) | Free tier (write-capped) | 300 posts/15min | OAuth2 (3-legged) | Publishes brief content as numbered tweets; requires user-context token refresh |
 
 ### Storage
 
@@ -974,7 +1191,8 @@ llm:
 | **Local filesystem** | Obsidian vault is a local folder. Direct file write is simplest and most reliable. |
 | **JSON file (processed log)** | Flat list of paper IDs needs no database. Human-readable and manually editable. |
 | **In-memory (session state)** | Transient data — pipeline session and paper Markdown exist only for duration of one run. |
-| **PostgreSQL 17 (Phase 7, optional)** | Run timeline tracing: durable history of events, cross-restart replay, live SSE fan-out. Gracefully degrades if unavailable. Docker Compose supplied. |
+| **PostgreSQL 17 (Phase 7, optional; Phase 9 required for publishing)** | Run timeline tracing: durable history of events, cross-restart replay, live SSE fan-out. Publishing state: draft/publish tracking, idempotency guard. Both gracefully degrade if unavailable. Docker Compose supplied. |
+| **Publications (Phase 9)** | JSONB rows | **PostgreSQL** | **Durable** |
 
 ---
 
@@ -1129,12 +1347,26 @@ GET    localhost:8080/status/:id                → { stage, iteration, error }
 GET    localhost:8080/result/:id                → { content, vault_file_path }
 GET    localhost:8080/runs/:id/content          → { available: bool, content?: string }
 GET    localhost:8080/health                    → { status: "ok" }
+
+[Phase 9 Publishing Endpoints]
+GET    localhost:8080/channels                  → { channels: [{ id, category }] }
+POST   localhost:8080/runs/:id/publications     → { publications: [PublicationRecord] } (generate drafts)
+GET    localhost:8080/runs/:id/publications     → { publications: [PublicationRecord] } (list drafts)
+PATCH  localhost:8080/publications/:pid         → { status, error? } (approve/edit draft)
+POST   localhost:8080/publications/:pid/publish → { external_url, external_id } (push to channel)
 ```
 
 **Backward Compatibility:**
 - `POST /discover` with empty body → uses config-specified default resource and default values (Phase 9 backward compat for legacy `POST /discover` with `{category, terms}` body)
 - `GET /resources` returns descriptors for all registered resources; UI builds a resource picker
 - Each resource's `values` map gets whitelist-validated against the resource's `Schema` (e.g., category against `arxiv-cs` catalog, terms through `arxiv-terms` sanitizer)
+
+**Phase 9 Endpoints (Publishing):**
+- `GET /channels` — lists enabled channels and their categories (no auth; safe for UI to pre-populate channel picker)
+- `POST /runs/:id/publications` — generates drafts by calling Repurposer per unique category; creates PublicationRecord rows; returns 503 if DB unavailable
+- `GET /runs/:id/publications` — lists all publication drafts for a run (pagination in status update order)
+- `PATCH /publications/:pid` — human edit endpoint; updates title/body/status; validates via Channel.Validate(); idempotent
+- `POST /publications/:pid/publish` — atomic claim + publish flow; calls Channel.Publish(); returns 409 if already published; returns 503 if DB unavailable
 
 ---
 
@@ -1218,3 +1450,4 @@ GET    localhost:8080/health                    → { status: "ok" }
 | T4 | Single paper per run | Accepted | Human-in-the-loop control, simpler state management. |
 | T5 | In-memory session state | Accepted | Zero infrastructure complexity. Crash recovery not required for a local, single-user tool. |
 | T6 | Recency ranking only (no relevance) | Accepted | Explicitly deferred per PRD. Simple, predictable, zero complexity. |
+| T7 | daily.dev has no push API → future RSS channel | Accepted | daily.dev ingests content via RSS feed, not via direct POST. Modeled as future `digest` category (RSS channel not yet implemented). |
