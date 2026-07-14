@@ -81,6 +81,54 @@ func TestAgentConfigValidate(t *testing.T) {
 	}
 }
 
+// TestPublishingConfigValidate covers the Phase 10 publishing block: an empty
+// block is valid (feature disabled), and unknown channel ids / category keys
+// fail fast with a descriptive error.
+func TestPublishingConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     PublishingConfig
+		wantErr string // substring expected in the error; "" means expect success
+	}{
+		{"empty block ok", PublishingConfig{}, ""},
+		{
+			"known channels and categories ok",
+			PublishingConfig{
+				Channels:   []string{"devto", "x"},
+				Categories: map[string]CategoryConfig{"longform": {TargetWords: 1200}, "brief": {TargetWords: 120}},
+			},
+			"",
+		},
+		{
+			"unknown channel",
+			PublishingConfig{Channels: []string{"mastodon"}},
+			"unknown channel",
+		},
+		{
+			"unknown category key",
+			PublishingConfig{Categories: map[string]CategoryConfig{"thread": {TargetWords: 100}}},
+			"not a valid category",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
 // validConfig assembles a Config that passes validate(), letting each LLM test
 // tweak one field. Paths are absolute so the path checks pass.
 func validConfig() *Config {

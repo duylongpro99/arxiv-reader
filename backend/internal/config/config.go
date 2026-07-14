@@ -13,10 +13,11 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
-	LLM     LLMConfig     `yaml:"llm"`
-	Paths   PathsConfig   `yaml:"paths"`
-	Agent   AgentConfig   `yaml:"agent"`
-	Tracing TracingConfig `yaml:"tracing"`
+	LLM        LLMConfig        `yaml:"llm"`
+	Paths      PathsConfig      `yaml:"paths"`
+	Agent      AgentConfig      `yaml:"agent"`
+	Tracing    TracingConfig    `yaml:"tracing"`
+	Publishing PublishingConfig `yaml:"publishing"`
 	// DatabaseURL is the Postgres DSN for durable run-timeline history. Read from
 	// .env ONLY (like the API key; yaml:"-") so a secret never lands in the
 	// committed config.yaml. Empty is VALID: tracing then degrades to in-memory
@@ -76,8 +77,38 @@ type AgentConfig struct {
 	MaxReviewIterations int `yaml:"max_review_iterations"` // >= 0; default 2
 }
 
+// PublishingConfig is the Phase 10 channel-publishing knobs: which channels are
+// enabled and the target word count per content category. Publishing is
+// entirely optional — an empty `publishing:` block (both fields zero-valued)
+// is valid and means no channels are enabled; it is never fatal, mirroring the
+// degrade-safe DatabaseURL pattern above.
+type PublishingConfig struct {
+	Channels   []string                  `yaml:"channels"`
+	Categories map[string]CategoryConfig `yaml:"categories"`
+}
+
+// CategoryConfig holds the soft target length for one content category (see
+// internal/channels.Category). Kept centrally in config, not per channel, so
+// the Repurposer agent (category-blind to channels) can read it directly.
+type CategoryConfig struct {
+	TargetWords int `yaml:"target_words"`
+}
+
 // validProviders is the whitelist enforced by validate().
 var validProviders = map[string]bool{"anthropic": true, "openai": true, "gemini": true}
+
+// validChannels is the whitelist of known channel ids enforced by
+// PublishingConfig.validate(). Kept here (not in internal/channels) because
+// channels imports config for NewChannel(id, cfg) — importing channels back
+// from config would be a cycle. Extend this list in the same commit that adds
+// a channel's registry case (registry.go).
+var validChannels = map[string]bool{"devto": true, "x": true}
+
+// validPublishingCategories mirrors channels.Category's three values as plain
+// strings for the same import-cycle reason as validChannels above: config
+// cannot import channels, so this set must be kept in sync by hand whenever
+// channels.Category gains/loses a value.
+var validPublishingCategories = map[string]bool{"longform": true, "digest": true, "brief": true}
 
 // Load reads config.yaml (defaults), applies .env overrides, expands a leading
 // ~ on paths, then validates. Returns an error (caller decides fatal handling);
@@ -271,7 +302,27 @@ func (c *Config) validate() error {
 	if c.Tracing.Enabled && c.Tracing.BufferSize <= 0 {
 		return fmt.Errorf("tracing.buffer_size must be > 0 when tracing is enabled, got %d.\n  → Set tracing.buffer_size in config.yaml", c.Tracing.BufferSize)
 	}
-	return c.Agent.validate()
+	if err := c.Agent.validate(); err != nil {
+		return err
+	}
+	return c.Publishing.validate()
+}
+
+// validate enforces the Phase 10 publishing section. An empty block (no
+// channels, no categories) is valid and intentionally NOT an error — it means
+// the feature is simply disabled. Only non-empty, unknown entries fail fast.
+func (p *PublishingConfig) validate() error {
+	for _, id := range p.Channels {
+		if !validChannels[id] {
+			return fmt.Errorf("publishing.channels contains unknown channel %q.\n  → Must be one of: devto, x", id)
+		}
+	}
+	for category := range p.Categories {
+		if !validPublishingCategories[category] {
+			return fmt.Errorf("publishing.categories key %q is not a valid category.\n  → Must be one of: longform, digest, brief", category)
+		}
+	}
+	return nil
 }
 
 // validate enforces the Phase 2 agent section. A missing agent block leaves the

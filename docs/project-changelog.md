@@ -5,6 +5,118 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
+## [Phase 10] — 2026-07-19
+
+Channel Publishing: Select a persisted run's explainer, adapt it to multiple social channels via a category-blind agent, review/edit the drafts in the UI, and publish to dev.to and X. All state is durable and idempotent; re-publishing the same (run, channel) pair is blocked.
+
+### Added
+
+#### Backend
+- **Channel Abstraction & Registry** — self-registration pattern (mirrors llm.LLMClient)
+  - Channel interface: `ID()`, `Category()`, `Validate()`, `Publish()`
+  - Category taxonomy: `longform` (dev.to), `digest` (reserved RSS), `brief` (X)
+  - Blank imports in `cmd/server/main.go` wire channels without import cycles
+
+- **Repurposer Agent** — `internal/agents/repurposer`
+  - Single-shot generation per Category (no LLM reviewer loop — human is the review step)
+  - Category-blind: never references a channel ID
+  - Category-specific prompt templates; configurable per-category target word counts
+  - One LLM call per unique category; channels sharing category get one repurposed draft each
+
+- **Publications Store** — `internal/store/publications.go`
+  - CRUD: CreatePublication, ListPublicationsByRun, GetPublication, UpdatePublicationContent, ClaimForPublish, MarkPublished
+  - Schema (`0002_publications.sql`): publications table with (run_id, channel_id) UNIQUE constraint (idempotency)
+  - Status lifecycle: draft → approved → publishing (transient claim) → published/failed
+  - ClaimForPublish atomic transition guards concurrent double-publish
+
+- **dev.to Channel** — `internal/channels/devto`
+  - Publishes longform articles via dev.to API
+  - API key auth from `DEVTO_API_KEY` env var
+  - Validation: content length checks
+  - Returns live post URL + ID
+
+- **X (Twitter) Channel** — `internal/channels/x`
+  - Publishes brief content as numbered tweets
+  - OAuth2 user-context flow: 3-legged auth + token refresh (env: `X_CLIENT_ID/SECRET/REFRESH_TOKEN`)
+  - Mechanical chunking: splits brief into ≤280-char tweets with `(i/N)` numbering
+  - Reply threading: subsequent tweets reply to previous
+  - Returns thread URL + root post ID
+
+- **Orchestrator Publishing Handlers** — `internal/orchestrator/publish-handlers.go`
+  - `HandleChannels` — GET /channels: list enabled channels + categories
+  - `HandleCreatePublications` — POST /runs/:id/publications: repurpose per category + draft
+  - `HandleListPublications` — GET /runs/:id/publications: list run's drafts
+  - `HandlePatchPublication` — PATCH /publications/:pid: edit + approve
+  - `HandlePublish` — POST /publications/:pid/publish: atomic claim + Channel.Publish()
+
+- **Config Extension** — `publishing:` block
+  - `channels`: list of enabled channel ids
+  - `categories`: per-category soft target word counts (consumed by Repurposer)
+  - Channel secrets in `.env` only (API keys, OAuth tokens)
+
+#### Frontend
+- **Publish UI** — `components/publish-*.tsx`
+  - Publish panel from runs history: select channels
+  - Draft preview per channel (thread view for X, article view for dev.to)
+  - Edit draft: title + body before approval
+  - Live links to published posts
+
+- **API Routes** — `app/api/publish/*`
+  - Proxy routes for publishing endpoints
+
+#### Schema & Migration
+- `backend/migrations/0002_publications.sql` — USER-RUN migration
+  - `publications` table: idempotent (run_id, channel_id) unique constraint
+  - Safe to re-run: all objects use IF NOT EXISTS
+
+#### Documentation
+- `docs/design-notes/2026-07-14-channel-publishing.md` — approved brainstorm spec
+- `docs/channel-x-oauth-setup.md` — X OAuth 2.0 user-context setup guide
+- `docs/architecture.md` — sections 10–13: Channels, Repurposer, Publications, Flow 4
+
+### Changed
+
+- **config.yaml** — new `publishing:` block
+- **cmd/server/main.go** — blank imports wire channels: `_ "internal/channels/devto"`, `_ "internal/channels/x"`
+
+### Architecture
+
+**Key Design Points:**
+- **Decoupling:** Repurposer knows only Category; Channels know only their Category() + mechanics. GeneratedContent is the sole contract.
+- **Single-shot:** Agent runs once per unique category; humans review, not another LLM pass.
+- **Idempotent:** UNIQUE (run_id, channel_id) + ClaimForPublish atomic transition prevent duplicates.
+- **DB-Required:** Publishing feature disables itself when Postgres unavailable (503 response); rest of pipeline unaffected.
+
+### Known Limitations
+
+- **daily.dev has no push API** — RSS channel (digest category) is future work
+- **X auth is the cost** — OAuth2 setup complexity; dev.to is trivial API key
+- **X free tier write-capped** — ~300 posts/15min; paid tier required for high volume
+
+### Dependencies Added
+
+**Backend:**
+- No new Go dependencies (reuses existing llm.LLMClient, pgx, channels types)
+
+**Frontend:**
+- No new dependencies (HTTP client, React hooks already available)
+
+### Test Coverage
+
+- Channel interface implementations (devto, x)
+- Repurposer: category selection, prompt template application
+- Publications: CRUD, idempotency, ClaimForPublish atomicity
+- Orchestrator: full publish flow per channel
+- X chunking: ≤280-char tweet splitting with counter format
+
+### Backward Compatibility
+
+- Publishing is optional: empty/missing `publishing:` block disables feature
+- No breaking changes to existing endpoints or data structures
+- Publications table is additive; no migration of existing data required
+
+---
+
 ## [Phase 9] — 2026-07-18
 
 Declarative Resource Engine: Pluggable discovery abstraction. The entire paper discovery pipeline is no longer hardcoded to arXiv but driven by YAML declarations in `resources/*.yaml`. The core (orchestrator + agent pipeline) depends only on the `Source` interface + the resource registry, never on concrete implementations. Discovery is now resource-agnostic and extensible: adding a second source is pure YAML + optional catalog (no Go code changes required).

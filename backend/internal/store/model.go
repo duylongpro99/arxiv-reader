@@ -43,3 +43,23 @@ type EventRecord struct {
 	DurationMS  *int
 	CreatedAt   time.Time
 }
+
+// PublicationRecord is one row of the `publications` table — a single
+// (run, channel) publish draft/attempt (Phase 10: channel publishing). Nullable
+// columns use pointers so a NULL round-trips as nil rather than a misleading
+// zero value (e.g. a draft never titled, or never published). The column set
+// mirrors backend/migrations/0002_publications.sql exactly.
+type PublicationRecord struct {
+	ID             string
+	RunID          string
+	ChannelID      string
+	Category       string
+	Status         string
+	AdaptedContent string
+	Title          *string
+	ExternalURL    *string
+	ExternalID     *string
+	Error          *string
+	CreatedAt      time.Time
+	PublishedAt    *time.Time
+}

@@ -5,6 +5,11 @@ import (
 	"os"
 
 	"github.com/maritime-ds/arxiv-reader/internal/config"
+	// Blank-imported so each channel package's init() self-registers with
+	// internal/channels' registry (see channels.Register) — the registry
+	// itself cannot import these packages directly without an import cycle.
+	_ "github.com/maritime-ds/arxiv-reader/internal/channels/devto"
+	_ "github.com/maritime-ds/arxiv-reader/internal/channels/x"
 	"github.com/maritime-ds/arxiv-reader/internal/server"
 )
 

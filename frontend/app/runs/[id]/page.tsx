@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { RunTimeline } from "@/components/run-timeline";
 import { ResultPanel } from "@/components/result-panel";
+import { PublishDraftPanel } from "@/components/publish-draft-panel";
 import { ArrowLeftIcon } from "@/components/icons";
 import type { RunContent, RunSummary, TimelineEvent } from "@/lib/types";
 import { HistoryUnavailableError, useRun, useRunContent } from "@/lib/use-runs";
@@ -68,6 +69,11 @@ export default function RunDetailPage() {
             content={content}
             error={contentError}
           />
+          {/* Publishing only makes sense once there's a note to adapt — gate
+              on the note's own availability (not run.status) since a
+              "recovered" run may still have a usable note despite not
+              cleanly reaching "complete". */}
+          {content?.available && <PublishDraftPanel runId={data.run.id} />}
         </>
       )}
     </main>

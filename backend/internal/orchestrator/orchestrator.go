@@ -12,6 +12,8 @@ import (
 	"sync"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
+	"github.com/maritime-ds/arxiv-reader/internal/agents/repurposer"
+	"github.com/maritime-ds/arxiv-reader/internal/channels"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
@@ -64,6 +66,15 @@ type Orchestrator struct {
 	// the pipeline never depends on them.
 	tracer *tracing.Tracer
 	store  RunReader // history reads (Phase 04); nil when Postgres is unavailable
+
+	// Phase 10 channel-publishing fields. All three are additive: a nil
+	// publications store degrades the publishing endpoints to 503 (DB guard in
+	// publish-handlers.go) while every existing pipeline path is untouched.
+	repurpose    ContentRepurposer // category-blind content generation
+	publications PublicationStore  // publish state; nil when Postgres is unreachable
+	// channelFactory is a seam over channels.NewChannel so tests can inject a
+	// fake Channel without a real config-driven registry lookup.
+	channelFactory func(id string, cfg *config.Config) (channels.Channel, error)
 }
 
 // New wires the orchestrator with the real tools built from config. It can fail:
@@ -94,16 +105,24 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	// failure must not stop the server (mirrors the config fail-fast philosophy
 	// only for genuinely required config, which the DB is not). The error is
 	// DSN-free by construction (store.Open never echoes the password).
+	//
+	// Phase 10 widens the open condition: publishing needs the DB even when
+	// tracing is OFF (a user may want durable publish state without full run
+	// tracing), so the store opens whenever a DSN is configured OR tracing is
+	// enabled. The tracing writers (ev/rw), however, are only wired when tracing
+	// itself is enabled — publishing must never silently turn tracing on.
 	var st *store.Store
 	var ev tracing.EventWriter
 	var rw tracing.RunWriter
-	if cfg.Tracing.Enabled {
+	if cfg.Tracing.Enabled || cfg.DatabaseURL != "" {
 		opened, serr := store.Open(context.Background(), cfg.DatabaseURL)
 		if serr != nil {
-			slog.Warn("run history disabled — durable store unavailable (live timeline still works)",
-				"reason", serr.Error())
+			slog.Warn("durable store unavailable (publishing + history disabled; live timeline still works)", "reason", serr.Error())
 		} else {
-			st, ev, rw = opened, opened, opened
+			st = opened
+			if cfg.Tracing.Enabled {
+				ev, rw = opened, opened
+			}
 		}
 	}
 	tracer := tracing.New(cfg.Tracing.Enabled, ev, rw,
@@ -117,11 +136,18 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		reviewer:  agents.NewReviewer(client, cfg), // shares the explainer's LLM client
 		vault:     tools.NewVaultWriterTool(cfg, logCheck),
 		tracer:    tracer,
+		// Phase 10 channel-publishing wiring (orthogonal to discovery/resources):
+		// the repurposer shares the explainer's LLM client, and channelFactory is
+		// a seam over channels.NewChannel so tests can inject a fake Channel.
+		repurpose:      repurposer.New(client, cfg),
+		channelFactory: channels.NewChannel,
 	}
-	// Assign the reader ONLY when the DB opened, so a nil *store.Store never
-	// becomes a non-nil RunReader interface (which would panic on first call).
+	// Assign the reader/publications ONLY when the DB opened, so a nil
+	// *store.Store never becomes a non-nil RunReader/PublicationStore interface
+	// (which would panic on first call).
 	if st != nil {
 		o.store = st
+		o.publications = st
 	}
 	return o, nil
 }

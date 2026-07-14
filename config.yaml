@@ -39,3 +39,14 @@ tracing:
   enabled: true          # master switch for the Recorder (override: TRACING_ENABLED)
   full_payloads: true    # opt-in: persist full prompts/responses/markdown (override: TRACING_FULL_PAYLOADS)
   buffer_size: 256       # per-run in-memory ring capacity feeding SSE replay; > 0 when enabled
+
+# Phase 9 channel publishing. Optional: an empty block disables the feature.
+# channels must be known ids (devto, x); categories map soft target word
+# counts consumed by the Repurposer agent (internal/agents/repurposer), never
+# per-channel — see docs/design-notes/2026-07-14-channel-publishing.md.
+publishing:
+  channels: ["devto", "x"]
+  categories:
+    longform: { target_words: 1200 }
+    digest:   { target_words: 500 }
+    brief:    { target_words: 120 }

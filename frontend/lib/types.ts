@@ -199,3 +199,74 @@ export interface DiscoverMoreResult {
   candidates: Paper[];
   hasMore: boolean;
 }
+
+// --- Phase 8 channel-publishing types (mirror the Go DTOs in
+// backend/internal/orchestrator/dto.go) ---
+
+// Category groups a channel's content shape: a long-form article (dev.to), a
+// short digest, or a thread-chunked brief (X). Drives which editor/preview the
+// draft card renders.
+export type Category = "longform" | "digest" | "brief";
+
+// PublicationStatus is a draft's lifecycle: generated (draft) -> reviewed
+// (approved) -> claimed for the irreversible post (publishing, transient) ->
+// sent (published), or failed on the publish attempt. "publishing" is the
+// backend's atomic double-publish guard; it is normally momentary but can be
+// observed by a racing read, so the UI must render it.
+export type PublicationStatus =
+  | "draft"
+  | "approved"
+  | "publishing"
+  | "published"
+  | "failed";
+
+// Channel is one enabled, resolvable publish destination (Go ChannelDTO).
+export interface Channel {
+  id: string;
+  category: Category;
+}
+
+// Go ChannelsResponse.
+export interface ChannelsResponse {
+  channels: Channel[];
+}
+
+// CreatePublicationsRequest is the body of POST /runs/{id}/publications.
+export interface CreatePublicationsRequest {
+  channels: string[];
+}
+
+// PatchPublicationRequest is the body of PATCH /publications/{pid}. All
+// fields are optional — a partial edit (e.g. only `approve`) leaves the rest
+// untouched, matching the Go handler's pointer-field semantics.
+export interface PatchPublicationRequest {
+  title?: string;
+  content?: string;
+  approve?: boolean;
+}
+
+// Publication is one (run, channel) publish draft/attempt (Go PublicationDTO).
+// Optional fields are omitted by the backend (`omitempty`) rather than sent
+// as null/empty, so they are undefined at runtime until set.
+export interface Publication {
+  id: string;
+  runId: string;
+  channelId: string;
+  category: Category;
+  status: PublicationStatus;
+  title?: string;
+  content?: string;
+  externalUrl?: string;
+  externalId?: string;
+  error?: string;
+  createdAt: string; // ISO-8601
+  publishedAt?: string; // ISO-8601
+}
+
+// Go PublicationsResponse — GET/POST /runs/{id}/publications. skippedChannels
+// lists channel ids from a create-request that failed to resolve, paired with
+// omitempty semantics (undefined when nothing was skipped).
+export interface PublicationsResponse {
+  publications: Publication[];
+  skippedChannels?: string[];
+}

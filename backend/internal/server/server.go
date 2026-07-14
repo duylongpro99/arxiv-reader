@@ -38,6 +38,15 @@ func Handler(cfg *config.Config) (http.Handler, error) {
 	mux.HandleFunc("GET /runs/{id}", orch.HandleRun)
 	mux.HandleFunc("GET /runs/{id}/events", orch.HandleRunEvents)
 	mux.HandleFunc("GET /runs/{id}/content", orch.HandleRunContent)
+	// Phase 8 channel publishing: list channels, generate/list/edit/publish
+	// drafts. All publishing handlers self-guard with a 503 when the DB is
+	// unavailable (orchestrator.publications == nil) — registering the routes
+	// unconditionally here is safe.
+	mux.HandleFunc("GET /channels", orch.HandleChannels)
+	mux.HandleFunc("POST /runs/{id}/publications", orch.HandleCreatePublications)
+	mux.HandleFunc("GET /runs/{id}/publications", orch.HandleListPublications)
+	mux.HandleFunc("PATCH /publications/{pid}", orch.HandlePatchPublication)
+	mux.HandleFunc("POST /publications/{pid}/publish", orch.HandlePublish)
 
 	return corsMiddleware(mux), nil
 }
@@ -79,7 +88,8 @@ func corsMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin") // response varies by which origin matched
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		// PATCH added for Phase 8's PATCH /publications/{pid} edit/approve endpoint.
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

@@ -5,7 +5,7 @@
 
 ## Overview
 
-The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-18**, Phase 9 is complete. The system has been refactored to support pluggable discovery sources via a declarative resource engine: paper discovery is no longer hardcoded to arXiv but driven by YAML declarations. The core (orchestrator + agent pipeline) depends only on the `Source` interface, not concrete implementations.
+The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-19**, Phase 10 is complete. The system can discover papers with pagination via a declarative resource engine (discovery is no longer hardcoded to arXiv but driven by YAML declarations, with the core depending only on the `Source` interface), extract content, generate and review explainers, write them to Obsidian, provide a complete live and persistent timeline of every run, replay run history with full reasoning traces, and publish explainers to social channels (dev.to and X) with human review and editing.
 
 | Phase | Focus | Status | Completion |
 |---|---|---|---|
@@ -18,6 +18,7 @@ The project is organized into sequential phases, each delivering a complete, wor
 | **7** | Run Timeline Tracing | ✅ Complete | 2026-07-12 |
 | **8** | Full Reasoning Trace + Pagination | ✅ Complete | 2026-07-13 |
 | **9** | Declarative Resource Engine | ✅ Complete | 2026-07-18 |
+| **10** | Channel Publishing (dev.to + X) | ✅ Complete | 2026-07-19 |
 
 ---
 
@@ -402,6 +403,96 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 
 ---
 
+## Phase 10 — Channel Publishing (dev.to + X)
+**Status:** ✅ Complete (2026-07-19)
+
+**Deliverables:**
+- **Channel Abstraction & Registry**: Self-registration pattern (mirrors LLM provider); no import cycles; config-driven initialization
+  - Channel interface: `ID()`, `Category()`, `Validate()`, `Publish()`
+  - Category taxonomy: `longform` (deep article), `digest` (condensed, reserved for RSS), `brief` (punchy hook)
+  - v1 channels: **dev.to** (`longform`, API key), **X** (`brief`, OAuth2 + thread chunking)
+
+- **Repurposer Agent**: Single-shot content generation (no LLM reviewer loop)
+  - Category-blind: knows only `Category`, never a channel
+  - Reuses explainer's Analogies & Intuition + Glossary sections for accessibility
+  - Category-specific prompt templates; configurable per-category target word counts
+  - One LLM call per unique category; channels sharing category get one repurposed draft each
+
+- **Publications Store & Schema**: Durable, idempotent publication record
+  - `publications` table: (run_id, channel_id) UNIQUE constraint prevents duplicates
+  - Status lifecycle: draft → approved → publishing (transient claim guard) → published/failed
+  - ClaimForPublish atomic transition guards concurrent double-publish
+
+- **Orchestrator Integration**: Five new endpoints
+  - `GET /channels`: List enabled channels + categories
+  - `POST /runs/:id/publications`: Generate repurposer drafts per category
+  - `GET /runs/:id/publications`: List all drafts for a run
+  - `PATCH /publications/:pid`: Human edit endpoint (title, body, status)
+  - `POST /publications/:pid/publish`: Atomic claim + Channel.Publish() + store result
+
+- **dev.to Channel**: Publishes longform articles
+  - API key auth from `DEVTO_API_KEY` env var
+  - Creates article via dev.to API; returns live post URL + ID
+  - Validation: content length checks per dev.to limits
+
+- **X (Twitter) Channel**: Publishes brief content as numbered tweets
+  - OAuth2 user-context flow: 3-legged auth, token refresh (env: `X_CLIENT_ID/SECRET/REFRESH_TOKEN`)
+  - Mechanical chunking: splits brief into ≤280-char tweets with `(i/N)` counters
+  - Reply threading: subsequent tweets reply to previous (X API mechanics, not agent)
+  - Returns thread URL as external URL; thread root post ID as external_id
+
+- **Configuration**: `publishing:` block in config.yaml
+  - `channels`: List of enabled channel ids
+  - `categories`: Per-category soft target word counts
+  - Channel secrets in `.env` only (API keys, OAuth tokens, never logged)
+
+- **UI Components**: Publish workflow in frontend
+  - Publish panel: select channels, preview per-channel (thread/article view)
+  - Draft editor: edit title + body before approval
+  - Live links to published posts
+
+- **Documentation**: 
+  - Design note: `docs/design-notes/2026-07-14-channel-publishing.md`
+  - X OAuth setup: `docs/channel-x-oauth-setup.md`
+  - Architecture sections: Channels, Repurposer, Publications, Data Flow 4
+
+**Key Files:**
+- Backend:
+  - `internal/channels/{channel.go,category.go,registry.go}`
+  - `internal/channels/devto/{devto.go,*_test.go}`
+  - `internal/channels/x/{x.go,oauth.go,chunk.go,*_test.go}`
+  - `internal/agents/repurposer/{repurposer.go,repurposer-prompt.go,*_test.go}`
+  - `internal/store/{publications.go,model.go,*_test.go}`
+  - `backend/migrations/0002_publications.sql` (user-run migration)
+  - `internal/orchestrator/{publish-handlers.go,dto.go}`
+  - `cmd/server/main.go` (blank imports: `_ "internal/channels/devto"`, `_ "internal/channels/x"`)
+
+- Frontend:
+  - `app/runs/[id]/page.tsx` (publish UI integration)
+  - `components/publish-*.tsx` (UI components)
+  - `lib/use-publications.ts` (API hooks)
+  - `app/api/publish/*` (proxy routes)
+
+**Architecture:**
+- **Decoupling:** Repurposer (category-blind) ↔ Channel (mechanics-blind) seam via GeneratedContent DTO
+- **Idempotency:** UNIQUE (run_id, channel_id) + ClaimForPublish atomic transition
+- **DB-Required:** Publishing endpoints return 503 when Postgres unavailable; pipeline unaffected
+- **Single-shot:** Repurposer generates once per category; human review is the "reviewer" step, not another LLM pass
+
+**Success Metrics:**
+- Select a run → repurpose per category (one LLM call per unique category) → draft for each channel
+- Edit + approve draft in UI (no re-generation)
+- Publish → both dev.to and X return live external URLs stored in publications row
+- Re-publishing same (run, channel) pair blocked (409)
+- Adding a third channel: edit one channel package + add registry entry + re-import in main.go
+
+**Known Limitations:**
+- daily.dev has no push API → RSS channel is future work (modeled as `digest` category)
+- X auth is the cost (OAuth2 setup + token refresh); dev.to is trivial API key
+- X free tier is write-capped (~300 posts/15min); heavy publishing requires paid tier
+
+---
+
 ## Key Milestones
 
 | Milestone | Date | Achieved |
@@ -423,6 +514,10 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 | ArXiv tools deleted; resource YAML replaces hardcoding | 2026-07-18 | ✅ Yes |
 | Frontend resource picker + dynamic form (zero hardcoding) | 2026-07-18 | ✅ Yes |
 | New sources require YAML only (no Go changes) | 2026-07-18 | ✅ Yes |
+| Phase 10 channel publishing (dev.to + X) | 2026-07-19 | ✅ Yes |
+| Repurposer agent + Channel registry working | 2026-07-19 | ✅ Yes |
+| Select run → publish to dev.to and X with human review | 2026-07-19 | ✅ Yes |
+| Re-publishing blocked (idempotent) | 2026-07-19 | ✅ Yes |
 
 ---
 
@@ -456,22 +551,29 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 
 ## Known Limitations & Future Work
 
-### Phase 5 Limitations (resolved from Phase 4)
-- ~~**Single-pass generation:** No revision loop; Phase 5 adds that~~ → Phase 5 adds critic-generator loop
-- **Text-only:** Diagrams described by captions only; Phase ? may add optional image channel
-- **No auto-linking:** Follow-up papers listed; user opens arXiv manually; Phase ? may add links
-- **Obsidian only:** No other vault formats; future phases may add more targets
-- **Single paper per run:** No batch processing; Phase ? may add multiple papers
-- **Reviewer cost:** Default 2 iterations ≈ 200k tokens/paper; Phase 6 may add cost monitoring
+### Phase 9 Status: Channel Publishing Shipped
+Publishing to dev.to and X is now complete with human-in-the-loop review. daily.dev support deferred (no push API → future RSS channel).
 
-### Recommended Additions (Post-Phase 6)
-- Multi-category support (not just `cs.AI`)
-- Relevance ranking / keyword filtering
-- Batch processing multiple papers
-- Obsidian plugin for auto-sync
-- Cloud hosting / remote access (with strong privacy caveats)
-- Full-text search across generated notes
-- Categorization / tagging beyond static frontmatter
+### Resolved Limitations
+- ~~**Obsidian only:** Phase 9 adds social channel publishing (dev.to, X)~~
+- ~~**Single-pass generation:** Phase 5 added critic-generator revision loop~~
+- ~~**No publishing:** Phase 9 adds Channel abstraction + Repurposer agent~~
+
+### Remaining Limitations
+- **Text-only:** Diagrams/tables described by captions only; optional image channel reserved for future
+- **No auto-linking:** Follow-up papers listed; user opens arXiv manually
+- **Single paper per run:** No batch processing per session
+- **daily.dev no push API:** RSS channel (digest category) is future work; daily.dev ingests feeds, not POST
+
+### Recommended Additions (Post-Phase 9)
+- **daily.dev RSS Channel** — Publish digest content as RSS feed
+- **Multi-category arXiv** — Support beyond `cs.AI` (e.g., cs.LG, cs.NE)
+- **Relevance ranking** — Keyword filtering / semantic relevance (not just recency)
+- **Batch processing** — Multiple papers per run
+- **Obsidian plugin** — Direct vault integration + Obsidian-side UI
+- **Cloud hosting** — Remote access with privacy guardrails (local-only LLM inference)
+- **Full-text search** — Across all generated notes
+- **Auto-linking** — Hyperlink follow-up papers in explainers
 
 ---
 

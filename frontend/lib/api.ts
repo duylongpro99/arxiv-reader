@@ -2,8 +2,12 @@
 // never the Go backend directly — the backend address stays server-side.
 
 import type {
+  ChannelsResponse,
   DiscoverMoreResult,
+  PatchPublicationRequest,
   PipelineStatus,
+  Publication,
+  PublicationsResponse,
   ResourceDescriptor,
   ResultResponse,
   RetryResponse,
@@ -140,6 +144,90 @@ export async function fetchMoreCandidates(
       throw new Error("This search session expired — start a new search to load more.");
     }
     throw new Error(`Failed to load more papers (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// withStatus attaches the HTTP status to a thrown Error so callers (the
+// use-publications hooks) can special-case 503 (publishing unavailable, no
+// DB configured) the same way getRunContent/useRunContent already do.
+function withStatus(message: string, status: number): Error & { status?: number } {
+  const err = new Error(message) as Error & { status?: number };
+  err.status = status;
+  return err;
+}
+
+// --- Phase 8 channel-publishing API helpers (mirror the /channels,
+// /runs/:id/publications, /publications/:pid[/publish] proxy routes) ---
+
+// getChannels lists every enabled, resolvable publish channel.
+export async function getChannels(): Promise<ChannelsResponse> {
+  const res = await fetch("/api/channels");
+  if (!res.ok) {
+    throw withStatus(`Failed to load channels (HTTP ${res.status})`, res.status);
+  }
+  return res.json();
+}
+
+// getRunPublications lists the publish drafts/attempts already created for a run.
+export async function getRunPublications(runId: string): Promise<PublicationsResponse> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/publications`);
+  if (!res.ok) {
+    throw withStatus(`Failed to load publications (HTTP ${res.status})`, res.status);
+  }
+  return res.json();
+}
+
+// generateDrafts creates one draft publication per requested channel id for a run.
+export async function generateDrafts(
+  runId: string,
+  channels: string[],
+): Promise<PublicationsResponse> {
+  const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/publications`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ channels }),
+  });
+  if (!res.ok) {
+    throw withStatus(`Failed to generate drafts (HTTP ${res.status})`, res.status);
+  }
+  return res.json();
+}
+
+// patchPublication applies a partial edit (title/content) and/or approves a
+// draft. Only the fields present in `body` are sent — the backend treats
+// omitted fields as untouched.
+export async function patchPublication(
+  pid: string,
+  body: PatchPublicationRequest,
+): Promise<Publication> {
+  const res = await fetch(`/api/publications/${encodeURIComponent(pid)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw withStatus(`Failed to update draft (HTTP ${res.status})`, res.status);
+  }
+  return res.json();
+}
+
+// publishPublication sends an approved draft to its channel. A 409 (already
+// published) and 502 (channel error) are relayed as-is with the status
+// attached so the draft card can show the scrubbed backend error + retry.
+export async function publishPublication(pid: string): Promise<Publication> {
+  const res = await fetch(`/api/publications/${encodeURIComponent(pid)}/publish`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    let message = `Failed to publish (HTTP ${res.status})`;
+    try {
+      const body = await res.json();
+      if (typeof body?.error === "string" && body.error) message = body.error;
+    } catch {
+      // Non-JSON error body — fall back to the generic message above.
+    }
+    throw withStatus(message, res.status);
   }
   return res.json();
 }
