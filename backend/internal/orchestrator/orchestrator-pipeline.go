@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
@@ -51,14 +52,19 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 		}
 	}()
 
+	// The per-session query (category + free-text) drives every arXiv fetch —
+	// read it once here so the narrative, the fetch, and the summary all describe
+	// the same run.
+	query := session.Query()
+
 	// Timeline: discovery began (covers both a fresh run and a discovery retry).
 	o.rec(session).Emit(tev(tracing.KindDiscoveryStarted, tracing.StatusInfo, models.StageDiscovery,
-		fmt.Sprintf("Discovery triggered (%s)", o.cfg.Agent.ArxivCategory)))
+		fmt.Sprintf("Discovery triggered (%s)", describeQuery(query))))
 
 	// Surface arXiv retry attempts as a progress counter (F5). On success we reset
 	// it to 0 below so the "Connecting to arXiv (retry n/3)…" label disappears.
 	fetchStart := time.Now()
-	papers, err := o.disco.FetchPapers(ctx, func(attempt int) {
+	papers, err := o.disco.FetchPapers(ctx, query, func(attempt int) {
 		session.SetArxivRetryCount(attempt)
 	})
 	if err != nil {
@@ -72,7 +78,7 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 
 	fetched := tev(tracing.KindToolDiscoveryCompleted, tracing.StatusSuccess, models.StageDiscovery,
 		fmt.Sprintf("Fetched %d papers from arXiv", len(papers)))
-	fetched.Summary = map[string]any{"count": len(papers), "category": o.cfg.Agent.ArxivCategory}
+	fetched.Summary = map[string]any{"count": len(papers), "category": query.Category, "terms": query.Terms}
 	fetched.DurationMS = tracing.MS(time.Since(fetchStart))
 	o.rec(session).Emit(fetched)
 
@@ -227,7 +233,7 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 	}
 
 	s.SetStage(models.StageWriting)
-	path, err := o.vault.WriteToVault(ctx, *ex, *paper, s.Verdict())
+	path, err := o.vault.WriteToVault(ctx, *ex, *paper, s.Verdict(), s.Query().Category)
 	if err != nil {
 		// Permission/disk failures won't fix themselves on retry; others might.
 		msg, action := vaultErrMsg(err)
@@ -516,9 +522,20 @@ func sectionsOrNone(sections []string) string {
 	return strings.Join(sections, ", ")
 }
 
-// newSession creates a session with a unique, dependency-free random ID.
-func (o *Orchestrator) newSession() *models.PipelineSession {
-	return models.NewSession(newSessionID(), time.Now())
+// newSession creates a session with a unique, dependency-free random ID and the
+// given discovery query (category + free-text) fixed for its lifetime.
+func (o *Orchestrator) newSession(query arxivquery.Query) *models.PipelineSession {
+	return models.NewSession(newSessionID(), time.Now(), query)
+}
+
+// describeQuery renders a discovery query for the timeline narrative: the bare
+// category when there is no free-text, or "category: terms" when the user added
+// keywords.
+func describeQuery(q arxivquery.Query) string {
+	if q.Terms == "" {
+		return q.Category
+	}
+	return q.Category + ": " + q.Terms
 }
 
 // newSessionID returns a 32-hex-char (16 random bytes) session ID. crypto/rand

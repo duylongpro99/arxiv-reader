@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { useEventSource } from "@/lib/use-event-source";
 import { CandidateList } from "./candidate-list";
+import { CategoryPicker } from "./category-picker";
 import { ContextWarningBanner } from "./context-warning";
 import { ErrorBanner } from "./error-banner";
 import { ProgressIndicator } from "./progress-indicator";
@@ -23,6 +24,13 @@ import { TriggerButton } from "./trigger-button";
 // state comes from the polled status.
 export function DiscoveryPanel() {
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // The category + optional keywords driving the next discovery run. Category
+  // starts empty and is seeded by CategoryPicker from the backend's configured
+  // default (so the UI never diverges from the backend default); the user then
+  // swaps it. Kept here so `start()` reads the current selection directly. An
+  // empty category sent to the backend safely resolves to that same default.
+  const [category, setCategory] = useState("");
+  const [terms, setTerms] = useState("");
   // The paper the user picked (null = none yet / re-pick reset).
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // Whether we have ever committed a selection — gates the re-pick detector so
@@ -31,7 +39,7 @@ export function DiscoveryPanel() {
   const queryClient = useQueryClient();
 
   const trigger = useMutation({
-    mutationFn: triggerDiscovery,
+    mutationFn: () => triggerDiscovery(category, terms),
     onSuccess: ({ session_id }) => {
       setSessionId(session_id);
       setSelectedId(null);
@@ -121,7 +129,16 @@ export function DiscoveryPanel() {
 
   return (
     <div className="flex flex-col gap-6">
-      <TriggerButton onClick={start} loading={isLoading} />
+      <div className="flex flex-col gap-4">
+        <CategoryPicker
+          category={category}
+          terms={terms}
+          onCategoryChange={setCategory}
+          onTermsChange={setTerms}
+          disabled={isLoading}
+        />
+        <TriggerButton onClick={start} loading={isLoading} />
+      </div>
 
       {/* Trigger request itself failed (e.g. backend unreachable). */}
       {trigger.isError && (

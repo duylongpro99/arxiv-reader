@@ -9,8 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 )
+
+// testQry is the default discovery query used by the fetch tests (category-only,
+// matching the historical cs.AI behaviour these tests assert on).
+var testQry = arxivquery.Query{Category: "cs.AI"}
 
 // sampleFeed is a minimal but realistic arXiv Atom response with two entries,
 // deliberately including the newline-wrapped title/summary arXiv actually emits.
@@ -70,7 +75,7 @@ func TestFetchPapersHappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
+	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +116,7 @@ func TestFetchPapersRetriesThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
+	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, nil)
 	if err != nil {
 		t.Fatalf("expected success after retry, got %v", err)
 	}
@@ -141,7 +146,7 @@ func TestFetchPapersOnRetryCallbackFires(t *testing.T) {
 	defer srv.Close()
 
 	var attempts []int
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), func(attempt int) {
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, func(attempt int) {
 		attempts = append(attempts, attempt)
 	})
 	if err != nil {
@@ -159,7 +164,7 @@ func TestFetchPapersRateLimitExhausted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, nil)
 	if !errors.Is(err, ErrArxivRateLimit) {
 		t.Fatalf("expected ErrArxivRateLimit, got %v", err)
 	}
@@ -171,7 +176,7 @@ func TestFetchPapersServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, nil)
 	if !errors.Is(err, ErrArxivUnavailable) {
 		t.Fatalf("expected ErrArxivUnavailable, got %v", err)
 	}
@@ -183,9 +188,42 @@ func TestFetchPapersParseError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
+	_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, nil)
 	if !errors.Is(err, ErrArxivParse) {
 		t.Fatalf("expected ErrArxivParse, got %v", err)
+	}
+}
+
+// The built arXiv search_query must reflect the DiscoveryQuery: category-only,
+// and category AND-ed with free-text. This is the seam that lets a user switch
+// category / add keywords, so it is asserted on the decoded query value the
+// server actually receives.
+func TestFetchPapersBuildsSearchQueryFromQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		qry  arxivquery.Query
+		want string
+	}{
+		{"category only", arxivquery.Query{Category: "cs.LG"}, "cat:cs.LG"},
+		{"category + terms", arxivquery.Query{Category: "cs.LG", Terms: "transformer"}, "cat:cs.LG AND all:transformer"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var gotQuery string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.Query().Get("search_query")
+				_, _ = w.Write([]byte(sampleFeed))
+			}))
+			defer srv.Close()
+
+			_, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), c.qry, nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotQuery != c.want {
+				t.Errorf("search_query = %q, want %q", gotQuery, c.want)
+			}
+		})
 	}
 }
 
@@ -197,7 +235,7 @@ func TestFetchPapersEmptyFeedIsNotError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), nil)
+	papers, err := newFastTool(testAgentCfg(srv.URL)).FetchPapers(context.Background(), testQry, nil)
 	if err != nil {
 		t.Fatalf("empty feed should not error, got %v", err)
 	}

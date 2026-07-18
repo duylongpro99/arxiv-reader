@@ -7,11 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
@@ -24,9 +27,10 @@ import (
 // depends on. Defining them here (consumer-side) keeps the orchestrator
 // testable with fakes and decoupled from the concrete tools.
 type PaperFetcher interface {
-	// onRetry (nil-safe) fires per transient arXiv retry so the orchestrator can
-	// surface a progress counter (F5) without the tool touching the session.
-	FetchPapers(ctx context.Context, onRetry func(attempt int)) ([]models.Paper, error)
+	// query carries the per-session category + free-text; onRetry (nil-safe)
+	// fires per transient arXiv retry so the orchestrator can surface a progress
+	// counter (F5) without the tool touching the session.
+	FetchPapers(ctx context.Context, query arxivquery.Query, onRetry func(attempt int)) ([]models.Paper, error)
 }
 
 // PageFetcher is the narrow, consumer-side contract for Feature C (arXiv
@@ -35,7 +39,7 @@ type PaperFetcher interface {
 // PaperFetcher) so the existing PaperFetcher fakes used by orchestrator_test.go
 // keep compiling unchanged — this is strictly additive.
 type PageFetcher interface {
-	FetchPapersFrom(ctx context.Context, start int, onRetry func(attempt int)) ([]models.Paper, error)
+	FetchPapersFrom(ctx context.Context, query arxivquery.Query, start int, onRetry func(attempt int)) ([]models.Paper, error)
 }
 
 type Unprocessor interface {
@@ -56,7 +60,7 @@ type Explainer interface {
 }
 
 type VaultWriter interface {
-	WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper, verdict *models.ReviewVerdict) (string, error)
+	WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper, verdict *models.ReviewVerdict, category string) (string, error)
 }
 
 // Reviewer is the Phase 5 consumer contract for the critic in the revision loop.
@@ -148,7 +152,14 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // HandleStatus. Discovery is async because later phases (LLM calls) are slow;
 // establishing the contract now keeps it stable across phases.
 func (o *Orchestrator) HandleDiscover(w http.ResponseWriter, r *http.Request) {
-	session := o.newSession()
+	query, err := o.parseDiscoverQuery(r)
+	if err != nil {
+		// Malformed body or unknown category — both client errors, so 400.
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	session := o.newSession(query)
 	o.sessions.Store(session.SessionID, session)
 	o.rec(session) // create the recorder + run-header row at run start
 
@@ -160,6 +171,59 @@ func (o *Orchestrator) HandleDiscover(w http.ResponseWriter, r *http.Request) {
 	go o.runDiscovery(context.WithoutCancel(r.Context()), session)
 
 	writeJSON(w, http.StatusOK, DiscoverResponse{SessionID: session.SessionID})
+}
+
+// discoverRequest is the optional JSON body for POST /discover. Both fields are
+// optional: an empty/absent body (existing clients) falls back to the config
+// default category with no free-text.
+type discoverRequest struct {
+	Category string `json:"category"`
+	Terms    string `json:"terms"`
+}
+
+// parseDiscoverQuery decodes the optional {category, terms} body into a
+// validated arxivquery.Query. An empty body (EOF) is the backward-compatible
+// default path, not an error. It returns an error (→ 400) for a malformed body
+// or an explicitly-supplied unknown category. Free-text is sanitized here (the
+// single trust boundary for keyword input); the category is checked against the
+// cs.* whitelist.
+func (o *Orchestrator) parseDiscoverQuery(r *http.Request) (arxivquery.Query, error) {
+	var req discoverRequest
+	// EOF means no body → use defaults. Any other decode error is a genuinely
+	// malformed request, which we reject rather than silently downgrading to a
+	// default run (that would mask client bugs).
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		return arxivquery.Query{}, fmt.Errorf("invalid request body")
+	}
+
+	category := strings.TrimSpace(req.Category)
+	if category == "" {
+		category = o.cfg.Agent.ArxivCategory // config default (validated at load)
+	} else if !arxivquery.IsValid(category) {
+		return arxivquery.Query{}, fmt.Errorf("unknown category %q", category)
+	}
+
+	return arxivquery.Query{
+		Category: category,
+		Terms:    arxivquery.SanitizeTerms(req.Terms),
+	}, nil
+}
+
+// categoriesResponse carries the cs.* catalog plus the configured default so the
+// UI seeds its picker from the SAME default the empty-body discovery path uses —
+// no divergence between what the frontend shows and what the backend defaults to.
+type categoriesResponse struct {
+	Default    string               `json:"default"`
+	Categories []arxivquery.Category `json:"categories"`
+}
+
+// HandleCategories returns the cs.* catalog + configured default for the UI
+// dropdown. Static read of the compiled-in list + config — no session, no arXiv.
+func (o *Orchestrator) HandleCategories(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, categoriesResponse{
+		Default:    o.cfg.Agent.ArxivCategory,
+		Categories: arxivquery.Categories,
+	})
 }
 
 // HandleProcess records the user's paper choice and kicks off extraction. It
@@ -377,7 +441,9 @@ func (o *Orchestrator) HandleDiscoverMore(w http.ResponseWriter, r *http.Request
 	fetchLimit := o.cfg.Agent.FetchLimit
 	start := s.ConsumeNextStart(fetchLimit)
 
-	papers, err := o.discoMore.FetchPapersFrom(r.Context(), start, nil)
+	// Pass the session's own query so pagination stays within the same category +
+	// free-text the user chose for this run (never drifting to the config default).
+	papers, err := o.discoMore.FetchPapersFrom(r.Context(), s.Query(), start, nil)
 	if err != nil {
 		msg, _, _ := describeError(err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})

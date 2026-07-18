@@ -4,10 +4,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 )
 
 func TestAccessorsMutateUnderLock(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 
 	s.SetStage(StageExtracting)
 	s.SetSelectedPaper(&Paper{ID: "2312.00752"})
@@ -26,7 +28,7 @@ func TestAccessorsMutateUnderLock(t *testing.T) {
 // Phase 4 accessors round-trip under the lock, and none of the new server-only
 // fields leak into Snapshot() (which would inflate every /status poll).
 func TestPhase4AccessorsRoundTrip(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 
 	p := &Paper{ID: "2401.12345", Title: "Attention Is All You Need"}
 	s.SetSelectedPaper(p)
@@ -68,7 +70,7 @@ func TestPhase4AccessorsRoundTrip(t *testing.T) {
 // against a future field being added to the snapshot by habit (would leak KBs
 // of text to every /status poll).
 func TestSnapshotExcludesMarkdown(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 	s.SetMarkdown("secret large markdown body")
 
 	snap := s.Snapshot()
@@ -80,7 +82,7 @@ func TestSnapshotExcludesMarkdown(t *testing.T) {
 }
 
 func TestRecoverToSelectionPreservesCandidates(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 	cands := []Paper{{ID: "a"}, {ID: "b"}}
 	s.Complete(cands, "")
 	s.SetStage(StageExtracting)
@@ -108,7 +110,7 @@ func TestRecoverToSelectionPreservesCandidates(t *testing.T) {
 // Fail and RecoverToSelection are distinct transitions: Fail lands in failed,
 // recover lands back in selection.
 func TestFailVsRecover(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 	s.SetStage(StageExtracting)
 	s.Fail("boom", true)
 	if s.Snapshot().Stage != StageFailed {
@@ -119,7 +121,7 @@ func TestFailVsRecover(t *testing.T) {
 // Race guard: concurrent accessor writes + Snapshot reads must be lock-clean
 // under `go test -race`.
 func TestConcurrentAccess(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(2)
@@ -132,7 +134,7 @@ func TestConcurrentAccess(t *testing.T) {
 // Fail must snapshot the stage that was active BEFORE the transition to failed —
 // this is what Phase 6 retry routing keys off to resume the correct segment.
 func TestFailCapturesFailedStage(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 	s.SetStage(StageWriting)
 	s.Fail("disk full", false)
 
@@ -148,7 +150,7 @@ func TestFailCapturesFailedStage(t *testing.T) {
 // additive, and the poll-surfaced fields (errorAction/arxivRetryCount/
 // contextWarning) reach Snapshot while the large in/out totals do NOT.
 func TestPhase6AccessorsRoundTrip(t *testing.T) {
-	s := NewSession("s1", time.Now())
+	s := NewSession("s1", time.Now(), arxivquery.Query{Category: "cs.AI"})
 
 	s.SetErrorAction("fix_config")
 	if got := s.ErrorAction(); got != "fix_config" {

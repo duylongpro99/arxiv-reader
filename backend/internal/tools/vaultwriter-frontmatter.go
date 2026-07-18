@@ -25,7 +25,7 @@ var (
 // reviewer was disabled (max_review_iterations: 0) → review_iterations: 0,
 // review_passed: true, and review_score is omitted (no review ran). A set verdict
 // records its real iteration count, pass flag, and score.
-func (t *VaultWriterTool) buildFrontmatter(p models.Paper, ex models.ExplainerOutput, verdict *models.ReviewVerdict) string {
+func (t *VaultWriterTool) buildFrontmatter(p models.Paper, ex models.ExplainerOutput, verdict *models.ReviewVerdict, category string) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString(fmt.Sprintf("arxiv_id: %s\n", escapeYAML(p.ID)))
@@ -35,7 +35,7 @@ func (t *VaultWriterTool) buildFrontmatter(p models.Paper, ex models.ExplainerOu
 		b.WriteString(fmt.Sprintf("  - %s\n", escapeYAML(a)))
 	}
 	b.WriteString(fmt.Sprintf("published: %s\n", escapeYAML(dateOnly(p.Published))))
-	b.WriteString(fmt.Sprintf("category: %s\n", escapeYAML(t.cfg.Agent.ArxivCategory)))
+	b.WriteString(fmt.Sprintf("category: %s\n", escapeYAML(category)))
 	b.WriteString(fmt.Sprintf("generated_at: %s\n", escapeYAML(ex.CreatedAt.UTC().Format(time.RFC3339))))
 	if verdict == nil {
 		// Reviewer disabled: nothing was reviewed, so record an honest "0 rounds,

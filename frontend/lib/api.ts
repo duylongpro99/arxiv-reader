@@ -2,6 +2,7 @@
 // never the Go backend directly — the backend address stays server-side.
 
 import type {
+  CategoriesResponse,
   DiscoverMoreResult,
   PipelineStatus,
   ResultResponse,
@@ -11,10 +12,29 @@ import type {
   TriggerResponse,
 } from "./types";
 
-// triggerDiscovery starts a discovery run and returns the new session id.
-export async function triggerDiscovery(): Promise<TriggerResponse> {
-  const res = await fetch("/api/trigger", { method: "POST" });
+// fetchCategories loads the cs.* catalog + configured default for the picker.
+export async function fetchCategories(): Promise<CategoriesResponse> {
+  const res = await fetch("/api/categories");
   if (!res.ok) {
+    throw new Error(`Failed to load categories (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
+// triggerDiscovery starts a discovery run for the chosen category (+ optional
+// keywords) and returns the new session id. category is required; terms is
+// optional free-text the backend sanitizes and AND-s onto the category filter.
+export async function triggerDiscovery(
+  category: string,
+  terms?: string,
+): Promise<TriggerResponse> {
+  const res = await fetch("/api/trigger", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category, terms: terms ?? "" }),
+  });
+  if (!res.ok) {
+    // A 400 means the category was not recognised — surface it clearly.
     throw new Error(`Failed to start discovery (HTTP ${res.status})`);
   }
   return res.json();

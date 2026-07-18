@@ -37,7 +37,10 @@ func NewVaultWriterTool(cfg *config.Config, logCheck *LogCheckTool) *VaultWriter
 // filesystem). A rename failure removes the temp file so no orphan ".tmp" is
 // left. A post-write log-update failure is a WARNING, not an error: the note is
 // already saved; the only consequence is the paper re-surfaces next run.
-func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper, verdict *models.ReviewVerdict) (string, error) {
+// category is the arXiv category this run was discovered under (now runtime-
+// selectable), recorded verbatim in the note frontmatter — NOT the config
+// default, which would mislabel any run on a non-default category.
+func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerOutput, p models.Paper, verdict *models.ReviewVerdict, category string) (string, error) {
 	start := time.Now()
 	vaultDir := filepath.Join(t.cfg.Paths.ObsidianVault, "AI Papers")
 	filename := t.generateFilename(p)
@@ -54,7 +57,7 @@ func (t *VaultWriterTool) WriteToVault(ctx context.Context, ex models.ExplainerO
 
 	slog.Info("vault write started", "paper_id", p.ID, "filename", filename)
 
-	content := t.buildFrontmatter(p, ex, verdict) + ex.Content
+	content := t.buildFrontmatter(p, ex, verdict, category) + ex.Content
 	// Atomic + unique-temp write: no partial file ever appears at finalPath, and
 	// concurrent writers to the same note never collide on one temp (see
 	// writeFileAtomic). A failure leaves no orphan temp behind.

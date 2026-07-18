@@ -41,7 +41,9 @@ func TestWriteToVaultHappyPath(t *testing.T) {
 		Authors: []string{"A. Vaswani", `N. "Noam" Shazeer`}, Published: "2017-06-12T00:00:00Z",
 	}
 
-	path, err := w.WriteToVault(context.Background(), sampleExplainer(), paper, nil)
+	// Pass a category that differs from the config default (cs.AI) to prove the
+	// frontmatter records the RUN's category, not the config constant.
+	path, err := w.WriteToVault(context.Background(), sampleExplainer(), paper, nil, "cs.RO")
 	if err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
@@ -66,8 +68,8 @@ func TestWriteToVaultHappyPath(t *testing.T) {
 			t.Fatalf("frontmatter missing key %q; got %v", k, fm)
 		}
 	}
-	if fm["category"] != "cs.AI" {
-		t.Fatalf("category should come from config: %v", fm["category"])
+	if fm["category"] != "cs.RO" {
+		t.Fatalf("category should come from the run's query, not config: %v", fm["category"])
 	}
 	// nil verdict = reviewer disabled: 0 iterations, passed by default, no score key.
 	if fm["review_iterations"] != 0 || fm["review_passed"] != true {
@@ -105,7 +107,7 @@ func TestWriteToVaultRenameFailureCleansTmp(t *testing.T) {
 		t.Fatalf("setup dir: %v", err)
 	}
 
-	_, err := w.WriteToVault(context.Background(), sampleExplainer(), paper, nil)
+	_, err := w.WriteToVault(context.Background(), sampleExplainer(), paper, nil, "cs.AI")
 	if err == nil {
 		t.Fatal("expected rename failure")
 	}
