@@ -9,6 +9,8 @@ import (
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
+
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 )
 
 // Config is the fully-resolved runtime configuration.
@@ -272,6 +274,12 @@ func (c *Config) validate() error {
 func (a *AgentConfig) validate() error {
 	if a.ArxivCategory == "" {
 		return fmt.Errorf("agent.arxiv_category is required but not set.\n  → Set agent.arxiv_category (e.g. cs.AI) in config.yaml")
+	}
+	// The configured category is the DEFAULT selection surfaced to users, so it
+	// must be a known cs.* code — otherwise the first discovery run (with an
+	// empty request body) would build an invalid arXiv query. Fail fast at load.
+	if !arxivquery.IsValid(a.ArxivCategory) {
+		return fmt.Errorf("agent.arxiv_category %q is not a known cs.* category.\n  → Set agent.arxiv_category to a valid code (e.g. cs.AI) in config.yaml", a.ArxivCategory)
 	}
 	if a.ArxivBaseURL == "" {
 		return fmt.Errorf("agent.arxiv_base_url is required but not set.\n  → Set agent.arxiv_base_url in config.yaml")

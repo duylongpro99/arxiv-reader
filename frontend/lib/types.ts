@@ -57,6 +57,20 @@ export interface TriggerResponse {
   session_id: string;
 }
 
+// One arXiv cs.* category for the discovery picker. Shape mirrors the Go
+// arxivquery.Category DTO ({code, label} json tags).
+export interface Category {
+  code: string;
+  label: string;
+}
+
+// GET /categories payload: the catalog plus the backend's configured default,
+// so the picker seeds from the same default the empty-body discovery path uses.
+export interface CategoriesResponse {
+  default: string;
+  categories: Category[];
+}
+
 // Selecting a paper returns the same session id (the panel keeps polling it).
 export interface SelectResponse {
   session_id: string;

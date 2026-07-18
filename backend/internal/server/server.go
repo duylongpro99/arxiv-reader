@@ -25,6 +25,7 @@ func Handler(cfg *config.Config) (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler) // method-based routing (Go 1.22+)
+	mux.HandleFunc("GET /categories", orch.HandleCategories)
 	mux.HandleFunc("POST /discover", orch.HandleDiscover)
 	mux.HandleFunc("POST /discover/{sessionId}/more", orch.HandleDiscoverMore)
 	mux.HandleFunc("POST /process", orch.HandleProcess)

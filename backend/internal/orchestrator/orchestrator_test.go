@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
@@ -26,7 +27,7 @@ type fakeFetcher struct {
 	err    error
 }
 
-func (f *fakeFetcher) FetchPapers(context.Context, func(int)) ([]models.Paper, error) {
+func (f *fakeFetcher) FetchPapers(context.Context, arxivquery.Query, func(int)) ([]models.Paper, error) {
 	return f.papers, f.err
 }
 
@@ -91,15 +92,17 @@ func (f *fakeExplainer) Generate(context.Context, agents.ExplainerInput) (models
 
 // fakeVault records the write and returns a canned path or a forced error.
 type fakeVault struct {
-	path        string
-	err         error
-	written     int32
-	lastVerdict *models.ReviewVerdict // captured for review-loop assertions
+	path         string
+	err          error
+	written      int32
+	lastVerdict  *models.ReviewVerdict // captured for review-loop assertions
+	lastCategory string                // captured to assert the run's category is recorded
 }
 
-func (f *fakeVault) WriteToVault(_ context.Context, _ models.ExplainerOutput, _ models.Paper, verdict *models.ReviewVerdict) (string, error) {
+func (f *fakeVault) WriteToVault(_ context.Context, _ models.ExplainerOutput, _ models.Paper, verdict *models.ReviewVerdict, category string) (string, error) {
 	atomic.AddInt32(&f.written, 1)
 	f.lastVerdict = verdict
+	f.lastCategory = category
 	if f.err != nil {
 		return "", f.err
 	}
@@ -130,7 +133,7 @@ func newProcessOrch(c PaperContent, opts ...func(*Orchestrator)) *Orchestrator {
 // selectionSession stores a session already at the selection stage with the
 // given candidates, ready for HandleProcess.
 func selectionSession(o *Orchestrator, candidates []models.Paper) *models.PipelineSession {
-	s := models.NewSession("sess-test", time.Now())
+	s := models.NewSession("sess-test", time.Now(), arxivquery.Query{Category: "cs.AI"})
 	s.Complete(candidates, "")
 	o.sessions.Store(s.SessionID, s)
 	return s
@@ -340,7 +343,7 @@ func TestProcessOtherErrorFailsRecoverable(t *testing.T) {
 
 func TestProcessWrongStage400(t *testing.T) {
 	o := newProcessOrch(&fakeContent{md: "x"})
-	s := models.NewSession("sess-test", time.Now()) // still in discovery
+	s := models.NewSession("sess-test", time.Now(), arxivquery.Query{Category: "cs.AI"}) // still in discovery
 	o.sessions.Store(s.SessionID, s)
 
 	if rec := process(o, s.SessionID, "a"); rec.Code != http.StatusBadRequest {
@@ -494,7 +497,7 @@ type toggleVault struct {
 	path    string
 }
 
-func (v *toggleVault) WriteToVault(context.Context, models.ExplainerOutput, models.Paper, *models.ReviewVerdict) (string, error) {
+func (v *toggleVault) WriteToVault(context.Context, models.ExplainerOutput, models.Paper, *models.ReviewVerdict, string) (string, error) {
 	// A bare error is recoverable by default (vaultRecoverable), modelling a
 	// transient disk hiccup that clears on retry.
 	if atomic.AddInt32(&v.written, 1) == 1 {

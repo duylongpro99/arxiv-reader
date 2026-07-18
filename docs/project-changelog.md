@@ -5,6 +5,40 @@ All notable changes to this project are documented below, organized by release a
 
 ---
 
+## [Phase 9] — 2026-07-18
+
+Runtime category + keyword exploration. Discovery is no longer locked to a single hardcoded `cs.AI` category: the user picks any cs.* subcategory at runtime and optionally adds keywords, driving the arXiv query for both the initial run and "load more". The category constant moved from global config to per-session state.
+
+### Added
+
+#### Backend
+- **`internal/arxivquery` leaf package** — dependency-free, so config/tools/orchestrator all import it without a cycle
+  - `Categories` — the full cs.* taxonomy (`{code, label}`), doubling as the validation whitelist and the UI dropdown source
+  - `IsValid(code)` — O(1) whitelist gate for user-supplied categories
+  - `Query{Category, Terms}.SearchQuery()` — renders the arXiv `search_query` (`cat:X` or `cat:X AND all:...`)
+  - `SanitizeTerms` — single trust boundary for user free-text: strips arXiv boolean operators (AND/OR/ANDNOT) and structural chars (`"():`), caps length
+- **`GET /categories`** — serves the cs.* catalog **and the configured default** (`{default, categories}`) so the picker seeds from the same default the empty-body path uses (`HandleCategories`)
+- **`POST /discover` optional body** `{category, terms}` — empty body falls back to the config default (backward compatible); unknown category → 400; terms sanitized on entry
+
+#### Frontend
+- **CategoryPicker component** — cs.* dropdown (human labels) + optional keyword input, wired into DiscoveryPanel
+- **`/api/categories` proxy**; `/api/trigger` forwards the `{category, terms}` body; `api.ts` `fetchCategories` + `triggerDiscovery(category, terms)`
+
+### Changed
+
+#### Backend
+- **`DiscoveryTool`** — `FetchPapers`/`FetchPapersFrom`/`buildQueryURL` now take an `arxivquery.Query`; no longer read `cfg.ArxivCategory`
+- **`PipelineSession`** — new mutex-guarded `query` field + `Query()` accessor; `NewSession` takes a query. `runDiscovery` and `HandleDiscoverMore` (pagination) both read `session.Query()`, so "load more" stays within the chosen category+terms
+- **Config validation** — `agent.arxiv_category` default must now be a known cs.* code (fails fast at load)
+- **Security posture** — the stale "category comes from config, never user input, so there is no injection surface" comment in `discovery.go` was rewritten: category is now whitelist-validated and free-text is sanitized
+
+### Fixed
+- **Note frontmatter category** — `WriteToVault`/`buildFrontmatter` now record the run's actual category (threaded from `session.Query().Category`) instead of the config default, which mislabelled every note discovered under a non-default category
+- **`SanitizeTerms` UTF-8 safety** — length cap truncates on a rune boundary, so multibyte keywords can't produce invalid UTF-8 (and a malformed arXiv query)
+- **Malformed `/discover` body** — a non-empty, non-JSON body now returns 400 instead of silently downgrading to a default run (empty body still → default)
+
+---
+
 ## [Phase 8] — 2026-07-13
 
 Full agent reasoning trace + history content replay + arXiv pagination. Three independent improvements shipped together: explainer/reviewer PayloadFull now populated with full prompts and responses for observability; history detail view includes the persisted markdown note with live reasoning timeline; arXiv discovery supports offset-based pagination within a session.

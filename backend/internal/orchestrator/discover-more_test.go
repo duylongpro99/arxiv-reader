@@ -8,24 +8,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 )
 
 // fakePageFetcher satisfies both PaperFetcher and PageFetcher (as the real
 // DiscoveryTool does), recording how many times the paginated fetch ran so a
-// test can assert a rejected /more never reaches arXiv.
+// test can assert a rejected /more never reaches arXiv, plus the last query it
+// received so a test can assert pagination uses the session's own query.
 type fakePageFetcher struct {
-	page  []models.Paper
-	calls int
+	page    []models.Paper
+	calls   int
+	lastQry arxivquery.Query
 }
 
-func (f *fakePageFetcher) FetchPapers(context.Context, func(int)) ([]models.Paper, error) {
+func (f *fakePageFetcher) FetchPapers(context.Context, arxivquery.Query, func(int)) ([]models.Paper, error) {
 	return f.page, nil
 }
 
-func (f *fakePageFetcher) FetchPapersFrom(_ context.Context, _ int, _ func(int)) ([]models.Paper, error) {
+func (f *fakePageFetcher) FetchPapersFrom(_ context.Context, q arxivquery.Query, _ int, _ func(int)) ([]models.Paper, error) {
 	f.calls++
+	f.lastQry = q
 	return f.page, nil
 }
 
@@ -48,7 +52,7 @@ func discoverMore(o *Orchestrator, id string) *httptest.ResponseRecorder {
 func TestDiscoverMoreWrongStageIsRejectedAndDoesNotFetch(t *testing.T) {
 	pf := &fakePageFetcher{page: makePapers(5)}
 	o := moreOrch(pf)
-	s := models.NewSession("sess-test", time.Now()) // still in discovery stage
+	s := models.NewSession("sess-test", time.Now(), arxivquery.Query{Category: "cs.AI"}) // still in discovery stage
 	o.sessions.Store(s.SessionID, s)
 
 	rec := discoverMore(o, s.SessionID)

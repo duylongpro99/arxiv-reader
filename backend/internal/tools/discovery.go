@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
 )
@@ -84,8 +85,12 @@ type arxivLink struct {
 // number on each transient retry, letting the caller surface a progress counter
 // (F5) WITHOUT this tool depending on the session. It keeps DiscoveryTool
 // decoupled — the callback is the only seam.
-func (t *DiscoveryTool) FetchPapers(ctx context.Context, onRetry func(attempt int)) ([]models.Paper, error) {
-	return t.FetchPapersFrom(ctx, 0, onRetry)
+//
+// query carries the (validated) category + (sanitized) free-text for this run;
+// it replaces the old config-category constant so a single tool instance serves
+// any user selection.
+func (t *DiscoveryTool) FetchPapers(ctx context.Context, query arxivquery.Query, onRetry func(attempt int)) ([]models.Paper, error) {
+	return t.FetchPapersFrom(ctx, query, 0, onRetry)
 }
 
 // FetchPapersFrom queries arXiv (newest first) starting at the given offset and
@@ -96,9 +101,9 @@ func (t *DiscoveryTool) FetchPapers(ctx context.Context, onRetry func(attempt in
 //
 // start lets a caller page through older results (Feature C: "load more" via
 // session extension) without this tool knowing anything about sessions.
-func (t *DiscoveryTool) FetchPapersFrom(ctx context.Context, start int, onRetry func(attempt int)) ([]models.Paper, error) {
+func (t *DiscoveryTool) FetchPapersFrom(ctx context.Context, query arxivquery.Query, start int, onRetry func(attempt int)) ([]models.Paper, error) {
 	fetchStart := time.Now()
-	reqURL := t.buildQueryURL(start)
+	reqURL := t.buildQueryURL(query, start)
 
 	body, err := t.fetchWithRetry(ctx, reqURL, onRetry)
 	if err != nil {
@@ -126,12 +131,18 @@ func (t *DiscoveryTool) FetchPapersFrom(ctx context.Context, start int, onRetry 
 	return papers, nil
 }
 
-// buildQueryURL assembles the arXiv query at the given start offset. The
-// category comes from config, never user input (PRD §7), so there is no
-// injection surface.
-func (t *DiscoveryTool) buildQueryURL(start int) string {
+// buildQueryURL assembles the arXiv query for the given DiscoveryQuery at the
+// given start offset.
+//
+// Injection posture (this changed when category/terms became user-selectable):
+// the category is validated against the cs.* whitelist upstream (arxivquery.
+// IsValid, enforced by the trigger handler and config load), and the free-text
+// is neutralized by arxivquery.SanitizeTerms before it ever reaches here — so no
+// arXiv boolean operator or field prefix can be spliced in. query.SearchQuery()
+// returns the raw value; url.Values.Encode() then handles transport encoding.
+func (t *DiscoveryTool) buildQueryURL(query arxivquery.Query, start int) string {
 	q := url.Values{}
-	q.Set("search_query", "cat:"+t.cfg.ArxivCategory)
+	q.Set("search_query", query.SearchQuery())
 	q.Set("sortBy", "submittedDate")
 	q.Set("sortOrder", "descending")
 	q.Set("max_results", fmt.Sprintf("%d", t.cfg.FetchLimit))

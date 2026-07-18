@@ -13,7 +13,7 @@ func fmPaper() models.Paper {
 
 func TestBuildFrontmatterNilVerdict(t *testing.T) {
 	w, _ := newVaultWriter(t)
-	fm := parseFrontmatter(t, w.buildFrontmatter(fmPaper(), sampleExplainer(), nil)+"body")
+	fm := parseFrontmatter(t, w.buildFrontmatter(fmPaper(), sampleExplainer(), nil, "cs.AI")+"body")
 
 	if fm["review_iterations"] != 0 {
 		t.Fatalf("nil verdict → review_iterations should be 0, got %v", fm["review_iterations"])
@@ -29,7 +29,7 @@ func TestBuildFrontmatterNilVerdict(t *testing.T) {
 func TestBuildFrontmatterPassedVerdict(t *testing.T) {
 	w, _ := newVaultWriter(t)
 	v := &models.ReviewVerdict{PaperID: "2401.12345", Pass: true, Score: 0.87, Iteration: 2}
-	fm := parseFrontmatter(t, w.buildFrontmatter(fmPaper(), sampleExplainer(), v)+"body")
+	fm := parseFrontmatter(t, w.buildFrontmatter(fmPaper(), sampleExplainer(), v, "cs.AI")+"body")
 
 	if fm["review_iterations"] != 2 {
 		t.Fatalf("review_iterations = %v, want 2", fm["review_iterations"])
@@ -46,7 +46,7 @@ func TestBuildFrontmatterPassedVerdict(t *testing.T) {
 func TestBuildFrontmatterFailedVerdict(t *testing.T) {
 	w, _ := newVaultWriter(t)
 	v := &models.ReviewVerdict{PaperID: "2401.12345", Pass: false, Score: 0.74, Iteration: 2}
-	fm := parseFrontmatter(t, w.buildFrontmatter(fmPaper(), sampleExplainer(), v)+"body")
+	fm := parseFrontmatter(t, w.buildFrontmatter(fmPaper(), sampleExplainer(), v, "cs.AI")+"body")
 
 	if fm["review_passed"] != false {
 		t.Fatalf("failed verdict → review_passed should be false, got %v", fm["review_passed"])
