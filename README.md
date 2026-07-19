@@ -1,8 +1,11 @@
 # ArXiv AI Paper Explainer Agent
 
-Local dev foundation: a Next.js frontend (`:3000`) and a Go backend
-(`127.0.0.1:8080`) run together with one command. Phase 1 is scaffolding + config
-only — no product logic yet.
+A Next.js frontend (`:3000`) and a Go backend (`127.0.0.1:8080`) run together
+with one command. Pick a source + query, choose a paper, and the agent fetches
+its HTML, generates a reviewed explainer note, and writes it to your Obsidian
+vault — with a live run timeline and durable history. The discovery source is
+**declarative**: arXiv is a YAML file (`resources/arxiv.yaml`), and adding a new
+source is config, not code (see [`docs/adding-a-resource.md`](docs/adding-a-resource.md)).
 
 ## Prerequisites
 
@@ -179,11 +182,19 @@ to `$HOME` at load.
 |---|---|---|---|
 | `obsidian_vault` | string | `~/obsidian/arxiv-papers` | Vault root; notes land in `{vault}/AI Papers/` (override: `OBSIDIAN_VAULT_PATH`) |
 | `log_file` | string | `~/.arxiv-agent/processed.json` | Processed-paper dedup log (JSON) |
+| `resources_dir` | string | `./resources` | Declarative resource engine dir (`resources/*.yaml`); override: `RESOURCES_DIR` |
 
 ### `agent.*`
+
+> The discovery source is now **declarative**: arXiv lives in `resources/arxiv.yaml`
+> (+ `resources/catalogs/arxiv-cs.yaml`), which consumes the `agent.arxiv_*` values
+> below via `${...}` references — the env names are unchanged, so existing overrides
+> keep working. Adding a new source is a YAML file, not code — see
+> [`docs/adding-a-resource.md`](docs/adding-a-resource.md).
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `arxiv_category` | string | `cs.AI` | arXiv category queried |
+| `arxiv_category` | string | `cs.AI` | Default arXiv category (consumed by `resources/arxiv.yaml`) |
 | `arxiv_base_url` | string | `https://export.arxiv.org/api/query` | arXiv Atom API endpoint |
 | `fetch_limit` | int | `20` | Papers pulled from arXiv (buffer for dedup) |
 | `display_limit` | int | `5` | Candidates surfaced to the user |
