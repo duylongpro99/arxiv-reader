@@ -17,11 +17,11 @@ The two services communicate via HTTP. Both run locally on the user's machine.
 ### Pipeline Flow
 
 ```
-User Trigger
+User Trigger (picks resource + parameters)
     │
     ▼
-[DiscoveryTool] ──→ Fetch top 5 new cs.AI papers from arXiv
-    │
+[Declarative Resource Engine] ──→ Fetch candidates via resource's YAML declaration
+    │                              (transport → decode → normalize → ACL)
     ▼
 [LogCheckTool] ──→ Filter already-processed paper IDs
     │
@@ -29,15 +29,15 @@ User Trigger
 [Next.js UI] ◀──→ Present candidates → User selects one paper
     │
     ▼
-[PaperContentTool] ──→ Fetch arXiv HTML, convert to Markdown
+[Resource Content Converter] ──→ Fetch content (HTML/JSON/etc), convert to Markdown
     │         │
     │    [404 Not Found] ──→ Recoverable: return to selection, re-pick
     │
     ▼
-[ExplainerAgent] ──→ Read Markdown text + Generate rich explainer
+[ExplainerAgent] ──→ Read Markdown text + Generate rich explainer (UNCHANGED)
     │
     ▼
-[ReviewerAgent] ──→ Critique explainer against quality rubric
+[ReviewerAgent] ──→ Critique explainer against quality rubric (UNCHANGED)
     │         │
     │    [Pass] ──→ Proceed to save
     │         │
@@ -59,12 +59,12 @@ User Trigger
 │      Next.js App            │         │        Go ADK Backend            │
 │  (localhost:3000)           │◀──────▶│       (localhost:8080)           │
 │                             │  HTTP   │                                  │
-│  - Trigger UI               │         │  - ADK Agent Orchestrator        │
-│  - Paper selection UI       │         │  - DiscoveryTool                 │
-│  - Progress display         │         │  - LogCheckTool                  │
-│  - Explainer preview        │         │  - PaperContentTool (HTML→MD)    │
-│  - Run timeline UI          │         │  - ExplainerAgent                │
-│  - Runs history list        │         │  - ReviewerAgent                 │
+│  - Resource picker UI       │         │  - ADK Agent Orchestrator        │
+│  - Paper selection UI       │         │  - Resource Registry + Loader    │
+│  - Progress display         │         │  - Resource Engine (4-stage)     │
+│  - Explainer preview        │         │  - LogCheckTool                  │
+│  - Run timeline UI          │         │  - ExplainerAgent (UNCHANGED)    │
+│  - Runs history list        │         │  - ReviewerAgent (UNCHANGED)     │
 │                             │         │  - VaultWriterTool               │
 │                             │         │  - LLM Client (text-only)        │
 │                             │         │  - RunRecorder (Phase 7)         │
@@ -73,10 +73,10 @@ User Trigger
                                                         │
                                     ┌───────────────────┼───────────────────┬────────────┐
                                     │                   │                   │            │
-                             ┌──────▼─────┐    ┌───────▼──────┐   ┌───────▼──────┐  ┌──▼──────────┐
-                             │ arXiv API  │    │  LLM Provider │   │Obsidian Vault│  │ PostgreSQL  │
-                             │ (external) │    │  (configured) │   │ (local disk) │  │ (optional)  │
-                             └────────────┘    └──────────────┘   └──────────────┘  └─────────────┘
+                             ┌──────▼────────────┐    ┌───────▼──────┐   ┌───────▼──────┐  ┌──▼──────────┐
+                             │ Resource APIs      │    │  LLM Provider │   │Obsidian Vault│  │ PostgreSQL  │
+                             │(declared in YAML) │    │  (configured) │   │ (local disk) │  │ (optional)  │
+                             └────────────────────┘    └──────────────┘   └──────────────┘  └─────────────┘
 ```
 
 ---
@@ -133,32 +133,110 @@ GET  /health                      → sanity check endpoint
 
 ---
 
-### 3. DiscoveryTool (ADK Tool)
+### 3. Resource Registry & Declarative Resource Engine
 
-**Purpose:** Fetch the latest papers from arXiv `cs.AI` category.
+**Purpose:** Pluggable discovery abstraction. The source of papers is declared in YAML (e.g., `resources/arxiv.yaml`); the core depends only on the `Source` interface, never on concrete implementations. Discovery is resource-agnostic.
 
-**Responsibilities:**
-- Query arXiv API for most recent papers in `cs.AI`
-- Extract paper ID, title, authors, abstract, PDF URL
-- Return top N papers (N from config, default 5)
+**Architecture:**
 
-**Interface:**
-```go
-type Paper struct {
-    ID        string
-    Title     string
-    Authors   []string
-    Abstract  string
-    PDFURL    string
-    Category  string
-    Published time.Time
-}
+The engine is a four-stage pipeline **behind the anti-corruption layer (ACL):**
 
-func FetchPapers(ctx context.Context, limit int) ([]Paper, error)         // start=0, implicit
-func FetchPapersFrom(ctx context.Context, start int, limit int) ([]Paper, error) // Phase 8: offset pagination
+```
+RAW BYTES (HTTP response)
+    ↓
+① Transport    (HTTP + retry + limits, per FetchSpec in YAML)
+    ↓
+② Decoder      (per-format; v1: atom-xml for Atom feeds, extensible to JSON etc.)
+    ↓
+═══════════════ Normalization Layer (ACL) ═══════════════
+    ↓
+③ Normalize    (path lookups + transforms/derivers → canonical Paper struct)
+④ ACL Gate     (validate fields, run sanitizers, drop invalid items)
+    ↓
+Orchestrator + Agent Pipeline (UNCHANGED, resource-agnostic)
 ```
 
-**Dependencies:** arXiv API (external HTTP)
+**Key Interfaces:**
+
+```go
+type Source interface {
+    Discover(ctx context.Context, values map[string]string) ([]Paper, error)
+    FetchDiscoverMore(ctx context.Context, values map[string]string) ([]Paper, error)
+    FetchContent(ctx context.Context, paper Paper) ([]byte, error)
+    Descriptor() Descriptor
+    ValidateValues(raw map[string]string) (map[string]string, error)
+}
+
+type Descriptor struct {
+    ID          string       // e.g. "arxiv"
+    Label       string       // Human-friendly name
+    Description string       // What this resource provides
+    Fields      []Field      // Request form fields (select / text)
+}
+
+type Field struct {
+    Name    string
+    Type    FieldType // FieldSelect or FieldText
+    Label   string
+    Options []FieldOption // For FieldSelect
+}
+```
+
+**Capability Registries** (in `internal/resource/`):
+- `RegisterDecoder(format, Decoder)` — response format handlers (atom-xml, etc.)
+- `RegisterTransform(name, transformer)` — string transforms (trim, normalize, etc.)
+- `RegisterDeriver(name, deriver)` — node-aware field derivers (arxiv-id, arxiv-pdf-url)
+- `RegisterSanitizer(name, sanitizer)` — free-text validators (arxiv-terms, etc.)
+- `RegisterConverter(name, converter)` — content format converters (html-to-markdown, etc.)
+
+**YAML Declaration** (e.g., `resources/arxiv.yaml`):
+
+The resource declares:
+- How to fetch candidates (`request.fields`, `fetch.url`, `fetch.query`, `fetch.paginate`, `fetch.retry`)
+- How to decode the response (`response.format`, `response.items`, `response.fields` with `path`/`@attr`/`multi`/`derive`)
+- How to validate and extract required fields (`response.require`, `response.fields.sanitize`)
+- How to fetch and convert content (`content.fetch`, `content.convert`, `content.not_found`)
+
+Example snippet (arXiv):
+```yaml
+id: arxiv
+label: arXiv
+description: Computer Science papers from arXiv.org
+request:
+  fields:
+    - name: category
+      type: select
+      options:
+        catalog: arxiv-cs
+    - name: terms
+      type: text
+fetch:
+  url: https://export.arxiv.org/api/query
+  query:
+    - key: search_query
+      value: cat:{{category}}{{ " AND all:" }}{{terms}}
+  paginate:
+    kind: offset
+    param: start
+    page_size: 20
+response:
+  format: atom-xml
+  items: entry
+  fields:
+    id:
+      path: id
+      transforms: [arxiv-id]
+    title:
+      path: title
+    authors:
+      path: author
+      multi: true
+      derive: name
+    abstract:
+      path: summary
+```
+
+**Dependencies:** Source implementations (currently `DeclarativeSource` + YAML loader), external resource APIs (arXiv, etc.)
 
 ---
 
@@ -180,38 +258,46 @@ func MarkAsProcessed(paperID string) error
 
 ---
 
-### 5. PaperContentTool
+### 5. Resource Content Conversion
 
-**Purpose:** Fetch paper content from arXiv's LaTeXML HTML rendering and convert it to clean Markdown text.
+**Purpose:** Fetch paper content (via resource-declared URL pattern) and convert to Markdown. Content converter is pluggable; arXiv uses HTML-to-Markdown, but other formats (JSON, PDF, etc.) can register their own converters.
 
 **Responsibilities:**
-- Query `https://arxiv.org/html/{arxiv_id}` (follows same-host redirect to versioned URL automatically)
-- Fetch HTML under a 50MB size limit (`io.LimitReader`)
-- Convert LaTeXML HTML to Markdown using pure-Go `html-to-markdown/v2` (no external dependencies, no CGO)
-- Extract the main `ltx_document` body
-- Strip math formulas, navigation elements, bibliography, and appendix sections (keep headings and figure captions)
-- Return clean Markdown text
+- Use the `Source.FetchContent()` method (which applies the `content` section of the YAML declaration)
+- Transport layer: HTTP fetch with same-host/scheme validation, redirects capped at 3, size limits enforced
+- Decoder layer: parse response format (v1: HTML via `html-to-markdown/v2`)
+- Converter: apply the registered converter (e.g., `html-to-markdown` for arXiv)
+- Return clean Markdown text, ready for ExplainerAgent
 
 **Why Markdown over PDF-as-image:** Pure text extraction avoids the complexity and token cost of vision APIs while preserving the essential content — paper structure, reasoning, and key figures/captions. The Markdown approach is compatible with any text-capable LLM model, maximizing provider flexibility.
 
-**Error Handling:**
-- 404 Not Found → `ErrPaperHTMLNotFound` — treated as recoverable re-pick (return to selection)
-- Transient failures (429, 5xx, network) → retry with exponential backoff (max 3 retries, same schedule as DiscoveryTool)
+**Error Handling (per YAML `content.not_found` policy):**
+- 404 Not Found + `not_found: repick` → recoverable re-pick (return to selection)
+- Transient failures (429, 5xx, network, timeout) → retry per `fetch.retry` policy in YAML
 - Permanent failures (other 4xx, parse errors) → surface as non-recoverable error
 
-**Interface:**
+**HTML-to-Markdown Conversion** (arXiv example):
+- Fetch `https://arxiv.org/html/{arxiv_id}` (follows same-host redirect to versioned URL automatically)
+- Fetch HTML under a 50MB size limit
+- Convert LaTeXML HTML to Markdown using pure-Go `html-to-markdown/v2` (no external dependencies, no CGO)
+- Extract the main document body
+- Strip math formulas, navigation elements, bibliography, and appendix sections (keep headings and figure captions)
+- Return clean Markdown text
+
+**Converter Registration** (in `internal/resource/convert_html.go`):
 ```go
-func (t *PaperContentTool) FetchMarkdown(ctx context.Context, arxivID string) (string, error)
-// Returns clean Markdown text ready for ExplainerAgent
+RegisterConverter("html-to-markdown", func(b []byte) (string, error) {
+    // Convert HTML to Markdown; used by content.convert: html-to-markdown in YAML
+})
 ```
 
-**Dependencies:** `html-to-markdown/v2` (pure Go), `net/http`, `io`
+**Dependencies:** Registered converters, `html-to-markdown/v2` (pure Go, for arXiv), transport layer
 
 ---
 
-### 6. ExplainerAgent (ADK LlmAgent)
+### 6. ExplainerAgent (ADK LlmAgent) — UNCHANGED
 
-**Purpose:** Core intelligence — read the paper's Markdown content and generate the rich, well-structured explainer.
+**Purpose:** Core intelligence — read the paper's Markdown content and generate the rich, well-structured explainer. Resource-agnostic: receives any source's Markdown.
 
 **Responsibilities:**
 - Receive paper Markdown text + metadata + structured prompt
@@ -245,9 +331,9 @@ func Generate(ctx context.Context, input ExplainerInput) (ExplainerOutput, error
 
 ---
 
-### 7. ReviewerAgent (ADK LlmAgent)
+### 7. ReviewerAgent (ADK LlmAgent) — UNCHANGED
 
-**Purpose:** Independent critic — evaluates explainer quality and drives the revision loop.
+**Purpose:** Independent critic — evaluates explainer quality and drives the revision loop. Resource-agnostic: evaluates any source's explainer.
 
 **Responsibilities:**
 - Evaluate **explainer text only** (paper Markdown NOT sent — cost optimization per design T3)
@@ -894,45 +980,87 @@ llm:
 
 ## 6. Integration Points
 
-### 1. arXiv API
+### 1. Resource Declarations (YAML)
 
-**Base URL:** `https://export.arxiv.org/api/query`
-**Auth:** None
+Resources are declared in `resources/*.yaml` files (e.g., `resources/arxiv.yaml`). Each declaration specifies:
 
+**Fetch & Discovery:**
+- `request.fields` — form inputs (select with catalog, or text with sanitizer)
+- `fetch` section:
+  - `url` — base endpoint (with `${...}` config interpolation, `{{...}}` runtime interpolation)
+  - `query` — structured query builder (can conditionally drop parts based on field presence)
+  - `paginate` — offset/page-based pagination config
+  - `retry` — max retries + error types to retry on (429, 5xx, network, timeout)
+  - `timeout_seconds`, `max_bytes` — resource-level limits
+- `response` section:
+  - `format` — decoder type (atom-xml, json, etc.)
+  - `items` — path to repeated element in response
+  - `fields` — mapping of canonical Paper fields (id, title, authors, etc.) from response paths, attributes, multi-value fields, or derivers
+  - `require` — fields that must be present (items lacking required fields are skipped)
+
+**Content Fetch:**
+- `content.fetch` — separate HTTP request for one item's content
+- `content.convert` — converter name (html-to-markdown, etc.)
+- `content.not_found` — error handling (repick, error, etc.)
+
+**Security & Interpolation:**
+- `${VAR}` — trusted config/env values, resolved at YAML load, YAML-escaped
+- `{{name}}` — untrusted runtime values (category, terms, start, paper.id), schema-validated + sanitized + URL-encoded
+
+**Example (arXiv):**
+```yaml
+id: arxiv
+label: arXiv
+request:
+  fields:
+    - name: category
+      type: select
+      options:
+        catalog: arxiv-cs
+fetch:
+  url: https://export.arxiv.org/api/query
+  query:
+    - key: search_query
+      value: cat:{{category}}
+  paginate:
+    kind: offset
+    param: start
+    page_size: 20
+  retry:
+    max_retries: 3
+    on: [429, 503, network]
+response:
+  format: atom-xml
+  items: entry
+  fields:
+    id:
+      path: id
+      transforms: [arxiv-id]
+    title:
+      path: title
+content:
+  fetch:
+    url: https://arxiv.org/html/{{paper.id}}
+  convert: html-to-markdown
+  not_found: repick
 ```
-GET https://export.arxiv.org/api/query
-  ?search_query=cat:cs.AI
-  &sortBy=submittedDate
-  &sortOrder=descending
-  &max_results=20
-  &start=0
-```
-
-**Response:** Atom/XML, parsed via `encoding/xml`
-
-**Constraints:**
-- Single connection at a time
-- Minimum 3-second delay between requests
-- Retry with exponential backoff on 429 (max 3 retries)
-- Descriptive `User-Agent` header required
 
 ---
 
-### 2. arXiv HTML Rendering
+### 2. Resource APIs (Runtime)
 
-**URL pattern:** `https://arxiv.org/html/{arxiv_id}`
-**Auth:** None
+At runtime, resources execute the YAML declaration via the four-stage engine:
 
-- Direct `GET` to HTML rendering endpoint
-- Follows same-host redirect (arXiv redirects to versioned URL automatically)
-- Timeout: configurable (`config.Agent.RequestTimeoutSec`, default 30s)
-- Size limit: 50MB (`io.LimitReader`) for safety
-- Retry on transient failures (429, 503, network) per `config.Agent.MaxRetries`
-- **404 Not Found** → treated as recoverable (return to selection, allow re-pick)
+1. **Transport** — HTTP GET/POST with retry policy, redirect cap (3), timeout, size limit
+2. **Decoder** — parse response format (atom-xml → XML nodes, json → JSON objects)
+3. **Normalize** — extract fields via dotted paths (`entry.title`), handle multi-value (`author` → list), apply transforms, derive computed fields
+4. **ACL** — validate against schema (e.g., category whitelist, text sanitization), drop invalid items
+
+All external API constraints (rate limits, auth headers, timeouts) are declared in the YAML, not hardcoded.
 
 ---
 
-### 3. LLM Provider APIs (Text-Only)
+### 3. LLM Provider APIs (Text-Only, UNCHANGED)
 
 All providers receive paper content as **text only** (Markdown). No images, no vision APIs.
 
@@ -991,18 +1119,22 @@ Content: DocumentText as inline text part
 **Communication:** HTTP on localhost only. CORS restricted to `localhost:3000`.
 
 ```
-POST   localhost:8080/discover                 → { session_id, candidates: [Paper] }
-POST   localhost:8080/discover/:sessionId/more → { candidates: [Paper] } (Phase 8: offset pagination)
-POST   localhost:8080/process                  → { session_id } (async processing begins)
-GET    localhost:8080/status/:id               → { stage, iteration, error }
-GET    localhost:8080/result/:id               → { content, vault_file_path }
-GET    localhost:8080/runs/:id/content         → { available: bool, content?: string } (Phase 8)
-GET    localhost:8080/health                   → { status: "ok" }
+GET    localhost:8080/resources                 → { descriptors: [Descriptor] } (resource picker schema)
+POST   localhost:8080/discover                  → { session_id, candidates: [Paper] }
+                                                  Body: { resourceId: "arxiv", values: {category, terms} }
+                                                  Empty body → defaults to config default resource
+POST   localhost:8080/discover/:sessionId/more  → { candidates: [Paper] } (offset pagination)
+POST   localhost:8080/process                   → { session_id } (async processing begins)
+GET    localhost:8080/status/:id                → { stage, iteration, error }
+GET    localhost:8080/result/:id                → { content, vault_file_path }
+GET    localhost:8080/runs/:id/content          → { available: bool, content?: string }
+GET    localhost:8080/health                    → { status: "ok" }
 ```
 
-**Phase 8 Endpoints:**
-- `POST /discover/:sessionId/more` — appends additional arXiv candidates to existing session during StageSelection; returns 409 if not in selection stage
-- `GET /runs/:id/content` — fetches persisted Obsidian note markdown from disk; returns {available: false} gracefully if file missing (vault write failed or file deleted)
+**Backward Compatibility:**
+- `POST /discover` with empty body → uses config-specified default resource and default values (Phase 9 backward compat for legacy `POST /discover` with `{category, terms}` body)
+- `GET /resources` returns descriptors for all registered resources; UI builds a resource picker
+- Each resource's `values` map gets whitelist-validated against the resource's `Schema` (e.g., category against `arxiv-cs` catalog, terms through `arxiv-terms` sanitizer)
 
 ---
 

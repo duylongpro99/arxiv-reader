@@ -15,6 +15,7 @@ llm:
 paths:
   obsidian_vault: ~/obsidian/cris/arxiv    # ~ expanded to $HOME at load (override: OBSIDIAN_VAULT_PATH)
   log_file: ~/.arxiv-agent/processed.json    # ~ expanded to $HOME at load; JSON content, .json extension
+  resources_dir: ./resources               # declarative resource engine: resources/*.yaml (override: RESOURCES_DIR)
 
 # Phase 2 discovery pipeline. arXiv params live here so tuning stays out of code
 # and tests can point arxiv_base_url at a local httptest server.

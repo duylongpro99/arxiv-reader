@@ -57,18 +57,26 @@ export interface TriggerResponse {
   session_id: string;
 }
 
-// One arXiv cs.* category for the discovery picker. Shape mirrors the Go
-// arxivquery.Category DTO ({code, label} json tags).
-export interface Category {
-  code: string;
+// ResourceField describes one dynamic request input. Mirrors the Go
+// resource.Field json tags exactly (name/type/label/required/default/options).
+// The engine is self-describing: the form is built from these, not hardcoded.
+export interface ResourceField {
+  name: string;
+  type: "select" | "text";
   label: string;
+  required: boolean;
+  default?: string; // omitempty on the backend
+  options?: { value: string; label: string }[]; // present for select fields
 }
 
-// GET /categories payload: the catalog plus the backend's configured default,
-// so the picker seeds from the same default the empty-body discovery path uses.
-export interface CategoriesResponse {
-  default: string;
-  categories: Category[];
+// ResourceDescriptor is one resource served by GET /resources (Go
+// resource.Descriptor json tags): its identity plus the field schema the UI
+// renders. Adding a resource is a backend YAML file — zero frontend changes.
+export interface ResourceDescriptor {
+  id: string;
+  label: string;
+  description: string;
+  fields: ResourceField[];
 }
 
 // Selecting a paper returns the same session id (the panel keeps polling it).

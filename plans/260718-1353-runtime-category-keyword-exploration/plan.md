@@ -1,6 +1,7 @@
 ---
 title: Runtime Category + Keyword Exploration for arXiv Discovery
-status: completed
+status: superseded
+supersededBy: plans/260718-1600-declarative-resource-engine
 created: 2026-07-18
 completed: 2026-07-18
 blockedBy: []

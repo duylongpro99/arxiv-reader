@@ -3,34 +3,48 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import {
+  fetchResources,
   fetchResult,
   fetchStatus,
   retryPipeline,
   selectPaper,
   triggerDiscovery,
 } from "@/lib/api";
+import type { ResourceDescriptor } from "@/lib/types";
 import { useEventSource } from "@/lib/use-event-source";
 import { CandidateList } from "./candidate-list";
-import { CategoryPicker } from "./category-picker";
 import { ContextWarningBanner } from "./context-warning";
+import { DynamicRequestForm } from "./dynamic-request-form";
 import { ErrorBanner } from "./error-banner";
 import { ProgressIndicator } from "./progress-indicator";
+import { ResourcePicker } from "./resource-picker";
 import { ResultPanel } from "./result-panel";
 import { RunTimeline } from "./run-timeline";
 import { TriggerButton } from "./trigger-button";
+
+// defaultsFor seeds a values map from a resource's field defaults (empty string
+// when a field has no default), so the form starts on the backend-declared state.
+function defaultsFor(r: ResourceDescriptor): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const f of r.fields) {
+    out[f.name] = f.default ?? "";
+  }
+  return out;
+}
 
 // DiscoveryPanel owns the discovery + selection flow: trigger -> poll -> pick ->
 // extract. It holds the current session id and the chosen paper id; all pipeline
 // state comes from the polled status.
 export function DiscoveryPanel() {
   const [sessionId, setSessionId] = useState<string | null>(null);
-  // The category + optional keywords driving the next discovery run. Category
-  // starts empty and is seeded by CategoryPicker from the backend's configured
-  // default (so the UI never diverges from the backend default); the user then
-  // swaps it. Kept here so `start()` reads the current selection directly. An
-  // empty category sent to the backend safely resolves to that same default.
-  const [category, setCategory] = useState("");
-  const [terms, setTerms] = useState("");
+  // The selected resource + its validated field values driving the next run. Both
+  // are seeded from the backend descriptor (id = first resource, values = field
+  // defaults) so the UI never diverges from the backend's declared defaults; the
+  // user then edits them. Kept here so `start()` reads the current selection.
+  const [resourceId, setResourceId] = useState("");
+  const [values, setValues] = useState<Record<string, string>>({});
+  // Guards the one-time seed below so setting state during render can't loop.
+  const [seeded, setSeeded] = useState(false);
   // The paper the user picked (null = none yet / re-pick reset).
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // Whether we have ever committed a selection — gates the re-pick detector so
@@ -38,8 +52,42 @@ export function DiscoveryPanel() {
   const hasSelected = useRef(false);
   const queryClient = useQueryClient();
 
+  // Load the resource catalog once; it rarely changes within a session.
+  const { data: resources } = useQuery({
+    queryKey: ["resources"],
+    queryFn: fetchResources,
+    staleTime: Infinity,
+  });
+
+  // Seed the first resource + its default values once the catalog loads. This is
+  // the React-sanctioned "initialize state from async data" pattern: set state
+  // DURING render behind a one-shot guard (not in an effect), so there is no
+  // extra commit/flash and no cascading-render lint violation.
+  if (!seeded && resources && resources.length > 0) {
+    setSeeded(true);
+    setResourceId(resources[0].id);
+    setValues(defaultsFor(resources[0]));
+  }
+
+  const current = resources?.find((r) => r.id === resourceId);
+
+  // Switching resources resets the form to the new resource's defaults AND clears
+  // any in-flight session, so a stale session from the previous resource can't
+  // render candidates against the new form.
+  const onResourceChange = (id: string) => {
+    const next = resources?.find((r) => r.id === id);
+    setResourceId(id);
+    setValues(next ? defaultsFor(next) : {});
+    setSessionId(null);
+    setSelectedId(null);
+    hasSelected.current = false;
+  };
+
+  const onFieldChange = (name: string, value: string) =>
+    setValues((v) => ({ ...v, [name]: value }));
+
   const trigger = useMutation({
-    mutationFn: () => triggerDiscovery(category, terms),
+    mutationFn: () => triggerDiscovery(resourceId, values),
     onSuccess: ({ session_id }) => {
       setSessionId(session_id);
       setSelectedId(null);
@@ -130,13 +178,20 @@ export function DiscoveryPanel() {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-4">
-        <CategoryPicker
-          category={category}
-          terms={terms}
-          onCategoryChange={setCategory}
-          onTermsChange={setTerms}
+        <ResourcePicker
+          resources={resources ?? []}
+          resourceId={resourceId}
+          onChange={onResourceChange}
           disabled={isLoading}
         />
+        {current && (
+          <DynamicRequestForm
+            fields={current.fields}
+            values={values}
+            onChange={onFieldChange}
+            disabled={isLoading}
+          />
+        )}
         <TriggerButton onClick={start} loading={isLoading} />
       </div>
 

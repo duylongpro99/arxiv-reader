@@ -15,4 +15,9 @@ type Paper struct {
 	Abstract  string   `json:"abstract"`
 	PDFURL    string   `json:"pdfUrl"`
 	Published string   `json:"published"` // ISO-8601 date string as returned by arXiv
+	// Source is the resource id this paper came from (e.g. "arxiv"). Set by the
+	// resource engine's normalizer; NOT persisted (the store maps only
+	// paper_id/title) so it needs no DB migration. omitempty keeps pre-engine
+	// JSON output byte-identical when unset.
+	Source string `json:"source,omitempty"`
 }

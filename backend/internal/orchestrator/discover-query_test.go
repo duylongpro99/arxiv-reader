@@ -2,19 +2,20 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 )
 
-// cfgWithCategory builds a config whose default category is set, so the
-// empty-body path has a valid default to fall back to.
+// cfgWithCategory builds a config whose default category is set (used by the
+// temporary /categories alias, which still reads cfg.Agent.ArxivCategory).
 func cfgWithCategory(cat string) *config.Config {
 	return &config.Config{Agent: config.AgentConfig{DisplayLimit: 5, FetchLimit: 5, ArxivCategory: cat}}
 }
@@ -33,98 +34,126 @@ func postDiscover(o *Orchestrator, body string) (*httptest.ResponseRecorder, str
 	return rec, resp.SessionID
 }
 
-func sessionQuery(t *testing.T, o *Orchestrator, id string) arxivquery.Query {
+func sessionValues(t *testing.T, o *Orchestrator, id string) map[string]string {
 	t.Helper()
 	v, ok := o.sessions.Load(id)
 	if !ok {
 		t.Fatalf("session %q not stored", id)
 	}
-	return v.(*models.PipelineSession).Query()
+	return v.(*models.PipelineSession).Values()
 }
 
-// A chosen category + keywords must be stored on the session (so both the run
-// and pagination use them), with the free-text sanitized on the way in.
-func TestHandleDiscoverStoresValidatedQuery(t *testing.T) {
-	o := newOrch(cfgWithCategory("cs.AI"), &fakeFetcher{}, passthrough())
-	rec, id := postDiscover(o, `{"category":"cs.LG","terms":"speech OR recognition"}`)
+// The engine-validated values must be stored on the session (so both the run and
+// pagination use them). The handler delegates whitelist/sanitize to the source's
+// ValidateValues; here we assert the wiring stores what ValidateValues returned.
+func TestHandleDiscoverStoresValidatedValues(t *testing.T) {
+	src := &fakeSource{validated: map[string]string{"category": "cs.LG", "terms": "speech recognition"}}
+	o := newOrch(cfgWithCategory("cs.AI"), src, passthrough())
+	rec, id := postDiscover(o, `{"resourceId":"arxiv","values":{"category":"cs.LG","terms":"speech OR recognition"}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	q := sessionQuery(t, o, id)
-	if q.Category != "cs.LG" {
-		t.Errorf("category = %q, want cs.LG", q.Category)
-	}
-	// "OR" is an arXiv boolean operator and must be stripped by SanitizeTerms.
-	if q.Terms != "speech recognition" {
-		t.Errorf("terms = %q, want sanitized \"speech recognition\"", q.Terms)
+	vals := sessionValues(t, o, id)
+	if vals["category"] != "cs.LG" || vals["terms"] != "speech recognition" {
+		t.Errorf("session values = %+v, want validated map", vals)
 	}
 }
 
-// An empty body is the backward-compatible path: fall back to the config
-// default category with no free-text.
-func TestHandleDiscoverEmptyBodyUsesDefault(t *testing.T) {
-	o := newOrch(cfgWithCategory("cs.CV"), &fakeFetcher{}, passthrough())
+// An empty body defaults to the arxiv resource with empty (default-filled) values.
+func TestHandleDiscoverEmptyBodyDefaults(t *testing.T) {
+	src := &fakeSource{}
+	o := newOrch(cfgWithCategory("cs.CV"), src, passthrough())
 	rec, id := postDiscover(o, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	if q := sessionQuery(t, o, id); q.Category != "cs.CV" || q.Terms != "" {
-		t.Errorf("query = %+v, want {cs.CV }", q)
+	if id == "" {
+		t.Fatal("expected a session id")
 	}
 }
 
-// An explicitly-supplied unknown category is a client error → 400, and no
-// session is created.
-func TestHandleDiscoverUnknownCategoryIs400(t *testing.T) {
-	o := newOrch(cfgWithCategory("cs.AI"), &fakeFetcher{}, passthrough())
-	rec, _ := postDiscover(o, `{"category":"cs.NOPE"}`)
+// F17: the exact legacy {category, terms} body (no resourceId/values) must fold
+// into values and reach ValidateValues — existing clients keep working.
+func TestHandleDiscoverLegacyBodyFolded(t *testing.T) {
+	src := &fakeSource{}
+	o := newOrch(cfgWithCategory("cs.AI"), src, passthrough())
+	rec, _ := postDiscover(o, `{"category":"cs.LG","terms":"transformer"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy body want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if src.lastValidateIn["category"] != "cs.LG" || src.lastValidateIn["terms"] != "transformer" {
+		t.Errorf("legacy values not folded before validation: %+v", src.lastValidateIn)
+	}
+}
+
+// F17: a legacy field with the wrong JSON type is a 400 (not a silent drop).
+func TestHandleDiscoverLegacyWrongTypeIs400(t *testing.T) {
+	o := newOrch(cfgWithCategory("cs.AI"), &fakeSource{}, passthrough())
+	rec, _ := postDiscover(o, `{"category":123}`)
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("want 400 for unknown category, got %d", rec.Code)
+		t.Fatalf("want 400 for wrong-typed legacy field, got %d", rec.Code)
 	}
 }
 
-// A malformed (non-empty, non-JSON) body is a client error → 400, not a silent
-// downgrade to a default run.
+// An unknown resourceId is a client error → 400, no session created.
+func TestHandleDiscoverUnknownResourceIs400(t *testing.T) {
+	o := newOrch(cfgWithCategory("cs.AI"), &fakeSource{}, passthrough())
+	rec, _ := postDiscover(o, `{"resourceId":"nope"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for unknown resource, got %d", rec.Code)
+	}
+}
+
+// A value rejected by the resource's schema (e.g. off-catalog category) → 400.
+func TestHandleDiscoverValidationErrorIs400(t *testing.T) {
+	src := &fakeSource{validateErr: errors.New("invalid value for \"category\"")}
+	o := newOrch(cfgWithCategory("cs.AI"), src, passthrough())
+	rec, _ := postDiscover(o, `{"resourceId":"arxiv","values":{"category":"cs.NOPE"}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for schema violation, got %d", rec.Code)
+	}
+}
+
+// A malformed (non-empty, non-JSON) body → 400.
 func TestHandleDiscoverMalformedBodyIs400(t *testing.T) {
-	o := newOrch(cfgWithCategory("cs.AI"), &fakeFetcher{}, passthrough())
-	rec, _ := postDiscover(o, `{"category": broken`)
+	o := newOrch(cfgWithCategory("cs.AI"), &fakeSource{}, passthrough())
+	rec, _ := postDiscover(o, `{"resourceId": broken`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400 for malformed body, got %d", rec.Code)
 	}
 }
 
-// GET /categories returns the compiled-in cs.* catalog plus the configured
-// default, so the UI can seed its picker from the same default the backend uses.
-func TestHandleCategoriesReturnsCatalogAndDefault(t *testing.T) {
-	o := newOrch(cfgWithCategory("cs.LG"), &fakeFetcher{}, passthrough())
+// GET /resources returns the registry's descriptors for the UI.
+func TestHandleResourcesReturnsDescriptors(t *testing.T) {
+	src := &fakeSource{descriptor: resource.Descriptor{
+		ID: "arxiv", Label: "arXiv",
+		Fields: []resource.Field{
+			{Name: "category", Type: resource.FieldSelect},
+			{Name: "terms", Type: resource.FieldText},
+		},
+	}}
+	o := newOrch(cfgWithCategory("cs.AI"), src, passthrough())
 	rec := httptest.NewRecorder()
-	o.HandleCategories(rec, httptest.NewRequest(http.MethodGet, "/categories", nil))
+	o.HandleResources(rec, httptest.NewRequest(http.MethodGet, "/resources", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	var resp struct {
-		Default    string                `json:"default"`
-		Categories []arxivquery.Category `json:"categories"`
+	var got []resource.Descriptor
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode resources: %v", err)
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode categories: %v", err)
-	}
-	if resp.Default != "cs.LG" {
-		t.Errorf("default = %q, want cs.LG (the configured default)", resp.Default)
-	}
-	if len(resp.Categories) != len(arxivquery.Categories) || resp.Categories[0].Code == "" {
-		t.Fatalf("unexpected categories payload: %d entries", len(resp.Categories))
+	if len(got) != 1 || got[0].ID != "arxiv" || len(got[0].Fields) != 2 {
+		t.Fatalf("unexpected resources payload: %+v", got)
 	}
 }
 
-// The category a run was discovered under must reach the vault write, so the
-// exported note's frontmatter records the real category — not the config
-// default (regression guard: category became runtime-selectable).
+// F8: the category a run was discovered under must reach the vault write, sourced
+// from the session's values (not the config default).
 func TestProcessPassesSessionCategoryToVault(t *testing.T) {
 	fv := &fakeVault{path: "/vault/AI Papers/note.md"}
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) { o.vault = fv })
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) { o.vault = fv })
 
-	s := models.NewSession("sess-cat", time.Now(), arxivquery.Query{Category: "cs.CR"})
+	s := models.NewSession("sess-cat", time.Now(), "arxiv", map[string]string{"category": "cs.CR"})
 	s.Complete(makePapers(3), "")
 	o.sessions.Store(s.SessionID, s)
 
@@ -136,20 +165,19 @@ func TestProcessPassesSessionCategoryToVault(t *testing.T) {
 	}
 }
 
-// "Load more" must fetch within the SAME category the session was created with,
-// never the config default — otherwise pagination would drift categories.
-func TestDiscoverMoreUsesSessionQuery(t *testing.T) {
-	pf := &fakePageFetcher{page: makePapers(5)}
+// "Load more" must fetch within the SAME values the session was created with.
+func TestDiscoverMoreUsesSessionValues(t *testing.T) {
+	pf := &fakePageSource{page: makePapers(5)}
 	o := moreOrch(pf)
-	s := models.NewSession("sess-q", time.Now(), arxivquery.Query{Category: "cs.CV", Terms: "detection"})
-	s.Complete(makePapers(5), "") // move to selection stage so /more is allowed
+	s := models.NewSession("sess-q", time.Now(), "arxiv", map[string]string{"category": "cs.CV", "terms": "detection"})
+	s.Complete(makePapers(5), "")
 	o.sessions.Store(s.SessionID, s)
 
 	rec := discoverMore(o, s.SessionID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rec.Code)
 	}
-	if pf.lastQry.Category != "cs.CV" || pf.lastQry.Terms != "detection" {
-		t.Errorf("pagination query = %+v, want {cs.CV detection}", pf.lastQry)
+	if pf.lastValues["category"] != "cs.CV" || pf.lastValues["terms"] != "detection" {
+		t.Errorf("pagination values = %+v, want {cs.CV detection}", pf.lastValues)
 	}
 }

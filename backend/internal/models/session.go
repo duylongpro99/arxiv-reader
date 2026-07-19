@@ -1,10 +1,9 @@
 package models
 
 import (
+	"maps"
 	"sync"
 	"time"
-
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 )
 
 // PipelineStage is the coarse-grained stage the frontend polls for. Only the
@@ -34,12 +33,14 @@ const (
 type PipelineSession struct {
 	mu          sync.RWMutex
 	SessionID   string // immutable after newSession; safe to read but kept private-access for consistency
-	// query is the (validated) category + (sanitized) free-text driving this
-	// run's arXiv fetches. Immutable after NewSession, but read by the discovery
-	// goroutine AND the /discover/{id}/more handler, so it lives under mu like
-	// every other field. Both the initial run and pagination read Query() so a
-	// "load more" stays within the same category+terms the user chose.
-	query       arxivquery.Query
+	// resourceID + values are the resource-agnostic drivers of this run's fetches
+	// (which resource, and the validated field values). They replace the old
+	// arXiv-specific query value. Immutable after NewSession, but read by the
+	// discovery goroutine AND the /discover/{id}/more handler, so they live under mu like
+	// every other field. Both the initial run and pagination read them so a
+	// "load more" stays within the same resource + values the user chose.
+	resourceID  string
+	values      map[string]string
 	stage       PipelineStage
 	candidates  []Paper
 	notice      string
@@ -114,25 +115,33 @@ type SessionSnapshot struct {
 	ContextWarning  *ContextWarning
 }
 
-// NewSession creates a session in the discovery stage. id must be unique. query
-// is fixed for the session's lifetime and drives every arXiv fetch (initial run
-// and pagination alike).
-func NewSession(id string, startedAt time.Time, query arxivquery.Query) *PipelineSession {
+// NewSession creates a session in the discovery stage. id must be unique.
+// resourceID + values are fixed for the session's lifetime and drive every fetch
+// (initial run and pagination alike). values is copied defensively.
+func NewSession(id string, startedAt time.Time, resourceID string, values map[string]string) *PipelineSession {
 	return &PipelineSession{
-		SessionID: id,
-		query:     query,
-		stage:     StageDiscovery,
-		startedAt: startedAt,
+		SessionID:  id,
+		resourceID: resourceID,
+		values:     maps.Clone(values),
+		stage:      StageDiscovery,
+		startedAt:  startedAt,
 	}
 }
 
-// Query returns a copy of the session's discovery query. Safe to call from any
-// goroutine; the value is immutable after construction but read under RLock to
-// satisfy the race detector (mu guards every field uniformly).
-func (s *PipelineSession) Query() arxivquery.Query {
+// ResourceID returns the session's resource id. Immutable after construction but
+// read under RLock (mu guards every field uniformly for the race detector).
+func (s *PipelineSession) ResourceID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.query
+	return s.resourceID
+}
+
+// Values returns a copy of the session's validated field values, safe to read
+// from any goroutine.
+func (s *PipelineSession) Values() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return maps.Clone(s.values)
 }
 
 // Snapshot returns a lock-free copy of the current observable state. Candidates

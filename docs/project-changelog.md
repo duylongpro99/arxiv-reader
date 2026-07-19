@@ -7,35 +7,91 @@ All notable changes to this project are documented below, organized by release a
 
 ## [Phase 9] — 2026-07-18
 
-Runtime category + keyword exploration. Discovery is no longer locked to a single hardcoded `cs.AI` category: the user picks any cs.* subcategory at runtime and optionally adds keywords, driving the arXiv query for both the initial run and "load more". The category constant moved from global config to per-session state.
+Declarative Resource Engine: Pluggable discovery abstraction. The entire paper discovery pipeline is no longer hardcoded to arXiv but driven by YAML declarations in `resources/*.yaml`. The core (orchestrator + agent pipeline) depends only on the `Source` interface + the resource registry, never on concrete implementations. Discovery is now resource-agnostic and extensible: adding a second source is pure YAML + optional catalog (no Go code changes required).
 
 ### Added
 
 #### Backend
-- **`internal/arxivquery` leaf package** — dependency-free, so config/tools/orchestrator all import it without a cycle
-  - `Categories` — the full cs.* taxonomy (`{code, label}`), doubling as the validation whitelist and the UI dropdown source
-  - `IsValid(code)` — O(1) whitelist gate for user-supplied categories
-  - `Query{Category, Terms}.SearchQuery()` — renders the arXiv `search_query` (`cat:X` or `cat:X AND all:...`)
-  - `SanitizeTerms` — single trust boundary for user free-text: strips arXiv boolean operators (AND/OR/ANDNOT) and structural chars (`"():`), caps length
-- **`GET /categories`** — serves the cs.* catalog **and the configured default** (`{default, categories}`) so the picker seeds from the same default the empty-body path uses (`HandleCategories`)
-- **`POST /discover` optional body** `{category, terms}` — empty body falls back to the config default (backward compatible); unknown category → 400; terms sanitized on entry
+- **`internal/resource/` package** — the declarative resource engine with four-stage pipeline (transport → decoder → normalize → ACL)
+  - `Source` interface: `Discover()`, `FetchDiscoverMore()`, `FetchContent()`, `ValidateValues()`, `Descriptor()`
+  - `DeclarativeSource` — single implementation that loads YAML declarations
+  - `Registry` — holds all registered resources; orchestrator depends on this + Source, not on concrete arXiv tools
+  
+- **Capability Registries** — pluggable seams for extensibility
+  - `RegisterDecoder(format, Decoder)` — response format handlers (atom-xml v1, json/etc. future)
+  - `RegisterTransform(name, transformer)` — string transforms (normalize, trim, lowercase)
+  - `RegisterDeriver(name, deriver)` — node-aware field derivers (arxiv-id, arxiv-pdf-url)
+  - `RegisterSanitizer(name, sanitizer)` — free-text validators (arxiv-terms)
+  - `RegisterConverter(name, converter)` — content format converters (html-to-markdown)
+  
+- **YAML Declarations** (`resources/arxiv.yaml`, `resources/catalogs/arxiv-cs.yaml`)
+  - `request.fields` — form inputs (select with catalog validation, text with sanitizer)
+  - `fetch` — URL template, query builder, pagination, retry policy, timeout/size limits
+  - `response` — format, items path, field mappings (path, @attr, multi, transforms, derive)
+  - `content` — content fetch, converter, error handling (repick on 404)
+  - Two interpolations: `${VAR}` (trusted config, YAML-escaped, resolved at load), `{{name}}` (untrusted runtime, validated+sanitized+URL-encoded)
+  
+- **`GET /resources`** — returns resource descriptors (id, label, description, fields schema) so UI renders resource picker + dynamic form automatically
+- **`POST /discover` schema change** — body now `{resourceId?, values: {category, terms, ...}}` (empty body → defaults)
+  - Backward compat shim: legacy `{category, terms}` folded into values via default resource ID
 
 #### Frontend
-- **CategoryPicker component** — cs.* dropdown (human labels) + optional keyword input, wired into DiscoveryPanel
-- **`/api/categories` proxy**; `/api/trigger` forwards the `{category, terms}` body; `api.ts` `fetchCategories` + `triggerDiscovery(category, terms)`
+- **ResourcePicker component** — dropdown of available resources (sourced from GET /resources)
+- **DynamicRequestForm** — schema-driven form builder (zero hardcoding; generates UI from resource Descriptor.Fields)
+- Both wired into DiscoveryPanel; no more hardcoded CategoryPicker or field definitions
+
+#### Deleted Code
+- **`/backend/internal/tools/discovery.go`** — DiscoveryTool (replaced by resource engine)
+- **`/backend/internal/tools/papercontent.go`** — PaperContentTool (replaced by resource content fetch + converter)
+- **`/backend/internal/tools/papercontent-cleanup.go`** — redundant cleanup
+- **`/backend/internal/arxivquery/` package** — hardcoded arXiv query logic (now declarative in `resources/arxiv.yaml` + sanitizers)
+
+#### Documentation
+- **`docs/adding-a-resource.md`** — operator guide for adding new resources (Case A: existing capabilities → YAML only; Case B: new capability → register seam + YAML)
+- **`docs/design-notes/2026-07-18-declarative-resource-engine.md`** — design rationale and tradeoffs
 
 ### Changed
 
 #### Backend
-- **`DiscoveryTool`** — `FetchPapers`/`FetchPapersFrom`/`buildQueryURL` now take an `arxivquery.Query`; no longer read `cfg.ArxivCategory`
-- **`PipelineSession`** — new mutex-guarded `query` field + `Query()` accessor; `NewSession` takes a query. `runDiscovery` and `HandleDiscoverMore` (pagination) both read `session.Query()`, so "load more" stays within the chosen category+terms
-- **Config validation** — `agent.arxiv_category` default must now be a known cs.* code (fails fast at load)
-- **Security posture** — the stale "category comes from config, never user input, so there is no injection surface" comment in `discovery.go` was rewritten: category is now whitelist-validated and free-text is sanitized
+- **Orchestrator.newSession()** — now takes `(resourceID string, values map[string]string)` instead of implicit arXiv
+- **Orchestrator.HandleDiscover()** — parses `{resourceId?, values}` body; validates against resource's schema
+- **PipelineSession** — new `source` field (resource identifier); removed hardcoded category state
+- **`models.Paper`** — new non-persisted `Source` field (indicates which resource provided it)
+
+#### Frontend
+- **`/api/trigger`** — now accepts `{resourceId, values}` body (empty body preserved for backward compat)
+- **Discovery UI** — resource picker drives which form appears (dynamic per resource)
 
 ### Fixed
-- **Note frontmatter category** — `WriteToVault`/`buildFrontmatter` now record the run's actual category (threaded from `session.Query().Category`) instead of the config default, which mislabelled every note discovered under a non-default category
-- **`SanitizeTerms` UTF-8 safety** — length cap truncates on a rune boundary, so multibyte keywords can't produce invalid UTF-8 (and a malformed arXiv query)
-- **Malformed `/discover` body** — a non-empty, non-JSON body now returns 400 instead of silently downgrading to a default run (empty body still → default)
+
+- **Removed hardcoded arXiv dependency** — core orchestrator + agent pipeline now resource-agnostic
+- **Security generalized** — whitelist validation (catalog), text sanitization, path traversal prevention all parameterized by resource declaration
+- **Content converter extensible** — new formats (JSON, PDF, etc.) register a converter; no core changes
+
+### Architecture
+
+**Golden Regression:** Engine reproduces Phase 1–8 behavior field-for-field (validated via tests)
+- `resources/arxiv.yaml` + `resources/catalogs/arxiv-cs.yaml` replicate old hardcoded arXiv discovery
+- Content fetch + html-to-markdown converter replicate old PaperContentTool behavior
+- Pagination cursor, retry policy, timeout/size limits all declared in YAML
+
+**Security:** v1 SSRF is arXiv-safe (fixed public host, same-host/scheme validation, redirect cap 3). REQUIRED before enabling configurable-host resources: egress denylist (RFC1918, loopback, link-local, cloud-metadata) in transport layer — seam left open in `docs/adding-a-resource.md`.
+
+### Test Coverage
+
+- Engine integration: discovery → normalization → validation (end-to-end)
+- Loader: YAML parse, interpolation (`${...}` and `{{...}}`), validation, registry binding
+- Capability registries: decoders, transforms, derivers, sanitizers, converters
+- Transport: retry logic, redirect handling, timeout/size limits
+- Backward compat: legacy `{category, terms}` body → arXiv resource values
+
+### Migration from Phase 8
+
+1. **API:** `POST /discover` body now `{resourceId?, values}` (defaults to config default, values is map)
+2. **Legacy compat:** Old `{category, terms}` body still works (mapped to arXiv resource via shim)
+3. **Frontend:** Use new ResourcePicker + DynamicRequestForm (schema-driven, zero hardcoding)
+4. **Config:** `agent.default_resource_id: "arxiv"` in config.yaml (optional; defaults to arXiv for backward compat)
+5. **No database changes:** `models.Paper.Source` is non-persisted; no migration needed
 
 ---
 

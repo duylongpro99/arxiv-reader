@@ -8,34 +8,36 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 )
 
-// fakePageFetcher satisfies both PaperFetcher and PageFetcher (as the real
-// DiscoveryTool does), recording how many times the paginated fetch ran so a
-// test can assert a rejected /more never reaches arXiv, plus the last query it
-// received so a test can assert pagination uses the session's own query.
-type fakePageFetcher struct {
-	page    []models.Paper
-	calls   int
-	lastQry arxivquery.Query
+// fakePageSource is a resource.Source that records how many times Discover ran
+// (so a test can assert a rejected /more never fetches) plus the last values it
+// received (so a test can assert pagination uses the session's own values).
+type fakePageSource struct {
+	page       []models.Paper
+	calls      int
+	lastValues map[string]string
 }
 
-func (f *fakePageFetcher) FetchPapers(context.Context, arxivquery.Query, func(int)) ([]models.Paper, error) {
-	return f.page, nil
+func (f *fakePageSource) ID() string                      { return "arxiv" }
+func (f *fakePageSource) Descriptor() resource.Descriptor { return resource.Descriptor{ID: "arxiv"} }
+func (f *fakePageSource) PageSize() int                   { return 5 }
+func (f *fakePageSource) ValidateValues(v map[string]string) (map[string]string, error) {
+	return v, nil
 }
-
-func (f *fakePageFetcher) FetchPapersFrom(_ context.Context, q arxivquery.Query, _ int, _ func(int)) ([]models.Paper, error) {
+func (f *fakePageSource) Discover(_ context.Context, req resource.Request, _ int, _ func(int)) ([]models.Paper, error) {
 	f.calls++
-	f.lastQry = q
+	f.lastValues = req.Values
 	return f.page, nil
 }
+func (f *fakePageSource) FetchContent(context.Context, string) (string, error) { return "", nil }
 
-func moreOrch(pf *fakePageFetcher) *Orchestrator {
+func moreOrch(pf *fakePageSource) *Orchestrator {
 	cfg := &config.Config{Agent: config.AgentConfig{DisplayLimit: 5, FetchLimit: 5}}
-	return &Orchestrator{cfg: cfg, disco: pf, discoMore: pf, logCheck: passthrough()}
+	return &Orchestrator{cfg: cfg, registry: regWith(pf), logCheck: passthrough()}
 }
 
 func discoverMore(o *Orchestrator, id string) *httptest.ResponseRecorder {
@@ -50,9 +52,9 @@ func discoverMore(o *Orchestrator, id string) *httptest.ResponseRecorder {
 // stage) must be rejected WITHOUT fetching — otherwise the fetched page would be
 // silently overwritten by discovery's Complete() and the cursor left desynced.
 func TestDiscoverMoreWrongStageIsRejectedAndDoesNotFetch(t *testing.T) {
-	pf := &fakePageFetcher{page: makePapers(5)}
+	pf := &fakePageSource{page: makePapers(5)}
 	o := moreOrch(pf)
-	s := models.NewSession("sess-test", time.Now(), arxivquery.Query{Category: "cs.AI"}) // still in discovery stage
+	s := models.NewSession("sess-test", time.Now(), "arxiv", map[string]string{"category": "cs.AI"}) // still in discovery stage
 	o.sessions.Store(s.SessionID, s)
 
 	rec := discoverMore(o, s.SessionID)
@@ -65,7 +67,7 @@ func TestDiscoverMoreWrongStageIsRejectedAndDoesNotFetch(t *testing.T) {
 }
 
 func TestDiscoverMoreAppendsCandidatesInSelection(t *testing.T) {
-	pf := &fakePageFetcher{page: makePapers(5)} // full page → hasMore true
+	pf := &fakePageSource{page: makePapers(5)} // full page → hasMore true
 	o := moreOrch(pf)
 	s := selectionSession(o, makePapers(3)) // 3 existing candidates, StageSelection
 
@@ -87,7 +89,7 @@ func TestDiscoverMoreAppendsCandidatesInSelection(t *testing.T) {
 }
 
 func TestDiscoverMoreUnknownSessionIs404(t *testing.T) {
-	o := moreOrch(&fakePageFetcher{})
+	o := moreOrch(&fakePageSource{})
 	if rec := discoverMore(o, "nope"); rec.Code != http.StatusNotFound {
 		t.Fatalf("want 404 for unknown session, got %d", rec.Code)
 	}

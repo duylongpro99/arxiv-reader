@@ -72,9 +72,8 @@ func (r *scriptedReviewer) Review(_ context.Context, _ models.ExplainerOutput, _
 func reviewOrch(maxIter int, exp Explainer, rev Reviewer, v *fakeVault) *Orchestrator {
 	return &Orchestrator{
 		cfg:       &config.Config{Agent: config.AgentConfig{DisplayLimit: 5, MaxReviewIterations: maxIter}},
-		disco:     &fakeFetcher{},
+		registry:  regWith(&fakeSource{md: "# extracted"}),
 		logCheck:  passthrough(),
-		content:   &fakeContent{md: "# extracted"},
 		explainer: exp,
 		reviewer:  rev,
 		vault:     v,
@@ -358,7 +357,7 @@ func TestRetryReviewFailureReRunsLoop(t *testing.T) {
 // double-spawn window. Sequential calls make this deterministic: the first retry
 // synchronously leaves StageFailed before returning.
 func TestRetrySecondIsRejected(t *testing.T) {
-	content := &fakeContent{md: "# extracted"}
+	content := &fakeSource{md: "# extracted"}
 	o := newProcessOrch(content)
 	fv := &toggleVault{path: "/vault/AI Papers/n.md"} // fails once, then succeeds
 	o.vault = fv

@@ -2,9 +2,9 @@
 // never the Go backend directly — the backend address stays server-side.
 
 import type {
-  CategoriesResponse,
   DiscoverMoreResult,
   PipelineStatus,
+  ResourceDescriptor,
   ResultResponse,
   RetryResponse,
   RunContent,
@@ -12,29 +12,30 @@ import type {
   TriggerResponse,
 } from "./types";
 
-// fetchCategories loads the cs.* catalog + configured default for the picker.
-export async function fetchCategories(): Promise<CategoriesResponse> {
-  const res = await fetch("/api/categories");
+// fetchResources loads the registered resources + their field schemas so the UI
+// can render a resource picker and a dynamic request form.
+export async function fetchResources(): Promise<ResourceDescriptor[]> {
+  const res = await fetch("/api/resources");
   if (!res.ok) {
-    throw new Error(`Failed to load categories (HTTP ${res.status})`);
+    throw new Error(`Failed to load resources (HTTP ${res.status})`);
   }
   return res.json();
 }
 
-// triggerDiscovery starts a discovery run for the chosen category (+ optional
-// keywords) and returns the new session id. category is required; terms is
-// optional free-text the backend sanitizes and AND-s onto the category filter.
+// triggerDiscovery starts a discovery run for the chosen resource with its
+// validated field values and returns the new session id. The backend validates
+// values against the resource schema (whitelist selects, sanitize text).
 export async function triggerDiscovery(
-  category: string,
-  terms?: string,
+  resourceId: string,
+  values: Record<string, string>,
 ): Promise<TriggerResponse> {
   const res = await fetch("/api/trigger", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ category, terms: terms ?? "" }),
+    body: JSON.stringify({ resourceId, values }),
   });
   if (!res.ok) {
-    // A 400 means the category was not recognised — surface it clearly.
+    // A 400 means a value failed the resource's schema — surface it clearly.
     throw new Error(`Failed to start discovery (HTTP ${res.status})`);
   }
   return res.json();

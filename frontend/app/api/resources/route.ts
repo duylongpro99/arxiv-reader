@@ -1,11 +1,11 @@
 import { backendBaseURL } from "@/lib/backend";
 
-// GET /api/categories → GET {backend}/categories
-// Thin proxy for the cs.* catalog that populates the discovery category picker.
-// Relays the backend body + status unchanged.
+// GET /api/resources → GET {backend}/resources
+// Thin proxy for the resource descriptors that drive the resource picker + the
+// dynamic request form. Relays the backend body + status unchanged.
 export async function GET() {
   try {
-    const res = await fetch(`${backendBaseURL()}/categories`);
+    const res = await fetch(`${backendBaseURL()}/resources`);
     const body = await res.text();
     return new Response(body, {
       status: res.status,

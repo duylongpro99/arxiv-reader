@@ -9,8 +9,6 @@ import (
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
-
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 )
 
 // Config is the fully-resolved runtime configuration.
@@ -51,6 +49,9 @@ type LLMConfig struct {
 type PathsConfig struct {
 	ObsidianVault string `yaml:"obsidian_vault"`
 	LogFile       string `yaml:"log_file"`
+	// ResourcesDir holds the declarative resource engine's *.yaml declarations
+	// (default ./resources; env RESOURCES_DIR). The loader reads it at startup.
+	ResourcesDir string `yaml:"resources_dir"`
 }
 
 // AgentConfig holds the discovery-pipeline knobs introduced in Phase 2.
@@ -104,6 +105,10 @@ func Load(yamlPath string) (*Config, error) {
 	//    and Go's filepath.IsAbs treats "~/..." as relative.
 	cfg.Paths.ObsidianVault = expandHome(cfg.Paths.ObsidianVault)
 	cfg.Paths.LogFile = expandHome(cfg.Paths.LogFile)
+	// Default the resources dir so an existing config.yaml without the key boots.
+	if cfg.Paths.ResourcesDir == "" {
+		cfg.Paths.ResourcesDir = "./resources"
+	}
 
 	// 4. fail-fast validation
 	if err := cfg.validate(); err != nil {
@@ -132,6 +137,7 @@ func (c *Config) applyEnvOverrides() error {
 	// Paths
 	envStr("OBSIDIAN_VAULT_PATH", &c.Paths.ObsidianVault)
 	envStr("LOG_FILE", &c.Paths.LogFile)
+	envStr("RESOURCES_DIR", &c.Paths.ResourcesDir)
 	// Agent
 	envStr("AGENT_ARXIV_CATEGORY", &c.Agent.ArxivCategory)
 	envStr("AGENT_ARXIV_BASE_URL", &c.Agent.ArxivBaseURL)
@@ -275,12 +281,10 @@ func (a *AgentConfig) validate() error {
 	if a.ArxivCategory == "" {
 		return fmt.Errorf("agent.arxiv_category is required but not set.\n  → Set agent.arxiv_category (e.g. cs.AI) in config.yaml")
 	}
-	// The configured category is the DEFAULT selection surfaced to users, so it
-	// must be a known cs.* code — otherwise the first discovery run (with an
-	// empty request body) would build an invalid arXiv query. Fail fast at load.
-	if !arxivquery.IsValid(a.ArxivCategory) {
-		return fmt.Errorf("agent.arxiv_category %q is not a known cs.* category.\n  → Set agent.arxiv_category to a valid code (e.g. cs.AI) in config.yaml", a.ArxivCategory)
-	}
+	// The configured category is the DEFAULT selection (consumed by
+	// resources/arxiv.yaml via ${AGENT_ARXIV_CATEGORY}); the resource loader
+	// validates it is in the catalog (default-in-catalog check), so no cs.*
+	// whitelist lives here anymore — the catalog is the single source of truth.
 	if a.ArxivBaseURL == "" {
 		return fmt.Errorf("agent.arxiv_base_url is required but not set.\n  → Set agent.arxiv_base_url in config.yaml")
 	}
@@ -316,4 +320,31 @@ func (a *AgentConfig) validate() error {
 		return fmt.Errorf("agent.max_review_iterations must be >= 0, got %d.\n  → Set agent.max_review_iterations in config.yaml (0 disables the reviewer)", a.MaxReviewIterations)
 	}
 	return nil
+}
+
+// Resolve is the ${...} lookup the resource loader uses to expand config
+// references in resources/*.yaml. It reads the MERGED *Config field map first
+// (so a config.yaml-only value with no matching env var still resolves — F11),
+// then falls back to os.Getenv, and finally errors on an unknown key (fail-fast,
+// key-free message). Only whitelisted keys resolve — an unrelated env var cannot
+// be spliced into a declaration.
+func (c *Config) Resolve(key string) (string, error) {
+	merged := map[string]string{
+		"AGENT_ARXIV_CATEGORY":               c.Agent.ArxivCategory,
+		"AGENT_ARXIV_BASE_URL":               c.Agent.ArxivBaseURL,
+		"AGENT_FETCH_LIMIT":                  strconv.Itoa(c.Agent.FetchLimit),
+		"AGENT_USER_AGENT":                   c.Agent.UserAgent,
+		"AGENT_REQUEST_TIMEOUT_SECONDS":      strconv.Itoa(c.Agent.RequestTimeoutSec),
+		"AGENT_MIN_REQUEST_INTERVAL_SECONDS": strconv.Itoa(c.Agent.MinRequestIntervalSec),
+		"AGENT_MAX_RETRIES":                  strconv.Itoa(c.Agent.MaxRetries),
+		"AGENT_ARXIV_HTML_BASE_URL":          c.Agent.ArxivHTMLBaseURL,
+		"AGENT_MAX_CONTENT_BYTES":            strconv.FormatInt(c.Agent.MaxContentBytes, 10),
+	}
+	if v, ok := merged[key]; ok && v != "" {
+		return v, nil
+	}
+	if v := os.Getenv(key); v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("unresolved config reference %q in a resource declaration", key)
 }

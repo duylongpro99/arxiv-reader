@@ -13,10 +13,9 @@ import (
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
-	"github.com/maritime-ds/arxiv-reader/internal/tools"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
@@ -52,19 +51,27 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 		}
 	}()
 
-	// The per-session query (category + free-text) drives every arXiv fetch —
-	// read it once here so the narrative, the fetch, and the summary all describe
-	// the same run.
-	query := session.Query()
+	// The per-session resource + values drive every fetch — read them once here so
+	// the narrative, the fetch, and the summary all describe the same run.
+	resourceID := session.ResourceID()
+	values := session.Values()
+
+	src, ok := o.registry.Get(resourceID)
+	if !ok {
+		session.Fail("The selected resource is no longer available. Please try again.", false)
+		session.SetErrorAction("")
+		o.logFailure(session, fmt.Errorf("unknown resource %q", resourceID))
+		return
+	}
 
 	// Timeline: discovery began (covers both a fresh run and a discovery retry).
 	o.rec(session).Emit(tev(tracing.KindDiscoveryStarted, tracing.StatusInfo, models.StageDiscovery,
-		fmt.Sprintf("Discovery triggered (%s)", describeQuery(query))))
+		fmt.Sprintf("Discovery triggered (%s)", describeValues(resourceID, values))))
 
-	// Surface arXiv retry attempts as a progress counter (F5). On success we reset
-	// it to 0 below so the "Connecting to arXiv (retry n/3)…" label disappears.
+	// Surface fetch retry attempts as a progress counter (F5). On success we reset
+	// it to 0 below so the "Connecting… (retry n/3)…" label disappears.
 	fetchStart := time.Now()
-	papers, err := o.disco.FetchPapers(ctx, query, func(attempt int) {
+	papers, err := src.Discover(ctx, resource.Request{Values: values}, 0, func(attempt int) {
 		session.SetArxivRetryCount(attempt)
 	})
 	if err != nil {
@@ -77,8 +84,10 @@ func (o *Orchestrator) runDiscovery(ctx context.Context, session *models.Pipelin
 	session.SetArxivRetryCount(0) // fetch succeeded — clear any retry label
 
 	fetched := tev(tracing.KindToolDiscoveryCompleted, tracing.StatusSuccess, models.StageDiscovery,
-		fmt.Sprintf("Fetched %d papers from arXiv", len(papers)))
-	fetched.Summary = map[string]any{"count": len(papers), "category": query.Category, "terms": query.Terms}
+		fmt.Sprintf("Fetched %d papers from %s", len(papers), resourceID))
+	// Keep the category/terms summary keys when present so the frontend timeline
+	// (which reads them) needs no change; otherwise the values still ride along.
+	fetched.Summary = map[string]any{"count": len(papers), "category": values["category"], "terms": values["terms"]}
 	fetched.DurationMS = tracing.MS(time.Since(fetchStart))
 	o.rec(session).Emit(fetched)
 
@@ -155,9 +164,16 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 			tev(tracing.KindToolPaperContentStarted, tracing.StatusInfo, models.StageExtracting, "Fetching paper HTML…"),
 			map[string]any{"arxivId": paperID}))
 		extractStart := time.Now()
-		md, err := o.content.FetchMarkdown(ctx, paperID)
+		src, ok := o.registry.Get(s.ResourceID())
+		if !ok {
+			s.Fail("The selected resource is no longer available. Please try again.", false)
+			s.SetErrorAction("")
+			o.logFailure(s, fmt.Errorf("unknown resource %q", s.ResourceID()), "paper_id", paperID)
+			return
+		}
+		md, err := src.FetchContent(ctx, paperID)
 		if err != nil {
-			if errors.Is(err, tools.ErrPaperHTMLNotFound) {
+			if errors.Is(err, resource.ErrContentNotFound) {
 				// 404 re-pick: NOT a run failure — the run continues after the user
 				// selects another paper, so this event is non-terminal.
 				s.RecoverToSelection("Paper HTML not available on arXiv. Please select another paper.")
@@ -233,7 +249,9 @@ func (o *Orchestrator) runPipeline(ctx context.Context, s *models.PipelineSessio
 	}
 
 	s.SetStage(models.StageWriting)
-	path, err := o.vault.WriteToVault(ctx, *ex, *paper, s.Verdict(), s.Query().Category)
+	// F8: source the vault category from the run's values (empty-safe) — the call
+	// site was NOT resource-agnostic before; a non-arXiv resource simply yields "".
+	path, err := o.vault.WriteToVault(ctx, *ex, *paper, s.Verdict(), s.Values()["category"])
 	if err != nil {
 		// Permission/disk failures won't fix themselves on retry; others might.
 		msg, action := vaultErrMsg(err)
@@ -523,19 +541,33 @@ func sectionsOrNone(sections []string) string {
 }
 
 // newSession creates a session with a unique, dependency-free random ID and the
-// given discovery query (category + free-text) fixed for its lifetime.
-func (o *Orchestrator) newSession(query arxivquery.Query) *models.PipelineSession {
-	return models.NewSession(newSessionID(), time.Now(), query)
+// given resource id + validated values fixed for its lifetime.
+func (o *Orchestrator) newSession(resourceID string, values map[string]string) *models.PipelineSession {
+	return models.NewSession(newSessionID(), time.Now(), resourceID, values)
 }
 
-// describeQuery renders a discovery query for the timeline narrative: the bare
-// category when there is no free-text, or "category: terms" when the user added
-// keywords.
-func describeQuery(q arxivquery.Query) string {
-	if q.Terms == "" {
-		return q.Category
+// describeValues renders the run's resource + values for the timeline narrative.
+// It keeps the old "category" / "category: terms" phrasing when those keys are
+// present (so the arXiv timeline reads identically), otherwise falls back to the
+// resource id plus a compact join of the non-empty values.
+func describeValues(resourceID string, values map[string]string) string {
+	if cat := values["category"]; cat != "" {
+		if terms := values["terms"]; terms != "" {
+			return cat + ": " + terms
+		}
+		return cat
 	}
-	return q.Category + ": " + q.Terms
+	parts := make([]string, 0, len(values))
+	for k, v := range values {
+		if v != "" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	sort.Strings(parts)
+	if len(parts) == 0 {
+		return resourceID
+	}
+	return resourceID + " (" + strings.Join(parts, ", ") + ")"
 }
 
 // newSessionID returns a 32-hex-char (16 random bytes) session ID. crypto/rand

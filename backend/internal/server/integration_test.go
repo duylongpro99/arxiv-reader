@@ -143,7 +143,10 @@ func setupWith(t *testing.T, feed, logContent string, htmlHandler http.HandlerFu
 			MaxTokens: 4096, Temperature: 0.3, RequestTimeoutSec: 10,
 			BaseURL: llmSrv.URL,
 		},
-		Paths: config.PathsConfig{LogFile: logPath, ObsidianVault: vaultDir},
+		// ResourcesDir points at the repo-root resources/ (this test package runs
+		// from backend/internal/server), so the engine loads the real arxiv.yaml
+		// and resolves ${AGENT_ARXIV_*} against the Agent block below (fake servers).
+		Paths: config.PathsConfig{LogFile: logPath, ObsidianVault: vaultDir, ResourcesDir: "../../../resources"},
 		Agent: config.AgentConfig{
 			ArxivCategory:         "cs.AI",
 			ArxivBaseURL:          arxiv.URL,
