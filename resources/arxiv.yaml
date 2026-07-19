@@ -1,0 +1,91 @@
+# arXiv resource declaration — the entire arXiv integration expressed as data.
+# ${...} = trusted config/env, resolved on the raw bytes at load.
+# {{...}} = untrusted runtime values (category/terms/start/paper.id), sanitized
+#           + URL-encoded by the engine. The two never mix.
+id: arxiv
+label: arXiv
+description: Computer Science papers from arXiv (newest first)
+
+request:
+  fields:
+    - name: category
+      type: select
+      label: Category
+      required: true
+      default: ${AGENT_ARXIV_CATEGORY}
+      options:
+        catalog: arxiv-cs
+    - name: terms
+      type: text
+      label: Keywords (optional)
+      required: false
+      sanitize: arxiv-terms
+
+fetch:
+  method: GET
+  url: ${AGENT_ARXIV_BASE_URL}
+  headers:
+    User-Agent: ${AGENT_USER_AGENT}
+  query:
+    # cat:<category> [ AND all:<terms> ] — the all: clause is dropped when no
+    # free-text was supplied (its `when` guard is empty).
+    search_query:
+      join: " AND "
+      parts:
+        - value: "cat:{{category}}"
+        - value: "all:{{terms}}"
+          when: terms
+    sortBy: submittedDate
+    sortOrder: descending
+    max_results: ${AGENT_FETCH_LIMIT}
+    start: "{{start}}"
+  paginate:
+    kind: offset
+    param: start
+    page_size: ${AGENT_FETCH_LIMIT}
+  retry:
+    max_retries: ${AGENT_MAX_RETRIES}
+    on: ["429", "5xx", "network", "timeout"]  # discovery: timeout is transient
+    backoff_base_seconds: ${AGENT_MIN_REQUEST_INTERVAL_SECONDS}
+    backoff_factor: 2
+  timeout_seconds: ${AGENT_REQUEST_TIMEOUT_SECONDS}
+  max_bytes: ${AGENT_MAX_CONTENT_BYTES}
+
+response:
+  format: atom-xml
+  items: feed.entry
+  fields:
+    id:
+      derive: arxiv-id          # /abs/-anchored, version-stripped (handles old-style ids)
+    title:
+      path: title
+      transforms: [normalize]
+    abstract:
+      path: summary
+      transforms: [normalize]
+    authors:
+      path: author.name
+      multi: true
+      transforms: [normalize]
+    published:
+      path: published
+      transforms: [trim]
+    pdfUrl:
+      derive: arxiv-pdf-url     # explicit pdf link, else derived from id
+  require: [id, title]
+
+content:
+  request:
+    method: GET
+    url: ${AGENT_ARXIV_HTML_BASE_URL}/{{paper.id}}
+    headers:
+      User-Agent: ${AGENT_USER_AGENT}
+    retry:
+      max_retries: ${AGENT_MAX_RETRIES}
+      on: ["429", "5xx", "network"]  # content: timeout is TERMINAL (not listed)
+      backoff_base_seconds: ${AGENT_MIN_REQUEST_INTERVAL_SECONDS}
+      backoff_factor: 2
+    timeout_seconds: ${AGENT_REQUEST_TIMEOUT_SECONDS}
+    max_bytes: ${AGENT_MAX_CONTENT_BYTES}
+  convert: html-to-markdown
+  not_found: repick

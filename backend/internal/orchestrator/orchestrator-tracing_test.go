@@ -6,7 +6,7 @@ import (
 
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
-	"github.com/maritime-ds/arxiv-reader/internal/tools"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
@@ -78,7 +78,7 @@ func waitLastKind(t *testing.T, tr *tracing.Tracer, id string, kind tracing.Even
 
 func TestTraceHappyPathSequence(t *testing.T) {
 	// newProcessOrch has MaxReviewIterations=0 → reviewer disabled (no review events).
-	o := newProcessOrch(&fakeContent{md: "# Extracted paper"})
+	o := newProcessOrch(&fakeSource{md: "# Extracted paper"})
 	tr := withTracer(o)
 	s := selectionSession(o, makePapers(3))
 
@@ -152,7 +152,7 @@ func TestTraceMaxIterationsSequence(t *testing.T) {
 }
 
 func TestTrace404RecoverSequence(t *testing.T) {
-	o := newProcessOrch(&fakeContent{err: tools.ErrPaperHTMLNotFound})
+	o := newProcessOrch(&fakeSource{contentErr: resource.ErrContentNotFound})
 	tr := withTracer(o)
 	s := selectionSession(o, makePapers(3))
 
@@ -172,7 +172,7 @@ func TestTrace404RecoverSequence(t *testing.T) {
 
 func TestTraceGenerationFailureSequence(t *testing.T) {
 	// Transient generation error (timeout) → recoverable failure.
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.explainer = &fakeExplainer{err: llm.ErrLLMTimeout}
 	})
 	tr := withTracer(o)
@@ -196,7 +196,7 @@ func TestTraceGenerationFailureSequence(t *testing.T) {
 
 func TestTraceNonRecoverableFailureClosesRecorder(t *testing.T) {
 	// A bad-request generation error is non-recoverable → true terminal → closed.
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.explainer = &fakeExplainer{err: llm.ErrLLMBadRequest}
 	})
 	tr := withTracer(o)
@@ -211,7 +211,7 @@ func TestTraceNonRecoverableFailureClosesRecorder(t *testing.T) {
 }
 
 func TestTraceDiscoverySequence(t *testing.T) {
-	o := newOrch(testCfg(5), &fakeFetcher{papers: makePapers(8)}, passthrough())
+	o := newOrch(testCfg(5), &fakeSource{papers: makePapers(8)}, passthrough())
 	tr := withTracer(o)
 	o.cfg.Agent.ArxivCategory = "cs.AI"
 

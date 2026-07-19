@@ -6,6 +6,7 @@ import (
 	"syscall"
 
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 )
 
@@ -33,18 +34,24 @@ const (
 // non-recoverable failure here — it needs a manual fix (no action).
 func describeError(err error) (message string, recoverable bool, action string) {
 	switch {
-	case errors.Is(err, tools.ErrArxivRateLimit):
-		return "arXiv is rate limiting requests. Please try again in a minute.", true, actionRetry
-	case errors.Is(err, tools.ErrArxivUnavailable):
-		return "arXiv is currently unavailable. Please try again.", true, actionRetry
-	case errors.Is(err, tools.ErrArxivParse):
-		return "arXiv returned an unexpected response. Please try again.", true, actionRetry
+	// Discovery/transport failures (engine sentinels). F5: a discovery timeout is
+	// classified transient upstream and surfaces here as ErrTransportUnavailable
+	// ("unavailable"); a CONTENT timeout is terminal and surfaces distinctly as
+	// ErrTransportTimeout ("timed out") — preserving the old two-message split.
+	case errors.Is(err, resource.ErrTransportRateLimit):
+		return "The source is rate limiting requests. Please try again in a minute.", true, actionRetry
+	case errors.Is(err, resource.ErrTransportUnavailable):
+		return "The source is currently unavailable. Please try again.", true, actionRetry
+	case errors.Is(err, resource.ErrTransportTimeout):
+		return "Fetching the paper's content timed out. Please try again.", true, actionRetry
+	case errors.Is(err, resource.ErrTransportTooLarge):
+		return "The paper content is too large to process.", true, actionRetry
+	case errors.Is(err, resource.ErrDecode):
+		return "The source returned an unexpected response. Please try again.", true, actionRetry
+	case errors.Is(err, resource.ErrContentFailed):
+		return "Could not fetch or convert the paper's content. Please try again.", true, actionRetry
 	case errors.Is(err, tools.ErrLogCorrupted):
 		return "The processed-log file is corrupted and needs manual inspection.", false, ""
-	case errors.Is(err, tools.ErrPaperHTMLTimeout):
-		return "Fetching the paper's HTML timed out. Please try again.", true, actionRetry
-	case errors.Is(err, tools.ErrPaperHTMLFailed):
-		return "Could not fetch or convert the paper's HTML. Please try again.", true, actionRetry
 	default:
 		return "The request failed unexpectedly. Please try again.", true, actionRetry
 	}

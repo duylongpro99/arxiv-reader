@@ -7,49 +7,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 	"github.com/maritime-ds/arxiv-reader/internal/store"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 	"github.com/maritime-ds/arxiv-reader/internal/tracing"
 )
 
-// PaperFetcher and Unprocessor are the narrow tool contracts the orchestrator
-// depends on. Defining them here (consumer-side) keeps the orchestrator
-// testable with fakes and decoupled from the concrete tools.
-type PaperFetcher interface {
-	// query carries the per-session category + free-text; onRetry (nil-safe)
-	// fires per transient arXiv retry so the orchestrator can surface a progress
-	// counter (F5) without the tool touching the session.
-	FetchPapers(ctx context.Context, query arxivquery.Query, onRetry func(attempt int)) ([]models.Paper, error)
-}
-
-// PageFetcher is the narrow, consumer-side contract for Feature C (arXiv
-// pagination via session extension): fetching an arbitrary page by start
-// offset. Kept as its OWN interface (rather than adding a method to
-// PaperFetcher) so the existing PaperFetcher fakes used by orchestrator_test.go
-// keep compiling unchanged — this is strictly additive.
-type PageFetcher interface {
-	FetchPapersFrom(ctx context.Context, query arxivquery.Query, start int, onRetry func(attempt int)) ([]models.Paper, error)
-}
-
+// Unprocessor is the narrow dedup contract the orchestrator depends on
+// (consumer-side, so it stays testable with a fake). Paper discovery + content
+// now come from resource.Source (the engine), which the orchestrator gets from
+// its Registry — there is no longer a per-resource fetcher/content interface here.
 type Unprocessor interface {
 	FilterUnprocessed(papers []models.Paper) ([]models.Paper, error)
-}
-
-// PaperContent is the narrow contract for turning a chosen paper into Markdown.
-// Consumer-side interface so the orchestrator stays testable with a fake tool.
-type PaperContent interface {
-	FetchMarkdown(ctx context.Context, arxivID string) (string, error)
 }
 
 // Explainer and VaultWriter are the Phase 4 consumer contracts, defined here so
@@ -71,15 +48,16 @@ type Reviewer interface {
 
 // Orchestrator holds the session store and the tools it sequences.
 type Orchestrator struct {
-	sessions  sync.Map // sessionID -> *models.PipelineSession
-	cfg       *config.Config
-	disco     PaperFetcher
-	discoMore PageFetcher // Feature C: pagination — same concrete tool as disco, narrower interface
+	sessions sync.Map // sessionID -> *models.PipelineSession
+	cfg      *config.Config
+	// registry is the declarative resource engine: discovery + content for every
+	// resource come from the resource.Source it returns, keyed by the session's
+	// resourceID. It replaces the old arXiv-specific disco/discoMore/content tools.
+	registry  *resource.Registry
 	logCheck  Unprocessor
-	content   PaperContent // Phase 3: HTML → Markdown extraction
-	explainer Explainer    // Phase 4: LLM re-teaching generation
-	reviewer  Reviewer     // Phase 5: independent critic (revision loop)
-	vault     VaultWriter  // Phase 4: atomic Obsidian vault write
+	explainer Explainer   // Phase 4: LLM re-teaching generation
+	reviewer  Reviewer    // Phase 5: independent critic (revision loop)
+	vault     VaultWriter // Phase 4: atomic Obsidian vault write
 	// Phase 7 run-timeline tracing. tracer is always non-nil after New (it just
 	// skips the DB when unavailable); store backs the history read endpoints
 	// (Phase 04) and is nil when Postgres is unreachable. Both are additive —
@@ -103,6 +81,14 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	}
 	logCheck := tools.NewLogCheckTool(&cfg.Paths)
 
+	// Build the declarative resource engine from resources/*.yaml. A load failure
+	// (bad declaration, unknown capability, unresolved ${...}) must stop startup —
+	// the server cannot run without at least one resource (config fail-fast style).
+	registry, err := resource.Load(cfg.Paths.ResourcesDir, cfg.Resolve)
+	if err != nil {
+		return nil, fmt.Errorf("cannot load resources: %w", err)
+	}
+
 	// Open the durable history store — best-effort. An empty/unreachable
 	// DATABASE_URL degrades to in-memory-only tracing and is NEVER fatal: store
 	// failure must not stop the server (mirrors the config fail-fast philosophy
@@ -123,17 +109,10 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	tracer := tracing.New(cfg.Tracing.Enabled, ev, rw,
 		cfg.Tracing.FullPayloads, cfg.Tracing.BufferSize, cfg.LLM.APIKey, cfg.DatabaseURL)
 
-	// One concrete DiscoveryTool instance backs both the PaperFetcher (first
-	// page, used by runDiscovery) and PageFetcher (arbitrary page, used by
-	// HandleDiscoverMore) roles — it implements both methods; only the narrower
-	// interface each caller depends on differs.
-	disco := tools.NewDiscoveryTool(&cfg.Agent)
 	o := &Orchestrator{
 		cfg:       cfg,
-		disco:     disco,
-		discoMore: disco,
+		registry:  registry,
 		logCheck:  logCheck,
-		content:   tools.NewPaperContentTool(&cfg.Agent),
 		explainer: agents.New(client, cfg),
 		reviewer:  agents.NewReviewer(client, cfg), // shares the explainer's LLM client
 		vault:     tools.NewVaultWriterTool(cfg, logCheck),
@@ -152,14 +131,26 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // HandleStatus. Discovery is async because later phases (LLM calls) are slow;
 // establishing the contract now keeps it stable across phases.
 func (o *Orchestrator) HandleDiscover(w http.ResponseWriter, r *http.Request) {
-	query, err := o.parseDiscoverQuery(r)
+	resourceID, rawValues, err := parseDiscover(r)
 	if err != nil {
-		// Malformed body or unknown category — both client errors, so 400.
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	src, ok := o.registry.Get(resourceID)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("unknown resource %q", resourceID)})
+		return
+	}
+	// Validate + sanitize against the resource's own schema (early reject; the
+	// engine re-validates authoritatively in Discover — F21). Folded legacy
+	// values pass through the same whitelist + sanitizer here (F17).
+	values, err := src.ValidateValues(rawValues)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	session := o.newSession(query)
+	session := o.newSession(resourceID, values)
 	o.sessions.Store(session.SessionID, session)
 	o.rec(session) // create the recorder + run-header row at run start
 
@@ -173,57 +164,11 @@ func (o *Orchestrator) HandleDiscover(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, DiscoverResponse{SessionID: session.SessionID})
 }
 
-// discoverRequest is the optional JSON body for POST /discover. Both fields are
-// optional: an empty/absent body (existing clients) falls back to the config
-// default category with no free-text.
-type discoverRequest struct {
-	Category string `json:"category"`
-	Terms    string `json:"terms"`
-}
-
-// parseDiscoverQuery decodes the optional {category, terms} body into a
-// validated arxivquery.Query. An empty body (EOF) is the backward-compatible
-// default path, not an error. It returns an error (→ 400) for a malformed body
-// or an explicitly-supplied unknown category. Free-text is sanitized here (the
-// single trust boundary for keyword input); the category is checked against the
-// cs.* whitelist.
-func (o *Orchestrator) parseDiscoverQuery(r *http.Request) (arxivquery.Query, error) {
-	var req discoverRequest
-	// EOF means no body → use defaults. Any other decode error is a genuinely
-	// malformed request, which we reject rather than silently downgrading to a
-	// default run (that would mask client bugs).
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-		return arxivquery.Query{}, fmt.Errorf("invalid request body")
-	}
-
-	category := strings.TrimSpace(req.Category)
-	if category == "" {
-		category = o.cfg.Agent.ArxivCategory // config default (validated at load)
-	} else if !arxivquery.IsValid(category) {
-		return arxivquery.Query{}, fmt.Errorf("unknown category %q", category)
-	}
-
-	return arxivquery.Query{
-		Category: category,
-		Terms:    arxivquery.SanitizeTerms(req.Terms),
-	}, nil
-}
-
-// categoriesResponse carries the cs.* catalog plus the configured default so the
-// UI seeds its picker from the SAME default the empty-body discovery path uses —
-// no divergence between what the frontend shows and what the backend defaults to.
-type categoriesResponse struct {
-	Default    string               `json:"default"`
-	Categories []arxivquery.Category `json:"categories"`
-}
-
-// HandleCategories returns the cs.* catalog + configured default for the UI
-// dropdown. Static read of the compiled-in list + config — no session, no arXiv.
-func (o *Orchestrator) HandleCategories(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, categoriesResponse{
-		Default:    o.cfg.Agent.ArxivCategory,
-		Categories: arxivquery.Categories,
-	})
+// HandleResources returns every registered resource's descriptor (id, label,
+// description, field schema) so the UI can render a resource picker + a dynamic
+// request form. Static read of the registry — no session, no fetch.
+func (o *Orchestrator) HandleResources(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, o.registry.Descriptors())
 }
 
 // HandleProcess records the user's paper choice and kicks off extraction. It
@@ -435,15 +380,24 @@ func (o *Orchestrator) HandleDiscoverMore(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	src, ok := o.registry.Get(s.ResourceID())
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resource no longer available"})
+		return
+	}
+	// Page size is owned by the engine (F9): the SAME value drives both the cursor
+	// step and the hasMore heuristic below, so the orchestrator no longer reads
+	// cfg.Agent.FetchLimit.
+	pageSize := src.PageSize()
+
 	// Claim the next page under the session's own lock (ConsumeNextStart) so two
 	// concurrent /more calls on the same session can never re-fetch or skip a
 	// page — see the method doc for why a plain get-then-set would race here.
-	fetchLimit := o.cfg.Agent.FetchLimit
-	start := s.ConsumeNextStart(fetchLimit)
+	start := s.ConsumeNextStart(pageSize)
 
-	// Pass the session's own query so pagination stays within the same category +
-	// free-text the user chose for this run (never drifting to the config default).
-	papers, err := o.discoMore.FetchPapersFrom(r.Context(), s.Query(), start, nil)
+	// Pass the session's own resource values so pagination stays within the same
+	// selection the user chose for this run (never drifting to a default).
+	papers, err := src.Discover(r.Context(), resource.Request{Values: s.Values()}, start, nil)
 	if err != nil {
 		msg, _, _ := describeError(err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
@@ -458,9 +412,9 @@ func (o *Orchestrator) HandleDiscoverMore(w http.ResponseWriter, r *http.Request
 	s.AppendCandidates(unprocessed)
 
 	// hasMore is a heuristic on the RAW page (before dedup filtering): a
-	// full-sized page suggests arXiv likely has more beyond it; a short page
+	// full-sized page suggests the source likely has more beyond it; a short page
 	// means we hit the end of the feed.
-	hasMore := len(papers) == fetchLimit
+	hasMore := len(papers) == pageSize
 
 	slog.Info("discover more",
 		"session_id", id, "start", start, "fetched", len(papers), "new", len(unprocessed))

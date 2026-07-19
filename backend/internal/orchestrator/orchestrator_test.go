@@ -13,22 +13,71 @@ import (
 	"time"
 
 	"github.com/maritime-ds/arxiv-reader/internal/agents"
-	"github.com/maritime-ds/arxiv-reader/internal/arxivquery"
 	"github.com/maritime-ds/arxiv-reader/internal/config"
 	"github.com/maritime-ds/arxiv-reader/internal/llm"
 	"github.com/maritime-ds/arxiv-reader/internal/models"
+	"github.com/maritime-ds/arxiv-reader/internal/resource"
 	"github.com/maritime-ds/arxiv-reader/internal/tools"
 )
 
 // --- fakes ---
 
-type fakeFetcher struct {
-	papers []models.Paper
-	err    error
+// fakeSource is a resource.Source test double: canned discovery + content
+// results plus call counters so resume/pagination tests can assert what ran.
+type fakeSource struct {
+	papers        []models.Paper
+	discoverErr   error
+	md            string
+	contentErr    error
+	contentCalled int32
+	discoverCalls int32
+	pageSize      int
+	// wiring hooks for the discover-handler tests:
+	validateErr        error              // if set, ValidateValues returns it (→ 400)
+	validated          map[string]string  // if set, the map ValidateValues returns
+	lastValidateIn     map[string]string  // what the handler passed to ValidateValues
+	lastDiscoverValues map[string]string  // what reached Discover (pagination + run)
+	descriptor         resource.Descriptor
 }
 
-func (f *fakeFetcher) FetchPapers(context.Context, arxivquery.Query, func(int)) ([]models.Paper, error) {
-	return f.papers, f.err
+func (f *fakeSource) ID() string { return "arxiv" }
+func (f *fakeSource) Descriptor() resource.Descriptor {
+	if f.descriptor.ID != "" {
+		return f.descriptor
+	}
+	return resource.Descriptor{ID: "arxiv"}
+}
+func (f *fakeSource) PageSize() int {
+	if f.pageSize == 0 {
+		return 5
+	}
+	return f.pageSize
+}
+func (f *fakeSource) ValidateValues(v map[string]string) (map[string]string, error) {
+	f.lastValidateIn = v
+	if f.validateErr != nil {
+		return nil, f.validateErr
+	}
+	if f.validated != nil {
+		return f.validated, nil
+	}
+	return v, nil
+}
+func (f *fakeSource) Discover(_ context.Context, req resource.Request, _ int, _ func(int)) ([]models.Paper, error) {
+	atomic.AddInt32(&f.discoverCalls, 1)
+	f.lastDiscoverValues = req.Values
+	return f.papers, f.discoverErr
+}
+func (f *fakeSource) FetchContent(context.Context, string) (string, error) {
+	atomic.AddInt32(&f.contentCalled, 1)
+	return f.md, f.contentErr
+}
+
+// regWith builds a registry containing a single source (registered as "arxiv").
+func regWith(src resource.Source) *resource.Registry {
+	r := resource.NewRegistry()
+	_ = r.Register(src)
+	return r
 }
 
 type fakeUnprocessor struct {
@@ -56,22 +105,11 @@ func makePapers(n int) []models.Paper {
 	return out
 }
 
-func newOrch(cfg *config.Config, f PaperFetcher, u Unprocessor) *Orchestrator {
-	return &Orchestrator{cfg: cfg, disco: f, logCheck: u}
+func newOrch(cfg *config.Config, src resource.Source, u Unprocessor) *Orchestrator {
+	return &Orchestrator{cfg: cfg, registry: regWith(src), logCheck: u}
 }
 
 // --- process-path fakes ---
-
-type fakeContent struct {
-	md     string
-	err    error
-	called int32
-}
-
-func (f *fakeContent) FetchMarkdown(context.Context, string) (string, error) {
-	atomic.AddInt32(&f.called, 1)
-	return f.md, f.err
-}
 
 // fakeExplainer returns a canned ExplainerOutput or a forced error. called
 // counts invocations so a retry test can assert the generate loop was skipped
@@ -119,10 +157,10 @@ func canned() *fakeExplainer {
 
 // newProcessOrch builds an orchestrator with fake content + explainer + vault.
 // Optional overrides let a test inject a failing explainer/vault.
-func newProcessOrch(c PaperContent, opts ...func(*Orchestrator)) *Orchestrator {
+func newProcessOrch(src resource.Source, opts ...func(*Orchestrator)) *Orchestrator {
 	o := &Orchestrator{
-		cfg: testCfg(5), disco: &fakeFetcher{}, logCheck: passthrough(),
-		content: c, explainer: canned(), vault: &fakeVault{path: "/vault/AI Papers/note.md"},
+		cfg: testCfg(5), registry: regWith(src), logCheck: passthrough(),
+		explainer: canned(), vault: &fakeVault{path: "/vault/AI Papers/note.md"},
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -133,7 +171,7 @@ func newProcessOrch(c PaperContent, opts ...func(*Orchestrator)) *Orchestrator {
 // selectionSession stores a session already at the selection stage with the
 // given candidates, ready for HandleProcess.
 func selectionSession(o *Orchestrator, candidates []models.Paper) *models.PipelineSession {
-	s := models.NewSession("sess-test", time.Now(), arxivquery.Query{Category: "cs.AI"})
+	s := models.NewSession("sess-test", time.Now(), "arxiv", map[string]string{"category": "cs.AI"})
 	s.Complete(candidates, "")
 	o.sessions.Store(s.SessionID, s)
 	return s
@@ -161,7 +199,7 @@ func waitFor(t *testing.T, pred func() bool) {
 }
 
 func TestProcessHappyPathReachesComplete(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "# Extracted paper"})
+	o := newProcessOrch(&fakeSource{md: "# Extracted paper"})
 	s := selectionSession(o, makePapers(3))
 
 	rec := process(o, s.SessionID, "a")
@@ -187,7 +225,7 @@ func TestProcessHappyPathReachesComplete(t *testing.T) {
 
 func TestProcessGenerationErrorFailsRecoverable(t *testing.T) {
 	// A transient LLM error (timeout) is recoverable — a retry may succeed.
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.explainer = &fakeExplainer{err: llm.ErrLLMTimeout}
 	})
 	fv := &fakeVault{path: "x"}
@@ -214,7 +252,7 @@ func TestProcessGenerationErrorFailsRecoverable(t *testing.T) {
 // immutable at runtime, so an in-process retry would deterministically re-fail.
 // The action hint is fix_config and /retry must reject it (400).
 func TestProcessBadRequestNonRecoverable(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.explainer = &fakeExplainer{err: llm.ErrLLMBadRequest}
 	})
 	s := selectionSession(o, makePapers(3))
@@ -234,7 +272,7 @@ func TestProcessBadRequestNonRecoverable(t *testing.T) {
 }
 
 func TestProcessEmptyGenerationFailsRecoverable(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.explainer = &fakeExplainer{out: models.ExplainerOutput{PaperID: "a", Content: "   \n"}}
 	})
 	fv := &fakeVault{path: "x"}
@@ -253,7 +291,7 @@ func TestProcessEmptyGenerationFailsRecoverable(t *testing.T) {
 }
 
 func TestProcessVaultPermissionErrorNonRecoverable(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.vault = &fakeVault{err: os.ErrPermission}
 	})
 	s := selectionSession(o, makePapers(3))
@@ -277,7 +315,7 @@ func result(o *Orchestrator, id string) *httptest.ResponseRecorder {
 }
 
 func TestResultBeforeCompleteIs404(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"})
+	o := newProcessOrch(&fakeSource{md: "md"})
 	s := selectionSession(o, makePapers(3)) // still at selection
 	if rec := result(o, s.SessionID); rec.Code != http.StatusNotFound {
 		t.Fatalf("want 404 before complete, got %d", rec.Code)
@@ -285,14 +323,14 @@ func TestResultBeforeCompleteIs404(t *testing.T) {
 }
 
 func TestResultUnknownSessionIs404(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"})
+	o := newProcessOrch(&fakeSource{md: "md"})
 	if rec := result(o, "nope"); rec.Code != http.StatusNotFound {
 		t.Fatalf("want 404 for unknown session, got %d", rec.Code)
 	}
 }
 
 func TestResultAfterCompleteReturnsContent(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "# Extracted paper"})
+	o := newProcessOrch(&fakeSource{md: "# Extracted paper"})
 	s := selectionSession(o, makePapers(3))
 	process(o, s.SessionID, "a")
 	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
@@ -311,7 +349,7 @@ func TestResultAfterCompleteReturnsContent(t *testing.T) {
 }
 
 func TestProcess404RecoversToSelection(t *testing.T) {
-	o := newProcessOrch(&fakeContent{err: tools.ErrPaperHTMLNotFound})
+	o := newProcessOrch(&fakeSource{contentErr: resource.ErrContentNotFound})
 	s := selectionSession(o, makePapers(3))
 
 	if rec := process(o, s.SessionID, "a"); rec.Code != http.StatusOK {
@@ -329,7 +367,7 @@ func TestProcess404RecoversToSelection(t *testing.T) {
 }
 
 func TestProcessOtherErrorFailsRecoverable(t *testing.T) {
-	o := newProcessOrch(&fakeContent{err: tools.ErrPaperHTMLFailed})
+	o := newProcessOrch(&fakeSource{contentErr: resource.ErrContentFailed})
 	s := selectionSession(o, makePapers(3))
 
 	process(o, s.SessionID, "a")
@@ -342,8 +380,8 @@ func TestProcessOtherErrorFailsRecoverable(t *testing.T) {
 }
 
 func TestProcessWrongStage400(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "x"})
-	s := models.NewSession("sess-test", time.Now(), arxivquery.Query{Category: "cs.AI"}) // still in discovery
+	o := newProcessOrch(&fakeSource{md: "x"})
+	s := models.NewSession("sess-test", time.Now(), "arxiv", map[string]string{"category": "cs.AI"}) // still in discovery
 	o.sessions.Store(s.SessionID, s)
 
 	if rec := process(o, s.SessionID, "a"); rec.Code != http.StatusBadRequest {
@@ -352,7 +390,7 @@ func TestProcessWrongStage400(t *testing.T) {
 }
 
 func TestProcessUnknownPaper400(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "x"})
+	o := newProcessOrch(&fakeSource{md: "x"})
 	s := selectionSession(o, makePapers(3))
 
 	if rec := process(o, s.SessionID, "zzz"); rec.Code != http.StatusBadRequest {
@@ -361,7 +399,7 @@ func TestProcessUnknownPaper400(t *testing.T) {
 }
 
 func TestProcessUnknownSession404(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "x"})
+	o := newProcessOrch(&fakeSource{md: "x"})
 	if rec := process(o, "nope", "a"); rec.Code != http.StatusNotFound {
 		t.Fatalf("want 404 for unknown session, got %d", rec.Code)
 	}
@@ -417,7 +455,7 @@ func getStatus(t *testing.T, o *Orchestrator, id string) StatusResponse {
 }
 
 func TestDiscoverReachesSelection(t *testing.T) {
-	o := newOrch(testCfg(5), &fakeFetcher{papers: makePapers(8)}, passthrough())
+	o := newOrch(testCfg(5), &fakeSource{papers: makePapers(8)}, passthrough())
 	id := discover(t, o)
 	status := waitStatus(t, o, id)
 
@@ -433,7 +471,7 @@ func TestDiscoverReachesSelection(t *testing.T) {
 }
 
 func TestDiscoverFewerThanLimitSetsNotice(t *testing.T) {
-	o := newOrch(testCfg(5), &fakeFetcher{papers: makePapers(3)}, passthrough())
+	o := newOrch(testCfg(5), &fakeSource{papers: makePapers(3)}, passthrough())
 	id := discover(t, o)
 	status := waitStatus(t, o, id)
 
@@ -446,7 +484,7 @@ func TestDiscoverFewerThanLimitSetsNotice(t *testing.T) {
 }
 
 func TestDiscoverArxivFailureRecoverable(t *testing.T) {
-	o := newOrch(testCfg(5), &fakeFetcher{err: tools.ErrArxivRateLimit}, passthrough())
+	o := newOrch(testCfg(5), &fakeSource{discoverErr: resource.ErrTransportRateLimit}, passthrough())
 	id := discover(t, o)
 	status := waitStatus(t, o, id)
 
@@ -465,7 +503,7 @@ func TestDiscoverCorruptLogNotRecoverable(t *testing.T) {
 	u := &fakeUnprocessor{filter: func([]models.Paper) ([]models.Paper, error) {
 		return nil, tools.ErrLogCorrupted
 	}}
-	o := newOrch(testCfg(5), &fakeFetcher{papers: makePapers(4)}, u)
+	o := newOrch(testCfg(5), &fakeSource{papers: makePapers(4)}, u)
 	id := discover(t, o)
 	status := waitStatus(t, o, id)
 
@@ -478,7 +516,7 @@ func TestDiscoverCorruptLogNotRecoverable(t *testing.T) {
 }
 
 func TestStatusUnknownSession404(t *testing.T) {
-	o := newOrch(testCfg(5), &fakeFetcher{}, passthrough())
+	o := newOrch(testCfg(5), &fakeSource{}, passthrough())
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/status/nope", nil)
 	req.SetPathValue("sessionId", "nope")
@@ -518,7 +556,7 @@ func retry(o *Orchestrator, id string) *httptest.ResponseRecorder {
 // A transient vault failure then retry must re-write WITHOUT re-fetching HTML or
 // re-calling the LLM — the whole point of segment-level resume (zero LLM re-cost).
 func TestRetryVaultFailureSkipsLLM(t *testing.T) {
-	content := &fakeContent{md: "# Extracted paper"}
+	content := &fakeSource{md: "# Extracted paper"}
 	o := newProcessOrch(content) // cfg has MaxReviewIterations=0 → reviewer disabled
 	fv := &toggleVault{path: "/vault/AI Papers/note.md"}
 	o.vault = fv
@@ -535,7 +573,7 @@ func TestRetryVaultFailureSkipsLLM(t *testing.T) {
 	if s.FailedStage() != models.StageWriting {
 		t.Fatalf("failed stage = %q, want writing", s.FailedStage())
 	}
-	if got := atomic.LoadInt32(&content.called); got != 1 {
+	if got := atomic.LoadInt32(&content.contentCalled); got != 1 {
 		t.Fatalf("content fetched %d times before retry, want 1", got)
 	}
 	if got := atomic.LoadInt32(&expl.called); got != 1 {
@@ -549,7 +587,7 @@ func TestRetryVaultFailureSkipsLLM(t *testing.T) {
 	}
 	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
 
-	if got := atomic.LoadInt32(&content.called); got != 1 {
+	if got := atomic.LoadInt32(&content.contentCalled); got != 1 {
 		t.Fatalf("extraction re-ran on retry (called=%d); markdown cache not honoured", got)
 	}
 	if got := atomic.LoadInt32(&expl.called); got != 1 {
@@ -569,7 +607,7 @@ func TestRetryVaultFailureSkipsLLM(t *testing.T) {
 // A generation failure then retry must re-run the generate loop but NOT re-fetch
 // the HTML (markdown stays cached).
 func TestRetryGenerationFailureReRunsLoopNotExtraction(t *testing.T) {
-	content := &fakeContent{md: "# Extracted paper"}
+	content := &fakeSource{md: "# Extracted paper"}
 	// Explainer errors on the FIRST call, succeeds after — model a transient LLM fail.
 	expl := &fakeExplainer{err: llm.ErrLLMTimeout}
 	o := newProcessOrch(content, func(o *Orchestrator) { o.explainer = expl })
@@ -595,7 +633,7 @@ func TestRetryGenerationFailureReRunsLoopNotExtraction(t *testing.T) {
 	}
 	waitFor(t, func() bool { return s.Snapshot().Stage == models.StageComplete })
 
-	if got := atomic.LoadInt32(&content.called); got != 1 {
+	if got := atomic.LoadInt32(&content.contentCalled); got != 1 {
 		t.Fatalf("extraction re-ran on generation retry (called=%d), want 1", got)
 	}
 	if got := atomic.LoadInt32(&expl.called); got != 2 {
@@ -609,7 +647,7 @@ func TestRetryGenerationFailureReRunsLoopNotExtraction(t *testing.T) {
 
 // A non-recoverable failure must never be retryable.
 func TestRetryNonRecoverableReturns400(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"}, func(o *Orchestrator) {
+	o := newProcessOrch(&fakeSource{md: "md"}, func(o *Orchestrator) {
 		o.vault = &fakeVault{err: os.ErrPermission} // permission → non-recoverable
 	})
 	s := selectionSession(o, makePapers(3))
@@ -626,7 +664,7 @@ func TestRetryNonRecoverableReturns400(t *testing.T) {
 }
 
 func TestRetryUnknownSessionReturns404(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "md"})
+	o := newProcessOrch(&fakeSource{md: "md"})
 	if rec := retry(o, "nope"); rec.Code != http.StatusNotFound {
 		t.Fatalf("retry unknown session: want 404, got %d", rec.Code)
 	}
@@ -639,7 +677,7 @@ func TestRetryUnknownSessionReturns404(t *testing.T) {
 func TestContextWarningSetButNonBlocking(t *testing.T) {
 	// gpt-4o's limit is 128k tokens. ~600k chars → ~150k estimated tokens > limit.
 	bigMD := strings.Repeat("x", 600_000)
-	o := newProcessOrch(&fakeContent{md: bigMD})
+	o := newProcessOrch(&fakeSource{md: bigMD})
 	o.cfg.LLM.Model = "gpt-4o"
 	o.cfg.LLM.MaxTokens = 4096
 	s := selectionSession(o, makePapers(1))
@@ -659,7 +697,7 @@ func TestContextWarningSetButNonBlocking(t *testing.T) {
 
 // A normal-sized paper (or an unknown model) must NOT attach a warning.
 func TestNoContextWarningForNormalPaper(t *testing.T) {
-	o := newProcessOrch(&fakeContent{md: "# Short paper\n\nA few paragraphs."})
+	o := newProcessOrch(&fakeSource{md: "# Short paper\n\nA few paragraphs."})
 	o.cfg.LLM.Model = "claude-sonnet-4-6"
 	o.cfg.LLM.MaxTokens = 4096
 	s := selectionSession(o, makePapers(1))

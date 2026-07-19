@@ -5,7 +5,7 @@
 
 ## Overview
 
-The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-13**, Phase 8 is complete. The system can discover papers with pagination, extract content, generate and review explainers, write them to Obsidian, provide a complete live and persistent timeline of every run, and replay run history with full reasoning traces.
+The project is organized into sequential phases, each delivering a complete, working slice of functionality. As of **2026-07-18**, Phase 9 is complete. The system has been refactored to support pluggable discovery sources via a declarative resource engine: paper discovery is no longer hardcoded to arXiv but driven by YAML declarations. The core (orchestrator + agent pipeline) depends only on the `Source` interface, not concrete implementations.
 
 | Phase | Focus | Status | Completion |
 |---|---|---|---|
@@ -17,6 +17,7 @@ The project is organized into sequential phases, each delivering a complete, wor
 | **6** | Polish & Hardening | ✅ Complete | 2026-07-05 |
 | **7** | Run Timeline Tracing | ✅ Complete | 2026-07-12 |
 | **8** | Full Reasoning Trace + Pagination | ✅ Complete | 2026-07-13 |
+| **9** | Declarative Resource Engine | ✅ Complete | 2026-07-18 |
 
 ---
 
@@ -334,6 +335,73 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 
 ---
 
+## Phase 9 — Declarative Resource Engine
+**Status:** ✅ Complete (2026-07-18)
+
+**Delivered:**
+- **Resource Engine** — declarative, config-driven abstraction for paper discovery
+  - Four-stage pipeline: transport (HTTP) → decoder (format-specific) → normalize (canonical models) → ACL (validation)
+  - Source interface: implementations provide Discover/FetchDiscoverMore/FetchContent/ValidateValues
+  - Single implementation: DeclarativeSource loads YAML from `resources/*.yaml`
+  
+- **Capability Registries** — pluggable components for extensibility
+  - Decoders: atom-xml (v1), extensible to json, etc.
+  - Transforms: normalize, trim, lowercase (for string values)
+  - Derivers: arxiv-id (extract from metadata), arxiv-pdf-url (select from links)
+  - Sanitizers: arxiv-terms (whitelist operators, cap length)
+  - Converters: html-to-markdown (for content)
+  
+- **YAML Declarations** (`resources/*.yaml`)
+  - `request.fields`: form inputs (select with catalog validation, text with sanitizer)
+  - `fetch`: URL template, query builder, pagination, retry policy, timeout/size limits
+  - `response`: format, items path, field mappings (path, @attr, multi, transforms, derive)
+  - `content`: second fetch for item body, converter, error handling (repick on 404)
+  - Two interpolation styles: `${VAR}` (trusted config, resolved at load), `{{name}}` (untrusted runtime, validated)
+  
+- **API Changes**
+  - `GET /resources` → returns array of resource descriptors (id, label, description, fields schema)
+  - `POST /discover` → accepts `{resourceId, values}` body (empty body → defaults)
+  - Legacy backward compat: `{category, terms}` folded into `values` via `defaultResourceID` (Phase 9 artifact)
+  
+- **Frontend**
+  - ResourcePicker component (replaces hardcoded CategoryPicker)
+  - DynamicRequestForm (schema-driven form builder, replaces hardcoded category+terms fields)
+  - Zero form changes when adding a resource (pure YAML)
+
+- **Deleted**
+  - `/backend/internal/tools/discovery.go` — replaced by resource engine
+  - `/backend/internal/tools/papercontent.go` — replaced by content fetch + converter
+  - `/backend/internal/tools/papercontent-cleanup.go` — redundant cleanup
+  - `/backend/internal/arxivquery/` package — hardcoded arXiv query logic (now in `resources/arxiv.yaml` + `sanitizers.go`)
+
+- **New Code Locations**
+  - `/backend/internal/resource/` — the engine and all registries
+  - `/resources/arxiv.yaml` — arXiv resource declaration (golden regression: reproduces Phase 1–8 behaviour field-for-field)
+  - `/resources/catalogs/arxiv-cs.yaml` — cs.* category whitelist and labels
+  - `/docs/adding-a-resource.md` — operator guide (two cases: existing capabilities vs. new seam)
+
+**Key Architecture Points:**
+- **Decoupling achieved:** Orchestrator depends on `resource.Registry` + `resource.Source`, not concrete arXiv tools
+- **Security generalized:** whitelist validation (e.g., arxiv-cs catalog), text sanitization (arxiv-terms), path validation (same-host content fetch)
+- **Zero Go code per resource:** New sources are pure YAML + catalog (if needed)
+- **Golden regression:** Engine reproduces old DiscoveryTool/PaperContentTool output exactly (validated via tests)
+- **v1 SSRF minimal:** safe for arXiv (fixed public host); REQUIRED egress denylist for configurable hosts (documented in `adding-a-resource.md`)
+
+**Test Coverage:**
+- Golden tests: discovery/content output identical to Phase 8 behavior
+- Loader: YAML parse, interpolation, validation, cyclic reference detection
+- Engine: transport retries, decoder logic, normalization, ACL (whitelist, sanitizer)
+- Cascade: full end-to-end resource execution (discover → normalize → validate)
+- RegisterSuite: all capability registries (decoders, transforms, derivers, sanitizers, converters)
+
+**Migration from Phase 8:**
+1. `POST /discover` body now `{resourceId?, values}` (resourceId defaults to config default, values is map[string]string)
+2. Old `{category, terms}` body still works (internally mapped to arXiv resource's values schema)
+3. Frontend uses new ResourcePicker + DynamicRequestForm (schema-driven, zero hardcoding)
+4. User can configure `agent.default_resource_id: arxiv` in config.yaml to preserve old discovery defaults
+
+---
+
 ## Key Milestones
 
 | Milestone | Date | Achieved |
@@ -351,6 +419,10 @@ change extends the existing HTML→Markdown design (see `docs/phase6/brainstorm-
 | Phase 8 full reasoning trace + content replay + pagination | 2026-07-13 | ✅ Yes |
 | History detail shows note markdown + live timeline | 2026-07-13 | ✅ Yes |
 | Discovery supports "Load more" pagination | 2026-07-13 | ✅ Yes |
+| Phase 9 declarative resource engine shipped | 2026-07-18 | ✅ Yes |
+| ArXiv tools deleted; resource YAML replaces hardcoding | 2026-07-18 | ✅ Yes |
+| Frontend resource picker + dynamic form (zero hardcoding) | 2026-07-18 | ✅ Yes |
+| New sources require YAML only (no Go changes) | 2026-07-18 | ✅ Yes |
 
 ---
 
